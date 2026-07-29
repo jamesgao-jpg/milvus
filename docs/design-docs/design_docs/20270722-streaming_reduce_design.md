@@ -1,6 +1,6 @@
-# [V4] Streaming Reduce for Query and Search
+# [V5] Streaming Reduce for Query and Search
 
-## Version 4 [07/24/2026]
+## Version 5 [07/29/2026]
 
 ## Version History
 
@@ -9,7 +9,7 @@
 | V1 | `20260720-streaming_reduce_design.md` | `2a653697f32ed61fbc3cf2a6319f7e4909bc8d45` |
 | V2 | `stream_design_v2.md` | `8851a69bb5dc3ebfc4365519695513377b6365a3` |
 | V3 | `20270722-streaming_reduce_design_v3.md` | `7d6d90913684547d817bda5e883393095b012dad` |
-| V4 | `20270722-streaming_reduce_design_v4.md` | `aea9e8d217c0c834d15a9437464b4039957389bb` |
+| V4 | `20270722-streaming_reduce_design.md` | `4b6b18753efd21a51632008f550139f8eb39d393` |
 
 ## 1. Summary
 
@@ -239,10 +239,10 @@ on server receives interruptRequest:
 There is only one deciding criteria for splitting the below paradigm:
 
 ```text
-Is it meaningful for non-Proxy level to do any true reduce work?
+Is per-vchannel reduction meaningful before the final collection-level fan-in?
 ```
 
-For example, for Query Group by cases, while delgator can perform key-value pair merges from its QNs before forwarding its result to Proxy, Proxy will have to wait until all delegator's key-value pair drained to emit a final output result. This means delegator is not doing true reduce work and we thus classify them into the "UnOrderedReduce Stream" category.
+For Query Group By, each per-vchannel stream receives key-value pairs from the SN/QN work nodes selected by its QueryPlan, but the final stream must wait until all vchannels drain before emitting the result. The per-vchannel stream therefore forwards available units and uses `UnOrderedReduceStream`.
 
 `NewReduceStream()` classifies the request before child data is consumed and creates one concrete implementation based on the below criteria:
 
@@ -315,7 +315,7 @@ ProduceNextUnits(readyBuffers):
 
 #### UnOrderedReduceStream
 
-`UnOrderedReduceStream` applies to scenarios where the non-Proxy level are NOT REQUIRED to perform any reduction logic, and should instead forward the result directly to Proxy, who is responsible for aggregating final results accordingly. This scenario applies to:
+`UnOrderedReduceStream` applies when a per-vchannel stream does not need to establish cross-child ordering before forwarding units to the final collection-level stream. This scenario applies to:
 
 - Plain Query (Without default Order by PK)
 - Query Group By
@@ -370,55 +370,50 @@ ProduceNextUnits(readyBuffers):
 
 ### 4.3 Concrete ANN gRPC Flow
 
-This example shows how plain ANN Search composes gRPC streams from QN to Delegator and from Delegator to Proxy. Plain ANN Search selects `OrderedReduceStream`.
+Plain ANN Search selects `OrderedReduceStream`. Proxy resolves the collection's vchannels. For each vchannel, QueryView obtains a QueryPlan from SN, opens one gRPC client stream for every SN/QN work node in `plan.WorkNodes`, and creates one per-vchannel reduced stream. Proxy then composes the per-vchannel streams into the final reduced stream.
 
-#### QN
+#### SN/QN Work Nodes
 
-`SearchStreamSegments()` is a server-streaming method. P0 keeps Segment execution and local reduction unchanged, then sends the finalized result as CHUNKs.
+P0 keeps local Segment execution and reduction unchanged. Each `SearchOnView()` stream sends its local result as CHUNKs.
 
 ```text
-QN.SearchStreamSegments(request):
-    result = existingSegmentANNSearchAndReduce(request)
+SN/QN.SearchOnView(request):
+    result = existingLocalANNSearchAndReduce(request)
 
     for each CHUNK built from result:
         Send(CHUNK)
 ```
 
-#### Delegator
+#### Per-vchannel Fan-In in Proxy
 
-Each `qnClient.SearchStreamSegments()` call returns a generated `ClientRecvStream`.
+`legacyClient` resolves the vchannels. For each vchannel, `shardViewQueryClient` obtains its QueryPlan and creates one `OrderedReduceStream` from the generated SN/QN client streams.
 
 ```text
-Delegator.SearchStream(request):
-    qnStreams = [
-        qnClient.SearchStreamSegments(request)
-        for qnClient in qnClients
+vchannels = shardResolver.ResolveVChannels(request.collectionID)
+vchannelStreams = []
+
+for vchannel in vchannels:
+    plan = GetQueryPlan(vchannel, request)
+    workNodeStreams = [
+        queryServiceClient.SearchOnView(
+            node,
+            requestForNode(plan, node)
+        )
+        for node in plan.WorkNodes
     ]
 
-    reducedStream = NewReduceStream(request, qnStreams)
-    defer reducedStream.Close()
-
-    while true:
-        CHUNK = reducedStream.Recv()
-
-        if CHUNK is EOF:
-            return
-
-        Send(CHUNK)
+    vchannelStreams.append(
+        NewReduceStream(request, workNodeStreams)
+    )
 ```
 
-#### Proxy
+#### Final Fan-In in Proxy
 
-Each `delegatorClient.SearchStream()` call returns a generated `ClientRecvStream`. Proxy performs the same 1:N fan-in and consumes the final reduced stream into the existing unary response.
+Proxy creates the final `OrderedReduceStream` from the per-vchannel streams and consumes it into the existing unary response.
 
 ```text
 Proxy.Search(request):
-    delegatorStreams = [
-        delegatorClient.SearchStream(request)
-        for delegatorClient in delegatorClients
-    ]
-
-    reducedStream = NewReduceStream(request, delegatorStreams)
+    reducedStream = NewReduceStream(request, vchannelStreams)
     response = new SearchResponse
 
     while response.hitCount < request.topK:
