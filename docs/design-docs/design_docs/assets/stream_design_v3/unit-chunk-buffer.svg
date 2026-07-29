@@ -1,0 +1,237 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2050" height="800" viewBox="0 0 2050 800" role="img" aria-labelledby="title desc">
+  <title id="title">Unit, Chunk, and Buffer across ReduceStream levels</title>
+  <desc id="desc">A focused child stream sends a Chunk into its corresponding Buffer in a ReduceStream. That ReduceStream returns an output Chunk into one corresponding Buffer owned by an upstream ReduceStream. Other child paths are muted.</desc>
+  <defs>
+    <pattern id="blueHatch" width="12" height="12" patternUnits="userSpaceOnUse" patternTransform="rotate(12)">
+      <rect width="12" height="12" fill="#eff6ff"/>
+      <line x1="0" y1="0" x2="0" y2="12" stroke="#bfdbfe" stroke-width="3" opacity="0.6"/>
+    </pattern>
+    <pattern id="amberHatch" width="12" height="12" patternUnits="userSpaceOnUse" patternTransform="rotate(12)">
+      <rect width="12" height="12" fill="#fffbeb"/>
+      <line x1="0" y1="0" x2="0" y2="12" stroke="#fde68a" stroke-width="3" opacity="0.6"/>
+    </pattern>
+    <pattern id="greenHatch" width="12" height="12" patternUnits="userSpaceOnUse" patternTransform="rotate(12)">
+      <rect width="12" height="12" fill="#f0fdf4"/>
+      <line x1="0" y1="0" x2="0" y2="12" stroke="#bbf7d0" stroke-width="3" opacity="0.6"/>
+    </pattern>
+    <marker id="arrowDark" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" fill="#475569"/>
+    </marker>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" fill="#059669"/>
+    </marker>
+    <marker id="arrowMuted" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" fill="#98a2b3"/>
+    </marker>
+    <style>
+      text { fill: #172033; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+      .hand { font-family: "Comic Sans MS", "Bradley Hand", cursive; font-weight: 700; }
+      .title { font-size: 30px; }
+      .component { font-size: 25px; }
+      .label { font-size: 16px; font-weight: 700; }
+      .small { fill: #667085; font-size: 13px; font-weight: 650; }
+      .unit { font-size: 13px; font-weight: 700; }
+      .outline { stroke-width: 2.2; }
+      .muted-text { fill: #7f8998; }
+      .muted-line { fill: none; stroke: #98a2b3; stroke-width: 2; stroke-dasharray: 8 7; marker-end: url(#arrowMuted); }
+      .focus-blue { fill: none; stroke: #2563eb; stroke-width: 2.8; marker-end: url(#arrowBlue); }
+      .focus-green { fill: none; stroke: #059669; stroke-width: 2.8; marker-end: url(#arrowGreen); }
+    </style>
+  </defs>
+
+  <rect width="2050" height="800" fill="#ffffff"/>
+  <text x="1025" y="42" text-anchor="middle" class="hand title">Unit, Chunk, and Buffer</text>
+
+  <!-- Child streams: two muted paths and one focused path. -->
+  <g opacity="0.42">
+    <rect x="35" y="70" width="335" height="175" rx="8" fill="#f8fafc" stroke="#98a2b3" class="outline"/>
+    <text x="202" y="103" text-anchor="middle" class="hand component muted-text">Child Stream 0</text>
+    <text x="202" y="132" text-anchor="middle" class="small">Chunk (up to X Units)</text>
+    <g>
+      <rect x="67" y="151" width="54" height="58" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="121" y="151" width="54" height="58" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="175" y="151" width="54" height="58" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="229" y="151" width="54" height="58" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="283" y="151" width="54" height="58" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <text x="94" y="185" text-anchor="middle" class="unit muted-text">Unit</text>
+      <text x="148" y="185" text-anchor="middle" class="unit muted-text">Unit</text>
+      <text x="202" y="185" text-anchor="middle" class="unit muted-text">Unit</text>
+      <text x="256" y="185" text-anchor="middle" class="unit muted-text">Unit</text>
+      <text x="310" y="185" text-anchor="middle" class="unit muted-text">Unit</text>
+    </g>
+  </g>
+
+  <rect x="35" y="310" width="335" height="190" rx="8" fill="url(#blueHatch)" stroke="#2563eb" class="outline"/>
+  <text x="202" y="346" text-anchor="middle" class="hand component">Child Stream i</text>
+  <text x="202" y="378" text-anchor="middle" class="label">Chunk (up to X Units)</text>
+  <g>
+    <rect x="67" y="397" width="54" height="64" fill="#ffffff" stroke="#2563eb" class="outline"/>
+    <rect x="121" y="397" width="54" height="64" fill="#ffffff" stroke="#2563eb" class="outline"/>
+    <rect x="175" y="397" width="54" height="64" fill="#ffffff" stroke="#2563eb" class="outline"/>
+    <rect x="229" y="397" width="54" height="64" fill="#ffffff" stroke="#2563eb" class="outline"/>
+    <rect x="283" y="397" width="54" height="64" fill="#ffffff" stroke="#2563eb" class="outline"/>
+    <text x="94" y="435" text-anchor="middle" class="unit">Unit</text>
+    <text x="148" y="435" text-anchor="middle" class="unit">Unit</text>
+    <text x="202" y="435" text-anchor="middle" class="unit">Unit</text>
+    <text x="256" y="435" text-anchor="middle" class="unit">Unit</text>
+    <text x="310" y="435" text-anchor="middle" class="unit">Unit</text>
+  </g>
+
+  <g opacity="0.42">
+    <rect x="35" y="565" width="335" height="175" rx="8" fill="#f8fafc" stroke="#98a2b3" class="outline"/>
+    <text x="202" y="598" text-anchor="middle" class="hand component muted-text">Child Stream N</text>
+    <text x="202" y="627" text-anchor="middle" class="small">Chunk (up to X Units)</text>
+    <g>
+      <rect x="67" y="646" width="54" height="58" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="121" y="646" width="54" height="58" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="175" y="646" width="54" height="58" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="229" y="646" width="54" height="58" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="283" y="646" width="54" height="58" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <text x="94" y="680" text-anchor="middle" class="unit muted-text">Unit</text>
+      <text x="148" y="680" text-anchor="middle" class="unit muted-text">Unit</text>
+      <text x="202" y="680" text-anchor="middle" class="unit muted-text">Unit</text>
+      <text x="256" y="680" text-anchor="middle" class="unit muted-text">Unit</text>
+      <text x="310" y="680" text-anchor="middle" class="unit muted-text">Unit</text>
+    </g>
+  </g>
+
+  <!-- Current ReduceStream owns one Buffer per child stream. -->
+  <rect x="555" y="60" width="660" height="690" rx="9" fill="url(#amberHatch)" stroke="#d97706" class="outline"/>
+  <text x="885" y="100" text-anchor="middle" class="hand component">ReduceStream</text>
+  <text x="885" y="124" text-anchor="middle" class="small">childStreams[] + one childBuffer per stream</text>
+
+  <g opacity="0.42">
+    <text x="885" y="158" text-anchor="middle" class="label muted-text">childBuffers[0] (capacity = X + y Units)</text>
+    <g>
+      <rect x="630" y="176" width="70" height="60" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="700" y="176" width="70" height="60" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="770" y="176" width="70" height="60" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="840" y="176" width="70" height="60" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="910" y="176" width="70" height="60" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="980" y="176" width="70" height="60" fill="#ffffff" stroke="#98a2b3" stroke-width="2.2" stroke-dasharray="7 5"/>
+      <rect x="1050" y="176" width="70" height="60" fill="#ffffff" stroke="#98a2b3" stroke-width="2.2" stroke-dasharray="7 5"/>
+    </g>
+  </g>
+
+  <text x="885" y="340" text-anchor="middle" class="label">childBuffers[i] (capacity = X + y Units)</text>
+  <g>
+    <rect x="630" y="358" width="70" height="66" fill="#ffffff" stroke="#d97706" class="outline"/>
+    <rect x="700" y="358" width="70" height="66" fill="#ffffff" stroke="#d97706" class="outline"/>
+    <rect x="770" y="358" width="70" height="66" fill="#ffffff" stroke="#d97706" class="outline"/>
+    <rect x="840" y="358" width="70" height="66" fill="#ffffff" stroke="#d97706" class="outline"/>
+    <rect x="910" y="358" width="70" height="66" fill="#ffffff" stroke="#d97706" class="outline"/>
+    <rect x="980" y="358" width="70" height="66" fill="#fff7ed" stroke="#d97706" stroke-width="2.2" stroke-dasharray="7 5"/>
+    <rect x="1050" y="358" width="70" height="66" fill="#fff7ed" stroke="#d97706" stroke-width="2.2" stroke-dasharray="7 5"/>
+    <text x="665" y="397" text-anchor="middle" class="unit">Unit</text>
+    <text x="735" y="397" text-anchor="middle" class="unit">Unit</text>
+    <text x="805" y="397" text-anchor="middle" class="unit">Unit</text>
+    <text x="875" y="397" text-anchor="middle" class="unit">Unit</text>
+    <text x="945" y="397" text-anchor="middle" class="unit">Unit</text>
+    <text x="1015" y="397" text-anchor="middle" class="unit">Unit</text>
+    <text x="1085" y="397" text-anchor="middle" class="unit">Unit</text>
+  </g>
+  <text x="805" y="450" text-anchor="middle" class="small">X Units</text>
+  <text x="1050" y="450" text-anchor="middle" class="small">y Units</text>
+
+  <g opacity="0.42">
+    <text x="885" y="562" text-anchor="middle" class="label muted-text">childBuffers[N] (capacity = X + y Units)</text>
+    <g>
+      <rect x="630" y="580" width="70" height="60" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="700" y="580" width="70" height="60" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="770" y="580" width="70" height="60" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="840" y="580" width="70" height="60" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="910" y="580" width="70" height="60" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="980" y="580" width="70" height="60" fill="#ffffff" stroke="#98a2b3" stroke-width="2.2" stroke-dasharray="7 5"/>
+      <rect x="1050" y="580" width="70" height="60" fill="#ffffff" stroke="#98a2b3" stroke-width="2.2" stroke-dasharray="7 5"/>
+    </g>
+  </g>
+
+  <path d="M370 180 L555 206" class="muted-line"/>
+  <path d="M370 430 L555 391" class="focus-blue"/>
+  <text x="465" y="383" text-anchor="middle" class="label">RPC</text>
+  <text x="465" y="454" text-anchor="middle" class="small">childStreams[i].Recv()</text>
+  <path d="M370 675 L555 610" class="muted-line"/>
+
+  <!-- Focused ReduceStream output Chunk. -->
+  <path d="M1215 391 L1285 391" class="focus-green"/>
+  <text x="1250" y="364" text-anchor="middle" class="label">Recv()</text>
+  <text x="1420" y="338" text-anchor="middle" class="label">Chunk (up to X Units)</text>
+  <g>
+    <rect x="1295" y="356" width="50" height="68" fill="#ffffff" stroke="#059669" class="outline"/>
+    <rect x="1345" y="356" width="50" height="68" fill="#ffffff" stroke="#059669" class="outline"/>
+    <rect x="1395" y="356" width="50" height="68" fill="#ffffff" stroke="#059669" class="outline"/>
+    <rect x="1445" y="356" width="50" height="68" fill="#ffffff" stroke="#059669" class="outline"/>
+    <rect x="1495" y="356" width="50" height="68" fill="#ffffff" stroke="#059669" class="outline"/>
+    <text x="1320" y="396" text-anchor="middle" class="unit">Unit</text>
+    <text x="1370" y="396" text-anchor="middle" class="unit">Unit</text>
+    <text x="1420" y="396" text-anchor="middle" class="unit">Unit</text>
+    <text x="1470" y="396" text-anchor="middle" class="unit">Unit</text>
+    <text x="1520" y="396" text-anchor="middle" class="unit">Unit</text>
+  </g>
+  <path d="M1545 391 L1625 391" class="focus-green"/>
+
+  <!-- Other ReduceStreams feed the non-focused upstream paths. -->
+  <g opacity="0.38">
+    <rect x="1300" y="125" width="235" height="82" rx="7" fill="#f8fafc" stroke="#98a2b3" class="outline"/>
+    <text x="1417" y="160" text-anchor="middle" class="hand label muted-text">Other ReduceStream</text>
+    <text x="1417" y="184" text-anchor="middle" class="small">Chunk</text>
+    <path d="M1535 166 L1625 197" class="muted-line"/>
+
+    <rect x="1300" y="575" width="235" height="82" rx="7" fill="#f8fafc" stroke="#98a2b3" class="outline"/>
+    <text x="1417" y="610" text-anchor="middle" class="hand label muted-text">Other ReduceStream</text>
+    <text x="1417" y="634" text-anchor="middle" class="small">Chunk</text>
+    <path d="M1535 616 L1625 605" class="muted-line"/>
+  </g>
+
+  <!-- Upstream is another ReduceStream with the same ownership model. -->
+  <rect x="1630" y="60" width="385" height="690" rx="9" fill="url(#greenHatch)" stroke="#059669" class="outline"/>
+  <text x="1822" y="100" text-anchor="middle" class="hand component">Upstream ReduceStream</text>
+  <text x="1822" y="124" text-anchor="middle" class="small">childStreams[] + one childBuffer per stream</text>
+
+  <g opacity="0.42">
+    <text x="1822" y="158" text-anchor="middle" class="label muted-text">childBuffers[0]</text>
+    <g>
+      <rect x="1672" y="176" width="42" height="60" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="1714" y="176" width="42" height="60" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="1756" y="176" width="42" height="60" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="1798" y="176" width="42" height="60" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="1840" y="176" width="42" height="60" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="1882" y="176" width="42" height="60" fill="#ffffff" stroke="#98a2b3" stroke-width="2.2" stroke-dasharray="7 5"/>
+      <rect x="1924" y="176" width="42" height="60" fill="#ffffff" stroke="#98a2b3" stroke-width="2.2" stroke-dasharray="7 5"/>
+    </g>
+  </g>
+
+  <text x="1822" y="340" text-anchor="middle" class="label">childBuffers[j] (capacity = X + y Units)</text>
+  <g>
+    <rect x="1672" y="358" width="42" height="66" fill="#ffffff" stroke="#059669" class="outline"/>
+    <rect x="1714" y="358" width="42" height="66" fill="#ffffff" stroke="#059669" class="outline"/>
+    <rect x="1756" y="358" width="42" height="66" fill="#ffffff" stroke="#059669" class="outline"/>
+    <rect x="1798" y="358" width="42" height="66" fill="#ffffff" stroke="#059669" class="outline"/>
+    <rect x="1840" y="358" width="42" height="66" fill="#ffffff" stroke="#059669" class="outline"/>
+    <rect x="1882" y="358" width="42" height="66" fill="#f0fdf4" stroke="#059669" stroke-width="2.2" stroke-dasharray="7 5"/>
+    <rect x="1924" y="358" width="42" height="66" fill="#f0fdf4" stroke="#059669" stroke-width="2.2" stroke-dasharray="7 5"/>
+    <text x="1693" y="397" text-anchor="middle" class="unit">Unit</text>
+    <text x="1735" y="397" text-anchor="middle" class="unit">Unit</text>
+    <text x="1777" y="397" text-anchor="middle" class="unit">Unit</text>
+    <text x="1819" y="397" text-anchor="middle" class="unit">Unit</text>
+    <text x="1861" y="397" text-anchor="middle" class="unit">Unit</text>
+  </g>
+  <text x="1777" y="450" text-anchor="middle" class="small">X Units</text>
+  <text x="1924" y="450" text-anchor="middle" class="small">y Units</text>
+
+  <g opacity="0.42">
+    <text x="1822" y="562" text-anchor="middle" class="label muted-text">childBuffers[N]</text>
+    <g>
+      <rect x="1672" y="580" width="42" height="60" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="1714" y="580" width="42" height="60" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="1756" y="580" width="42" height="60" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="1798" y="580" width="42" height="60" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="1840" y="580" width="42" height="60" fill="#ffffff" stroke="#98a2b3" class="outline"/>
+      <rect x="1882" y="580" width="42" height="60" fill="#ffffff" stroke="#98a2b3" stroke-width="2.2" stroke-dasharray="7 5"/>
+      <rect x="1924" y="580" width="42" height="60" fill="#ffffff" stroke="#98a2b3" stroke-width="2.2" stroke-dasharray="7 5"/>
+    </g>
+  </g>
+</svg>
