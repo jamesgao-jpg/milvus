@@ -188,6 +188,10 @@ func (c *fakeViewQueryServiceClient) SearchOnView(ctx context.Context, req *view
 	return c.searchOnView(ctx, req)
 }
 
+func (c *fakeViewQueryServiceClient) SearchOnViewStream(context.Context, ...grpc.CallOption) (viewpb.ViewQueryService_SearchOnViewStreamClient, error) {
+	return nil, nil
+}
+
 func (c *fakeViewQueryServiceClient) QueryOnView(ctx context.Context, req *viewpb.QueryOnViewRequest, _ ...grpc.CallOption) (*viewpb.QueryOnViewResponse, error) {
 	return c.queryOnView(ctx, req)
 }

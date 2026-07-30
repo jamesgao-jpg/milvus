@@ -263,6 +263,20 @@ func TestOrderedReduceStreamAcceptsEncodedChunk(t *testing.T) {
 	assertSearchChunk(t, recvChunk(t, stream), []int64{1}, []float32{0.9}, []int64{1})
 }
 
+func TestSplitSearchResultPreservesQueryBoundaries(t *testing.T) {
+	result := newSearchChunk(2, 3,
+		[]testHit{{id: 1, score: 0.9}, {id: 2, score: 0.8}, {id: 3, score: 0.7}},
+		[]testHit{{id: 10, score: 0.95}, {id: 11, score: 0.85}},
+	)
+
+	chunks, err := SplitSearchResult(result, 2)
+	require.NoError(t, err)
+	require.Len(t, chunks, 3)
+	assertSearchChunk(t, chunks[0], []int64{1, 2}, []float32{0.9, 0.8}, []int64{2, 0})
+	assertSearchChunk(t, chunks[1], []int64{3, 10}, []float32{0.7, 0.95}, []int64{1, 1})
+	assertSearchChunk(t, chunks[2], []int64{11}, []float32{0.85}, []int64{0, 1})
+}
+
 func TestOrderedReduceStreamStartsMissingChildReceivesConcurrently(t *testing.T) {
 	release := make(chan struct{})
 	left := &blockingReduceStream{

@@ -169,6 +169,51 @@ func decodeChunk(chunk *internalpb.SearchResults, nq, topK int64) (*schemapb.Sea
 	return data, nil
 }
 
+// SplitSearchResult splits one complete Search result into query-major Chunks.
+func SplitSearchResult(result *internalpb.SearchResults, chunkSize int) ([]*internalpb.SearchResults, error) {
+	if result == nil {
+		return nil, errors.New("SplitSearchResult requires a Search result")
+	}
+	if !merr.Ok(result.GetStatus()) {
+		return nil, merr.Error(result.GetStatus())
+	}
+	if result.GetNumQueries() <= 0 {
+		return nil, fmt.Errorf("SplitSearchResult requires a positive nq, got %d", result.GetNumQueries())
+	}
+	if result.GetTopK() <= 0 {
+		return nil, fmt.Errorf("SplitSearchResult requires a positive topK, got %d", result.GetTopK())
+	}
+	if chunkSize <= 0 {
+		return nil, fmt.Errorf("SplitSearchResult requires a positive Chunk size, got %d", chunkSize)
+	}
+
+	buffer := &orderedChildBuffer{}
+	if err := buffer.accept(result, result.GetNumQueries(), result.GetTopK()); err != nil {
+		return nil, err
+	}
+	if !buffer.hasUnit() {
+		return nil, nil
+	}
+
+	chunks := make([]*internalpb.SearchResults, 0, (len(buffer.units)+chunkSize-1)/chunkSize)
+	for start := 0; start < len(buffer.units); start += chunkSize {
+		end := min(start+chunkSize, len(buffer.units))
+		chunk, err := buildSearchChunk(
+			buffer.units[start:end],
+			result.GetNumQueries(),
+			result.GetTopK(),
+			result.GetMetricType(),
+			result.GetIsTopkReduce(),
+			result.GetIsRecallEvaluation(),
+		)
+		if err != nil {
+			return nil, err
+		}
+		chunks = append(chunks, chunk)
+	}
+	return chunks, nil
+}
+
 // OrderedReduceStream merges Plain ANN Search child Chunks by score.
 type OrderedReduceStream struct {
 	childStreams         []ReduceStream
@@ -410,9 +455,27 @@ func (s *OrderedReduceStream) merge(outputBuffer *orderedOutputBuffer, oneReduce
 }
 
 func (s *OrderedReduceStream) createOutputChunk(outputBuffer *orderedOutputBuffer) (*internalpb.SearchResults, error) {
-	first := outputBuffer.units[0]
+	return buildSearchChunk(
+		outputBuffer.units,
+		s.nq,
+		s.topK,
+		s.metricType,
+		s.isTopKReduce,
+		s.isRecallEval,
+	)
+}
+
+func buildSearchChunk(
+	units []orderedUnit,
+	nq int64,
+	topK int64,
+	metricType string,
+	isTopKReduce bool,
+	isRecallEvaluation bool,
+) (*internalpb.SearchResults, error) {
+	first := units[0]
 	templateFields := first.data.GetFieldsData()
-	for _, unit := range outputBuffer.units {
+	for _, unit := range units {
 		if len(unit.data.GetFieldsData()) > 0 {
 			templateFields = unit.data.GetFieldsData()
 			break
@@ -420,18 +483,18 @@ func (s *OrderedReduceStream) createOutputChunk(outputBuffer *orderedOutputBuffe
 	}
 
 	data := &schemapb.SearchResultData{
-		NumQueries:       s.nq,
-		TopK:             s.topK,
-		FieldsData:       typeutil.PrepareResultFieldData(templateFields, int64(len(outputBuffer.units))),
-		Scores:           make([]float32, 0, len(outputBuffer.units)),
+		NumQueries:       nq,
+		TopK:             topK,
+		FieldsData:       typeutil.PrepareResultFieldData(templateFields, int64(len(units))),
+		Scores:           make([]float32, 0, len(units)),
 		Ids:              &schemapb.IDs{},
-		Topks:            make([]int64, s.nq),
+		Topks:            make([]int64, nq),
 		OutputFields:     append([]string(nil), first.data.GetOutputFields()...),
 		PrimaryFieldName: first.data.GetPrimaryFieldName(),
 	}
 	fieldIndexComputers := make(map[*schemapb.SearchResultData]*typeutil.FieldDataIdxComputer)
 
-	for _, unit := range outputBuffer.units {
+	for _, unit := range units {
 		if len(data.FieldsData) > 0 {
 			if len(unit.data.GetFieldsData()) != len(data.FieldsData) {
 				return nil, fmt.Errorf("Search Chunk field count %d does not match output field count %d", len(unit.data.GetFieldsData()), len(data.FieldsData))
@@ -450,7 +513,7 @@ func (s *OrderedReduceStream) createOutputChunk(outputBuffer *orderedOutputBuffe
 		data.Topks[unit.queryIndex]++
 		if unit.data.GetElementIndices() != nil {
 			if data.ElementIndices == nil {
-				data.ElementIndices = &schemapb.LongArray{Data: make([]int64, 0, len(outputBuffer.units))}
+				data.ElementIndices = &schemapb.LongArray{Data: make([]int64, 0, len(units))}
 			}
 			data.ElementIndices.Data = append(data.ElementIndices.Data, unit.data.GetElementIndices().GetData()[unit.rowIndex])
 		}
@@ -460,12 +523,12 @@ func (s *OrderedReduceStream) createOutputChunk(outputBuffer *orderedOutputBuffe
 		Base:               first.result.GetBase(),
 		Status:             merr.Success(),
 		ReqID:              first.result.GetReqID(),
-		MetricType:         s.metricType,
-		NumQueries:         s.nq,
-		TopK:               s.topK,
+		MetricType:         metricType,
+		NumQueries:         nq,
+		TopK:               topK,
 		ResultData:         data,
-		IsTopkReduce:       s.isTopKReduce,
-		IsRecallEvaluation: s.isRecallEval,
+		IsTopkReduce:       isTopKReduce,
+		IsRecallEvaluation: isRecallEvaluation,
 	}, nil
 }
 
