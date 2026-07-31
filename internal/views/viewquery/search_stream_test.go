@@ -51,8 +51,21 @@ func TestSearchOnViewStreamSendsChunksAndEOF(t *testing.T) {
 	stream, err := searchutil.NewGRPCReduceStream(context.Background(), client, streamTestRequest())
 	require.NoError(t, err)
 
-	assertStreamChunk(t, recvSearchStreamChunk(t, stream), []int64{1, 2}, []int64{2, 0})
-	assertStreamChunk(t, recvSearchStreamChunk(t, stream), []int64{3, 10}, []int64{1, 1})
+	first := recvSearchStreamChunk(t, stream)
+	assertStreamChunk(t, first, []int64{1, 2}, []int64{2, 0})
+	require.Equal(t, int64(100), first.GetCostAggregation().GetTotalRelatedDataSize())
+	require.Equal(t, map[string]uint64{"channel-a": 1000}, first.GetChannelsMvcc())
+	require.Equal(t, int64(30), first.GetScannedRemoteBytes())
+	require.Equal(t, int64(40), first.GetScannedTotalBytes())
+	require.Equal(t, int64(50), first.GetResultData().GetAllSearchCount())
+
+	second := recvSearchStreamChunk(t, stream)
+	assertStreamChunk(t, second, []int64{3, 10}, []int64{1, 1})
+	require.Nil(t, second.GetCostAggregation())
+	require.Empty(t, second.GetChannelsMvcc())
+	require.Zero(t, second.GetScannedRemoteBytes())
+	require.Zero(t, second.GetScannedTotalBytes())
+	require.Zero(t, second.GetResultData().GetAllSearchCount())
 	assertStreamChunk(t, recvSearchStreamChunk(t, stream), []int64{11}, []int64{0, 1})
 
 	chunk, err := stream.Recv()
@@ -61,6 +74,48 @@ func TestSearchOnViewStreamSendsChunksAndEOF(t *testing.T) {
 	require.NoError(t, stream.Close())
 	require.Equal(t, 1, tasks.releaseCount)
 	require.Equal(t, int64(10), provider.request.GetCollectionID())
+}
+
+func TestSearchOnViewStreamSendsEmptyChunkWithMetadata(t *testing.T) {
+	result := &internalpb.SearchResults{
+		Status:             merr.Success(),
+		MetricType:         "IP",
+		NumQueries:         2,
+		TopK:               3,
+		CostAggregation:    &internalpb.CostAggregation{TotalRelatedDataSize: 100},
+		ChannelsMvcc:       map[string]uint64{"channel-a": 1000},
+		ScannedRemoteBytes: 30,
+		ScannedTotalBytes:  40,
+		ResultData: &schemapb.SearchResultData{
+			NumQueries:     2,
+			TopK:           3,
+			Topks:          []int64{0, 0},
+			Ids:            &schemapb.IDs{IdField: &schemapb.IDs_IntId{IntId: &schemapb.LongArray{}}},
+			AllSearchCount: 50,
+		},
+	}
+	server := NewServer(
+		&streamTestProvider{searchTasks: &streamTestSearchTasks{tasks: []SearchSegmentTask{struct{}{}}}},
+		&streamTestScheduler{result: result},
+	)
+	client, cleanup := startSearchStreamTestServer(t, server)
+	defer cleanup()
+	stream, err := searchutil.NewGRPCReduceStream(context.Background(), client, streamTestRequest())
+	require.NoError(t, err)
+
+	chunk := recvSearchStreamChunk(t, stream)
+	require.Empty(t, chunk.GetResultData().GetIds().GetIntId().GetData())
+	require.Equal(t, []int64{0, 0}, chunk.GetResultData().GetTopks())
+	require.Equal(t, int64(100), chunk.GetCostAggregation().GetTotalRelatedDataSize())
+	require.Equal(t, map[string]uint64{"channel-a": 1000}, chunk.GetChannelsMvcc())
+	require.Equal(t, int64(30), chunk.GetScannedRemoteBytes())
+	require.Equal(t, int64(40), chunk.GetScannedTotalBytes())
+	require.Equal(t, int64(50), chunk.GetResultData().GetAllSearchCount())
+
+	chunk, err = stream.Recv()
+	require.Nil(t, chunk)
+	require.ErrorIs(t, err, io.EOF)
+	require.NoError(t, stream.Close())
 }
 
 func TestSearchOnViewStreamReturnsServerError(t *testing.T) {
@@ -162,14 +217,19 @@ func streamTestRequest() *viewpb.SearchOnViewRequest {
 
 func streamTestResult() *internalpb.SearchResults {
 	return &internalpb.SearchResults{
-		Status:     merr.Success(),
-		MetricType: "IP",
-		NumQueries: 2,
-		TopK:       3,
+		Status:             merr.Success(),
+		MetricType:         "IP",
+		NumQueries:         2,
+		TopK:               3,
+		CostAggregation:    &internalpb.CostAggregation{TotalRelatedDataSize: 100},
+		ChannelsMvcc:       map[string]uint64{"channel-a": 1000},
+		ScannedRemoteBytes: 30,
+		ScannedTotalBytes:  40,
 		ResultData: &schemapb.SearchResultData{
-			NumQueries: 2,
-			TopK:       3,
-			Topks:      []int64{3, 2},
+			NumQueries:     2,
+			TopK:           3,
+			Topks:          []int64{3, 2},
+			AllSearchCount: 50,
 			Ids: &schemapb.IDs{IdField: &schemapb.IDs_IntId{
 				IntId: &schemapb.LongArray{Data: []int64{1, 2, 3, 10, 11}},
 			}},

@@ -26,6 +26,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
+	commonpb "github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
@@ -228,6 +229,61 @@ func TestOrderedReduceStreamComposesReducedChildStreams(t *testing.T) {
 	assertSearchChunk(t, recvChunk(t, stream), []int64{3}, []float32{0.75}, []int64{1})
 }
 
+func TestOrderedReduceStreamComposesMetadata(t *testing.T) {
+	request := &internalpb.SearchRequest{Nq: 1, Topk: 4, MetricType: "IP"}
+	leftFirst := newSearchChunk(1, 4, []testHit{{id: 1, score: 0.95}})
+	leftFirst.CostAggregation = &internalpb.CostAggregation{ResponseTime: 10, TotalRelatedDataSize: 10}
+	leftFirst.ChannelsMvcc = map[string]uint64{"channel-a": 100}
+	leftFirst.ScannedRemoteBytes = 1
+	leftFirst.ScannedTotalBytes = 2
+	leftFirst.ResultData.AllSearchCount = 3
+	leftSecond := newSearchChunk(1, 4, []testHit{{id: 3, score: 0.75}})
+	leftSecond.CostAggregation = &internalpb.CostAggregation{ResponseTime: 20, TotalRelatedDataSize: 20}
+	leftSecond.ChannelsMvcc = map[string]uint64{"channel-b": 200}
+	leftSecond.ScannedRemoteBytes = 4
+	leftSecond.ScannedTotalBytes = 5
+	leftSecond.ResultData.AllSearchCount = 6
+	left, err := NewReduceStream(request, []ReduceStream{
+		&fakeReduceStream{recv: []fakeStreamRecv{{chunk: leftFirst}}},
+		&fakeReduceStream{recv: []fakeStreamRecv{{chunk: leftSecond}}},
+	}, 2)
+	require.NoError(t, err)
+
+	rightFirst := newSearchChunk(1, 4, []testHit{{id: 2, score: 0.90}})
+	rightFirst.CostAggregation = &internalpb.CostAggregation{ResponseTime: 30, TotalRelatedDataSize: 30}
+	rightFirst.ChannelsMvcc = map[string]uint64{"channel-c": 300}
+	rightFirst.ScannedRemoteBytes = 7
+	rightFirst.ScannedTotalBytes = 8
+	rightFirst.ResultData.AllSearchCount = 9
+	rightSecond := newSearchChunk(1, 4, []testHit{{id: 4, score: 0.70}})
+	rightSecond.CostAggregation = &internalpb.CostAggregation{ResponseTime: 40, TotalRelatedDataSize: 40}
+	rightSecond.ChannelsMvcc = map[string]uint64{"channel-d": 400}
+	rightSecond.ScannedRemoteBytes = 10
+	rightSecond.ScannedTotalBytes = 11
+	rightSecond.ResultData.AllSearchCount = 12
+	right, err := NewReduceStream(request, []ReduceStream{
+		&fakeReduceStream{recv: []fakeStreamRecv{{chunk: rightFirst}}},
+		&fakeReduceStream{recv: []fakeStreamRecv{{chunk: rightSecond}}},
+	}, 2)
+	require.NoError(t, err)
+
+	stream, err := NewReduceStream(request, []ReduceStream{left, right}, 4)
+	require.NoError(t, err)
+	chunk := recvChunk(t, stream)
+	assertSearchChunk(t, chunk, []int64{1, 2, 3, 4}, []float32{0.95, 0.90, 0.75, 0.70}, []int64{4})
+	require.Equal(t, int64(40), chunk.GetCostAggregation().GetResponseTime())
+	require.Equal(t, int64(100), chunk.GetCostAggregation().GetTotalRelatedDataSize())
+	require.Equal(t, map[string]uint64{
+		"channel-a": 100,
+		"channel-b": 200,
+		"channel-c": 300,
+		"channel-d": 400,
+	}, chunk.GetChannelsMvcc())
+	require.Equal(t, int64(22), chunk.GetScannedRemoteBytes())
+	require.Equal(t, int64(26), chunk.GetScannedTotalBytes())
+	require.Equal(t, int64(30), chunk.GetResultData().GetAllSearchCount())
+}
+
 func TestOrderedReduceStreamUsesInternalScoreOrderForL2(t *testing.T) {
 	leftChunk := newSearchChunk(1, 2, []testHit{{id: 1, score: -0.10}})
 	leftChunk.MetricType = "L2"
@@ -275,6 +331,197 @@ func TestSplitSearchResultPreservesQueryBoundaries(t *testing.T) {
 	assertSearchChunk(t, chunks[0], []int64{1, 2}, []float32{0.9, 0.8}, []int64{2, 0})
 	assertSearchChunk(t, chunks[1], []int64{3, 10}, []float32{0.7, 0.95}, []int64{1, 1})
 	assertSearchChunk(t, chunks[2], []int64{11}, []float32{0.85}, []int64{0, 1})
+}
+
+func TestSplitSearchResultEmitsMetadataOnce(t *testing.T) {
+	result := newSearchChunk(1, 3,
+		[]testHit{{id: 1, score: 0.9}, {id: 2, score: 0.8}, {id: 3, score: 0.7}},
+	)
+	result.Base = &commonpb.MsgBase{SourceID: 100}
+	result.ReqID = 200
+	result.SealedSegmentIDsSearched = []int64{11, 12}
+	result.ChannelIDsSearched = []string{"channel-a"}
+	result.GlobalSealedSegmentIDs = []int64{21}
+	result.CostAggregation = &internalpb.CostAggregation{
+		ResponseTime:         10,
+		ServiceTime:          8,
+		TotalNQ:              4,
+		TotalRelatedDataSize: 100,
+	}
+	result.ChannelsMvcc = map[string]uint64{"channel-a": 1000}
+	result.ScannedRemoteBytes = 30
+	result.ScannedTotalBytes = 40
+	result.FilterValidCounts = []int64{5, 6}
+	result.ResultData.AllSearchCount = 50
+
+	chunks, err := SplitSearchResult(result, 1)
+	require.NoError(t, err)
+	require.Len(t, chunks, 3)
+
+	require.Equal(t, int64(100), chunks[0].GetBase().GetSourceID())
+	require.Equal(t, int64(200), chunks[0].GetReqID())
+	require.Equal(t, []int64{11, 12}, chunks[0].GetSealedSegmentIDsSearched())
+	require.Equal(t, []string{"channel-a"}, chunks[0].GetChannelIDsSearched())
+	require.Equal(t, []int64{21}, chunks[0].GetGlobalSealedSegmentIDs())
+	require.True(t, proto.Equal(result.GetCostAggregation(), chunks[0].GetCostAggregation()))
+	require.Equal(t, map[string]uint64{"channel-a": 1000}, chunks[0].GetChannelsMvcc())
+	require.Equal(t, int64(30), chunks[0].GetScannedRemoteBytes())
+	require.Equal(t, int64(40), chunks[0].GetScannedTotalBytes())
+	require.Equal(t, []int64{5, 6}, chunks[0].GetFilterValidCounts())
+	require.Equal(t, int64(50), chunks[0].GetResultData().GetAllSearchCount())
+
+	for _, chunk := range chunks[1:] {
+		require.Empty(t, chunk.GetSealedSegmentIDsSearched())
+		require.Empty(t, chunk.GetChannelIDsSearched())
+		require.Empty(t, chunk.GetGlobalSealedSegmentIDs())
+		require.Nil(t, chunk.GetCostAggregation())
+		require.Empty(t, chunk.GetChannelsMvcc())
+		require.Zero(t, chunk.GetScannedRemoteBytes())
+		require.Zero(t, chunk.GetScannedTotalBytes())
+		require.Empty(t, chunk.GetFilterValidCounts())
+		require.Zero(t, chunk.GetResultData().GetAllSearchCount())
+	}
+}
+
+func TestSplitSearchResultEmitsEmptyChunkWithMetadata(t *testing.T) {
+	result := newSearchChunk(1, 2)
+	result.CostAggregation = &internalpb.CostAggregation{TotalRelatedDataSize: 100}
+	result.ChannelsMvcc = map[string]uint64{"channel-a": 1000}
+	result.ScannedRemoteBytes = 30
+	result.ScannedTotalBytes = 40
+	result.ResultData.AllSearchCount = 50
+
+	chunks, err := SplitSearchResult(result, 2)
+	require.NoError(t, err)
+	require.Len(t, chunks, 1)
+	require.Empty(t, chunks[0].GetResultData().GetIds().GetIntId().GetData())
+	require.Equal(t, []int64{0}, chunks[0].GetResultData().GetTopks())
+	require.Equal(t, int64(100), chunks[0].GetCostAggregation().GetTotalRelatedDataSize())
+	require.Equal(t, map[string]uint64{"channel-a": 1000}, chunks[0].GetChannelsMvcc())
+	require.Equal(t, int64(30), chunks[0].GetScannedRemoteBytes())
+	require.Equal(t, int64(40), chunks[0].GetScannedTotalBytes())
+	require.Equal(t, int64(50), chunks[0].GetResultData().GetAllSearchCount())
+}
+
+func TestOrderedReduceStreamAggregatesMetadataOnce(t *testing.T) {
+	leftChunk := newSearchChunk(1, 3,
+		[]testHit{{id: 1, score: 0.9}, {id: 3, score: 0.7}},
+	)
+	leftChunk.SealedSegmentIDsSearched = []int64{11}
+	leftChunk.ChannelIDsSearched = []string{"channel-a"}
+	leftChunk.GlobalSealedSegmentIDs = []int64{21}
+	leftChunk.CostAggregation = &internalpb.CostAggregation{
+		ResponseTime:         10,
+		ServiceTime:          8,
+		TotalNQ:              4,
+		TotalRelatedDataSize: 100,
+	}
+	leftChunk.ChannelsMvcc = map[string]uint64{"channel-a": 1000}
+	leftChunk.ScannedRemoteBytes = 30
+	leftChunk.ScannedTotalBytes = 40
+	leftChunk.FilterValidCounts = []int64{5}
+	leftChunk.ResultData.AllSearchCount = 50
+
+	rightChunk := newSearchChunk(1, 3,
+		[]testHit{{id: 2, score: 0.8}},
+	)
+	rightChunk.SealedSegmentIDsSearched = []int64{12}
+	rightChunk.ChannelIDsSearched = []string{"channel-b"}
+	rightChunk.GlobalSealedSegmentIDs = []int64{22}
+	rightChunk.CostAggregation = &internalpb.CostAggregation{
+		ResponseTime:         20,
+		ServiceTime:          18,
+		TotalNQ:              6,
+		TotalRelatedDataSize: 200,
+	}
+	rightChunk.ChannelsMvcc = map[string]uint64{"channel-b": 2000}
+	rightChunk.ScannedRemoteBytes = 50
+	rightChunk.ScannedTotalBytes = 60
+	rightChunk.FilterValidCounts = []int64{6}
+	rightChunk.ResultData.AllSearchCount = 70
+
+	stream, err := NewReduceStream(
+		&internalpb.SearchRequest{Nq: 1, Topk: 3, MetricType: "IP"},
+		[]ReduceStream{
+			&fakeReduceStream{recv: []fakeStreamRecv{{chunk: leftChunk}}},
+			&fakeReduceStream{recv: []fakeStreamRecv{{chunk: rightChunk}}},
+		},
+		2,
+	)
+	require.NoError(t, err)
+
+	first := recvChunk(t, stream)
+	assertSearchChunk(t, first, []int64{1, 2}, []float32{0.9, 0.8}, []int64{2})
+	require.ElementsMatch(t, []int64{11, 12}, first.GetSealedSegmentIDsSearched())
+	require.ElementsMatch(t, []string{"channel-a", "channel-b"}, first.GetChannelIDsSearched())
+	require.ElementsMatch(t, []int64{21, 22}, first.GetGlobalSealedSegmentIDs())
+	require.Equal(t, int64(20), first.GetCostAggregation().GetResponseTime())
+	require.Equal(t, int64(18), first.GetCostAggregation().GetServiceTime())
+	require.Equal(t, int64(6), first.GetCostAggregation().GetTotalNQ())
+	require.Equal(t, int64(300), first.GetCostAggregation().GetTotalRelatedDataSize())
+	require.Equal(t, map[string]uint64{"channel-a": 1000, "channel-b": 2000}, first.GetChannelsMvcc())
+	require.Equal(t, int64(80), first.GetScannedRemoteBytes())
+	require.Equal(t, int64(100), first.GetScannedTotalBytes())
+	require.ElementsMatch(t, []int64{5, 6}, first.GetFilterValidCounts())
+	require.Equal(t, int64(120), first.GetResultData().GetAllSearchCount())
+
+	second := recvChunk(t, stream)
+	assertSearchChunk(t, second, []int64{3}, []float32{0.7}, []int64{1})
+	require.Empty(t, second.GetSealedSegmentIDsSearched())
+	require.Empty(t, second.GetChannelIDsSearched())
+	require.Empty(t, second.GetGlobalSealedSegmentIDs())
+	require.Nil(t, second.GetCostAggregation())
+	require.Empty(t, second.GetChannelsMvcc())
+	require.Zero(t, second.GetScannedRemoteBytes())
+	require.Zero(t, second.GetScannedTotalBytes())
+	require.Empty(t, second.GetFilterValidCounts())
+	require.Zero(t, second.GetResultData().GetAllSearchCount())
+}
+
+func TestOrderedReduceStreamEmitsMetadataForEmptyResults(t *testing.T) {
+	leftChunk := newSearchChunk(1, 1)
+	leftChunk.CostAggregation = &internalpb.CostAggregation{
+		ResponseTime:         10,
+		TotalRelatedDataSize: 100,
+	}
+	leftChunk.ChannelsMvcc = map[string]uint64{"channel-a": 1000}
+	leftChunk.ScannedRemoteBytes = 30
+	leftChunk.ScannedTotalBytes = 40
+	leftChunk.ResultData.AllSearchCount = 50
+
+	rightChunk := newSearchChunk(1, 1)
+	rightChunk.CostAggregation = &internalpb.CostAggregation{
+		ResponseTime:         20,
+		TotalRelatedDataSize: 200,
+	}
+	rightChunk.ChannelsMvcc = map[string]uint64{"channel-b": 2000}
+	rightChunk.ScannedRemoteBytes = 50
+	rightChunk.ScannedTotalBytes = 60
+	rightChunk.ResultData.AllSearchCount = 70
+
+	stream, err := NewReduceStream(
+		&internalpb.SearchRequest{Nq: 1, Topk: 1, MetricType: "IP"},
+		[]ReduceStream{
+			&fakeReduceStream{recv: []fakeStreamRecv{{chunk: leftChunk}}},
+			&fakeReduceStream{recv: []fakeStreamRecv{{chunk: rightChunk}}},
+		},
+		1,
+	)
+	require.NoError(t, err)
+
+	chunk := recvChunk(t, stream)
+	require.Empty(t, chunk.GetResultData().GetIds().GetIntId().GetData())
+	require.Equal(t, []int64{0}, chunk.GetResultData().GetTopks())
+	require.Equal(t, int64(20), chunk.GetCostAggregation().GetResponseTime())
+	require.Equal(t, int64(300), chunk.GetCostAggregation().GetTotalRelatedDataSize())
+	require.Equal(t, map[string]uint64{"channel-a": 1000, "channel-b": 2000}, chunk.GetChannelsMvcc())
+	require.Equal(t, int64(80), chunk.GetScannedRemoteBytes())
+	require.Equal(t, int64(100), chunk.GetScannedTotalBytes())
+	require.Equal(t, int64(120), chunk.GetResultData().GetAllSearchCount())
+
+	chunk, err = stream.Recv()
+	require.Nil(t, chunk)
+	require.ErrorIs(t, err, io.EOF)
 }
 
 func TestOrderedReduceStreamStartsMissingChildReceivesConcurrently(t *testing.T) {
