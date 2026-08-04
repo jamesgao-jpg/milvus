@@ -3,6 +3,7 @@ package queryclient
 import (
 	"context"
 	"errors"
+	"io"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -104,9 +105,14 @@ func TestLegacyClientSearchReducesIteratorVChannelStreams(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	require.Len(t, result.Results, 1)
-	require.Equal(t, []int64{1, 2, 3}, result.Results[0].GetResultData().GetIds().GetIntId().GetData())
-	require.Equal(t, []float32{0.9, 0.8, 0.7}, result.Results[0].GetResultData().GetScores())
+	require.NotNil(t, result.Stream)
+	chunk, err := result.Stream.Recv()
+	require.NoError(t, err)
+	require.Equal(t, []int64{1, 2, 3}, chunk.GetResultData().GetIds().GetIntId().GetData())
+	require.Equal(t, []float32{0.9, 0.8, 0.7}, chunk.GetResultData().GetScores())
+	_, err = result.Stream.Recv()
+	require.ErrorIs(t, err, io.EOF)
+	require.NoError(t, result.Stream.Close())
 	require.Len(t, result.Plans, 2)
 }
 
@@ -188,8 +194,11 @@ func TestLegacyClientSearchRetriesIteratorBeforeFirstFinalChunk(t *testing.T) {
 	}})
 	require.NoError(t, err)
 	require.Equal(t, 2, openCount)
-	require.Len(t, result.Results, 1)
-	require.Equal(t, []int64{10}, result.Results[0].GetResultData().GetIds().GetIntId().GetData())
+	require.NotNil(t, result.Stream)
+	chunk, err := result.Stream.Recv()
+	require.NoError(t, err)
+	require.Equal(t, []int64{10}, chunk.GetResultData().GetIds().GetIntId().GetData())
+	require.NoError(t, result.Stream.Close())
 	require.Equal(t, 1, firstStream.closeCount())
 	require.Equal(t, 1, secondStream.closeCount())
 }
@@ -229,7 +238,7 @@ func TestLegacyClientSearchDoesNotRetryIteratorAfterFirstFinalChunk(t *testing.T
 		firstReplicaPicker{},
 	)
 
-	_, err := client.Legacy().Search(context.Background(), &LegacySearchRequest{Req: &internalpb.SearchRequest{
+	result, err := client.Legacy().Search(context.Background(), &LegacySearchRequest{Req: &internalpb.SearchRequest{
 		CollectionID:     100,
 		ConsistencyLevel: commonpb.ConsistencyLevel_Bounded,
 		Nq:               1,
@@ -237,6 +246,11 @@ func TestLegacyClientSearchDoesNotRetryIteratorAfterFirstFinalChunk(t *testing.T
 		MetricType:       "IP",
 		IsIterator:       true,
 	}})
+	require.NoError(t, err)
+	require.NotNil(t, result.Stream)
+	_, err = result.Stream.Recv()
+	require.NoError(t, err)
+	_, err = result.Stream.Recv()
 	require.ErrorContains(t, err, "receive failed after output")
 	require.Equal(t, 1, openCount)
 	require.Equal(t, 1, childStream.closeCount())

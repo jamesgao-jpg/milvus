@@ -17,6 +17,7 @@
 # limitations under the License.
 
 import argparse
+import math
 import os
 import time
 from typing import List
@@ -160,7 +161,7 @@ def run_smoke(args: argparse.Namespace) -> None:
             anns_field="vector",
             param={"metric_type": "L2", "params": {}},
             limit=ITERATOR_LIMIT,
-            output_fields=["id"],
+            output_fields=["id", "vector"],
         )
         actual_top_id = search_results[0][0].id
         if actual_top_id != SEARCH_ID:
@@ -169,13 +170,29 @@ def run_smoke(args: argparse.Namespace) -> None:
             )
 
         batch_search_ids = [hit.id for hit in search_results[0]]
+        for hit in search_results[0]:
+            actual_vector = hit.entity.get("vector")
+            expected_vector = vector_for(hit.id)
+            if actual_vector is None or len(actual_vector) != VECTOR_DIMENSION:
+                raise AssertionError(
+                    f"Batch Search did not requery vector for ID {hit.id}: {actual_vector}"
+                )
+            if any(
+                not math.isclose(actual, expected, rel_tol=0.0, abs_tol=1e-5)
+                for actual, expected in zip(actual_vector, expected_vector)
+            ):
+                raise AssertionError(
+                    f"Batch Search returned an unexpected vector for ID {hit.id}: "
+                    f"actual={actual_vector}, expected={expected_vector}"
+                )
+
         search_iterator = collection.search_iterator(
             data=[vector_for(SEARCH_ID)],
             anns_field="vector",
             param={"metric_type": "L2", "params": {}},
             batch_size=ITERATOR_BATCH_SIZE,
             limit=ITERATOR_LIMIT,
-            output_fields=["id"],
+            output_fields=["id", "vector"],
         )
         iterator_search_ids = []
         try:
@@ -183,7 +200,28 @@ def run_smoke(args: argparse.Namespace) -> None:
                 page = search_iterator.next()
                 if len(page) == 0:
                     break
-                iterator_search_ids.extend(hit.id for hit in page)
+                for hit in page:
+                    iterator_search_ids.append(hit.id)
+                    actual_vector = hit.entity.get("vector")
+                    expected_vector = vector_for(hit.id)
+                    if actual_vector is None or len(actual_vector) != VECTOR_DIMENSION:
+                        raise AssertionError(
+                            f"Search iterator did not requery vector for ID {hit.id}: "
+                            f"{actual_vector}"
+                        )
+                    if any(
+                        not math.isclose(
+                            actual,
+                            expected,
+                            rel_tol=0.0,
+                            abs_tol=1e-5,
+                        )
+                        for actual, expected in zip(actual_vector, expected_vector)
+                    ):
+                        raise AssertionError(
+                            f"Search iterator returned an unexpected vector for ID {hit.id}: "
+                            f"actual={actual_vector}, expected={expected_vector}"
+                        )
         finally:
             search_iterator.close()
 

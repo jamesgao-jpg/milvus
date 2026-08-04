@@ -21,7 +21,7 @@ type Client interface {
 	Legacy() LegacyClient
 }
 
-// LegacyClient executes proxy-generated legacy internal requests and returns raw results.
+// LegacyClient returns batch results or the final iterator ReduceStream.
 type LegacyClient interface {
 	Search(ctx context.Context, req *LegacySearchRequest) (*LegacySearchResult, error)
 	Query(ctx context.Context, req *LegacyQueryRequest) (*LegacyQueryResult, error)
@@ -33,6 +33,7 @@ type LegacySearchRequest struct {
 
 type LegacySearchResult struct {
 	Results []*internalpb.SearchResults
+	Stream  searchutil.ReduceStream
 	Plans   []ShardPlan
 }
 
@@ -56,6 +57,30 @@ func (c *legacyOnlyClient) Legacy() LegacyClient {
 type legacyClient struct {
 	shardClient   *shardViewQueryClient
 	shardResolver resolver.ShardResolver
+}
+
+type prefetchedReduceStream struct {
+	stream     searchutil.ReduceStream
+	firstChunk *internalpb.SearchResults
+}
+
+func (s *prefetchedReduceStream) Recv() (*internalpb.SearchResults, error) {
+	if s.firstChunk != nil {
+		chunk := s.firstChunk
+		s.firstChunk = nil
+		return chunk, nil
+	}
+	return s.stream.Recv()
+}
+
+func (s *prefetchedReduceStream) Close() error {
+	s.firstChunk = nil
+	return s.stream.Close()
+}
+
+func (s *prefetchedReduceStream) Interrupt() (*internalpb.SearchResults, error) {
+	s.firstChunk = nil
+	return s.stream.Interrupt()
 }
 
 func NewLegacyViewQueryClient(
@@ -136,32 +161,27 @@ func (c *legacyClient) Search(ctx context.Context, req *LegacySearchRequest) (*L
 				return nil, err
 			}
 
-			results := make([]*internalpb.SearchResults, 0)
-			receivedChunk := false
-			for {
-				chunk, recvErr := finalStream.Recv()
-				if errors.Is(recvErr, io.EOF) {
-					break
-				}
-				if recvErr != nil {
-					err = recvErr
-					break
-				}
-				receivedChunk = true
-				results = append(results, chunk)
-			}
-			err = errors.Join(err, finalStream.Close())
-			if err != nil {
-				if receivedChunk || ctx.Err() != nil {
-					return nil, err
+			firstChunk, recvErr := finalStream.Recv()
+			if recvErr != nil && !errors.Is(recvErr, io.EOF) {
+				err = errors.Join(recvErr, finalStream.Close())
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
 				}
 				lastErr = err
 				continue
 			}
 
+			stream := finalStream
+			if firstChunk != nil {
+				stream = &prefetchedReduceStream{
+					stream:     finalStream,
+					firstChunk: firstChunk,
+				}
+			}
+
 			return &LegacySearchResult{
-				Results: results,
-				Plans:   shardPlans,
+				Stream: stream,
+				Plans:  shardPlans,
 			}, nil
 		}
 		return nil, lastErr
