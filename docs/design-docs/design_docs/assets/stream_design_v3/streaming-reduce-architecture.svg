@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
-  <title id="title">Batch and Streaming Reduce architecture</title>
-  <desc id="desc">Current full-result collection and proposed streaming fan-in use the same QueryView work nodes, per-vchannel fan-ins in Proxy, final Proxy fan-in, and unary client response.</desc>
+  <title id="title">M1A Batch and Streaming Fan-In</title>
+  <desc id="desc">Non-iterator requests retain the current full-result batch fan-in. M1A iterator requests use streaming fan-in with the same QueryView work nodes, per-vchannel fan-ins in Proxy, final Proxy fan-in, and unary client response.</desc>
   <defs>
     <pattern id="redHatch" width="12" height="12" patternUnits="userSpaceOnUse" patternTransform="rotate(12)">
       <rect width="12" height="12" fill="#fff5f5"/>
@@ -46,13 +46,13 @@
   </defs>
 
   <rect width="1600" height="900" fill="#ffffff"/>
-  <text x="800" y="48" text-anchor="middle" class="hand title">Batch vs Streaming Reduce</text>
+  <text x="80" y="48" class="hand title">M1A: Batch vs Streaming Fan-In</text>
 
   <rect x="40" y="75" width="1520" height="345" rx="14" fill="url(#redHatch)" stroke="#dc2626" class="outline"/>
   <rect x="40" y="455" width="1520" height="370" rx="14" fill="url(#greenHatch)" stroke="#059669" class="outline"/>
 
-  <text x="75" y="115" class="hand panel-title">Current: Batch fan-in</text>
-  <text x="75" y="495" class="hand panel-title">Proposed: Streaming fan-in</text>
+  <text x="75" y="115" class="hand panel-title">Non-iterator and current paths: Batch fan-in</text>
+  <text x="75" y="495" class="hand panel-title">M1A iterator requests: Streaming fan-in</text>
 
   <!-- Work-node groups -->
   <g>

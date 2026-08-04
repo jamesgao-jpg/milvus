@@ -13,9 +13,15 @@
 
 ## 1. Summary
 
-Streaming Reduce changes internal Query and Search fan-in from complete-result collection to stream composition. Each child exposes a request-scoped stream, the parent binds child streams and the selected reduction strategy into one `ReduceStream`, and output is obtained through parent calling `ReduceStream.Recv()` when needed. In order to mitigate OOM problems, stream-reducible paths retain bounded child CHUNKs instead of complete direct-child results, but is open to more advanced coordinating algorithms mentioned in section 5.
+Streaming Reduce changes internal Query and Search fan-in from complete-result collection to stream composition. Each child exposes a request-scoped stream, the parent binds child streams and the selected reduction strategy into one `ReduceStream`, and output is obtained through parent calling `ReduceStream.Recv()` when needed. In order to mitigate OOM problems, stream-reducible paths retain bounded child CHUNKs instead of complete direct-child results. More advanced application-level coordination remains a later investigation.
 
 This document defines the architecture, stream abstraction, runtime rules, interfaces, transport, delivery, and validation for Streaming Reduce.
+
+The current implementation milestone is `M1A: Iterator Streaming Foundation`.
+M1A activates Streaming Reduce only for iterator requests using Plain Query or
+Plain ANN Search reduction semantics. Non-iterator Query and Search requests
+remain on the existing batch path. Scenario lists elsewhere in this document
+describe algorithmic applicability and do not expand the active milestone.
 
 ## 2. Motivation
 
@@ -32,6 +38,9 @@ stream-reducible path:
 Ordered paths may also stop unused lower-level tails after Proxy demand is satisfied. The implementation must preserve current result semantics and leave the existing path unchanged when disabled.
 
 ## 3. Architecture
+
+For M1A, the streaming panel below applies only to iterator requests. All
+non-iterator requests continue to use the current batch fan-in.
 
 ![Streaming Reduce architecture](assets/stream_design_v3/streaming-reduce-architecture.svg)
 
@@ -77,6 +86,11 @@ ReduceStream:
 // factory method
 NewReduceStream(request, childStreams) -> ReduceStream
 ```
+
+Across process boundaries, child streams use bidirectional gRPC from the
+initial implementation. The initial implementation uses fixed-Unit-count
+Chunks and gRPC's natural backpressure; application-level credit coordination
+remains a later investigation.
 
 ### 4.1 Reduce Stream
 
@@ -236,6 +250,11 @@ on server receives interruptRequest:
 
 ### 4.2 ReduceStream Implementations by Reduction Strategy
 
+The implementation classifications below describe reduction behavior. During
+M1A, only iterator requests using Plain Query or Plain ANN Search semantics may
+select these streaming implementations; non-iterator requests remain on the
+batch path.
+
 There is only one deciding criteria for splitting the below paradigm:
 
 ```text
@@ -368,16 +387,23 @@ ProduceNextUnits(readyBuffers):
 
 ![ReduceStream implementation comparison](assets/stream_design_v3/reduce-stream-recv-strategies.svg)
 
-### 4.3 Concrete ANN gRPC Flow
+### 4.3 Concrete Iterator Plain ANN gRPC Flow
 
-Plain ANN Search selects `OrderedReduceStream`. Proxy resolves the collection's vchannels. For each vchannel, QueryView obtains a QueryPlan from SN, opens one gRPC client stream for every SN/QN work node in `plan.WorkNodes`, and creates one per-vchannel reduced stream. Proxy then composes the per-vchannel streams into the final reduced stream.
+An iterator request using Plain ANN Search semantics selects
+`OrderedReduceStream`. Proxy resolves the collection's vchannels. For each
+vchannel, QueryView obtains a QueryPlan from SN, opens one gRPC client stream
+for every SN/QN work node in `plan.WorkNodes`, and creates one per-vchannel
+reduced stream. Proxy then composes the per-vchannel streams into the final
+reduced stream. Non-iterator Plain ANN Search does not enter this flow and
+continues to use the existing batch path.
 
 #### SN/QN Work Nodes
 
-P0 keeps local Segment execution and reduction unchanged. Each `SearchOnView()` stream sends its local result as CHUNKs.
+M1A keeps local Segment execution and reduction unchanged. Each
+`SearchOnViewStream()` sends its local result as CHUNKs.
 
 ```text
-SN/QN.SearchOnView(request):
+SN/QN.SearchOnViewStream(request):
     result = existingLocalANNSearchAndReduce(request)
 
     for each CHUNK built from result:
@@ -395,7 +421,7 @@ vchannelStreams = []
 for vchannel in vchannels:
     plan = GetQueryPlan(vchannel, request)
     workNodeStreams = [
-        queryServiceClient.SearchOnView(
+        queryServiceClient.SearchOnViewStream(
             node,
             requestForNode(plan, node)
         )
@@ -413,6 +439,7 @@ Proxy creates the final `OrderedReduceStream` from the per-vchannel streams and 
 
 ```text
 Proxy.Search(request):
+    assert request is an iterator request
     reducedStream = NewReduceStream(request, vchannelStreams)
     response = new SearchResponse
 
@@ -430,11 +457,15 @@ Proxy.Search(request):
 
 `EOF` represents natural completion. When Proxy reaches `topK` first, `Close()` terminates the unread child streams.
 
-![Plain ANN gRPC stream flow](assets/stream_design_v3/ann-grpc-stream-flow.svg)
+![Iterator Plain ANN gRPC stream flow](assets/stream_design_v3/ann-grpc-stream-flow.svg)
 
-## 5. Delivery Priority
+## 5. Milestones
 
-| Priority | Scope |
-| --- | --- |
-| P0 | 1. Based on current queryView branch, Zhen Ye, implement qn/sn-to-Proxy streaming and verify correctness.<br>2. Support following streaming scenarios:<br>- Plain Query (`OrderedReduceStream`)<br>- Plain Search (`OrderedReduceStream`)<br>- Query Group By (`UnOrderedReduceStream`)<br>- Search Group By (`UnOrderedReduceStream`)<br>For all other cases that support streaming algorithmically but not in implementation, for example, query order by, implement streaming by force each child stream only once for its entire results (fall back to batch based approach). |
-| P1 | 1. Once streaming framework in P0 has been implemented, implement stateful query/search iterator with queryView, Zhen Ye.<br>2. As more search scenarios become streamable in implementation (for example, with pk dedup removed from search path, query order by, Yihao Dai), transfer the fallback cases in P0 to true streaming cases. |
+The [Streaming development milestone design](https://zilliverse.feishu.cn/wiki/GMnAwbgVjijzg2kU6Z8cVKuYnfd)
+defines the active implementation scope and overrides broader delivery language
+from earlier versions of this document.
+
+| Milestone | Details | Work scope | Work boundary | Completion criteria and validation |
+| --- | --- | --- | --- | --- |
+| M1A | Iterator Streaming Foundation | Implement `ReduceStream` for iterator requests using Plain Query and Plain ANN Search semantics. Establish QN/SN-to-Proxy bidirectional streaming. | Iterator requests only. Non-iterator requests remain on the batch path. Use fixed Chunk sizing: one Chunk contains at most `X` output Units. | End-to-end streaming execution succeeds. With deliberately large topK, peak retained memory approaches Chunk bytes times child count rather than complete-result bytes times child count. |
+| M1B | Stateful ANN Iterator | Integrate Cardinal ANN iterators with the M1A ANN `ReduceStream` and define the session lifecycle contract. | ANN Iterator only. Session ownership, persistence, cancellation, expiration, and cleanup require design agreement with Zhen Ye before implementation. | `Next()` preserves results, ordering, fields, metadata, and execution state. The agreed lifecycle behavior is preserved. |

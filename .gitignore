@@ -94,6 +94,7 @@ cpp_coverage/
 # virtualenv
 venv/
 .venv/
+.venv-smoke/
 
 # Python egg-info
 *.egg-info/

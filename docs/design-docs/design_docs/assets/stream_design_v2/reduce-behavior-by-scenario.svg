@@ -1,0 +1,132 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="900" viewBox="0 0 1800 900" role="img" aria-labelledby="title desc">
+  <title id="title">Reduce behavior by scenario</title>
+  <desc id="desc">Three scenario groups differ by parent retention, reduction readiness, semantic reduction result, and emitted stream representation.</desc>
+  <defs>
+    <pattern id="greenHatch" width="12" height="12" patternUnits="userSpaceOnUse" patternTransform="rotate(12)">
+      <rect width="12" height="12" fill="#f0fdf4"/>
+      <path d="M-3 3 L3 -3 M0 12 L12 0 M9 15 L15 9" stroke="#86efac" stroke-width="1.3" opacity="0.55"/>
+    </pattern>
+    <pattern id="orangeHatch" width="12" height="12" patternUnits="userSpaceOnUse" patternTransform="rotate(12)">
+      <rect width="12" height="12" fill="#fff7ed"/>
+      <path d="M-3 3 L3 -3 M0 12 L12 0 M9 15 L15 9" stroke="#fdba74" stroke-width="1.3" opacity="0.55"/>
+    </pattern>
+    <pattern id="blueHatch" width="12" height="12" patternUnits="userSpaceOnUse" patternTransform="rotate(12)">
+      <rect width="12" height="12" fill="#eff6ff"/>
+      <path d="M-3 3 L3 -3 M0 12 L12 0 M9 15 L15 9" stroke="#93c5fd" stroke-width="1.3" opacity="0.55"/>
+    </pattern>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M1 1 L11 6 L1 11" fill="none" stroke="#334155" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <filter id="rough" x="-3%" y="-3%" width="106%" height="106%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="1" seed="37" result="noise"/>
+      <feDisplacementMap in="SourceGraphic" in2="noise" scale="1.2" xChannelSelector="R" yChannelSelector="G"/>
+    </filter>
+  </defs>
+
+  <rect width="1800" height="900" fill="#ffffff"/>
+  <text x="900" y="62" text-anchor="middle" fill="#172033" font-family="Comic Sans MS, Bradley Hand, cursive" font-size="35" font-weight="700">Reduce Behavior by Scenario</text>
+
+  <g fill="#172033" font-family="Comic Sans MS, Bradley Hand, cursive">
+    <text x="580" y="120" text-anchor="middle" font-size="23" font-weight="700">PARENT RETAINS</text>
+    <text x="950" y="120" text-anchor="middle" font-size="23" font-weight="700">REDUCE WHEN</text>
+    <text x="1250" y="120" text-anchor="middle" font-size="23" font-weight="700">REDUCE RESULT</text>
+    <text x="1580" y="120" text-anchor="middle" font-size="23" font-weight="700">EMIT</text>
+  </g>
+
+  <g filter="url(#rough)" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="40" y="145" width="1720" height="215" rx="13" fill="url(#greenHatch)" stroke="#15803d" stroke-width="2.7"/>
+    <path d="M360 145 L360 360 M800 145 L800 360 M1100 145 L1100 360 M1400 145 L1400 360" fill="none" stroke="#15803d" stroke-width="2.1"/>
+    <rect x="380" y="180" width="400" height="112" rx="12" fill="#ffffff" stroke="#15803d" stroke-width="2.3"/>
+    <rect x="395" y="205" width="110" height="64" rx="8" fill="#ffffff" stroke="#15803d" stroke-width="2"/>
+    <rect x="525" y="205" width="110" height="64" rx="8" fill="#ffffff" stroke="#15803d" stroke-width="2"/>
+    <rect x="655" y="205" width="110" height="64" rx="8" fill="#ffffff" stroke="#15803d" stroke-width="2"/>
+    <rect x="835" y="180" width="230" height="145" rx="10" fill="#ffffff" stroke="#15803d" stroke-width="2.2"/>
+    <rect x="852" y="205" width="58" height="58" rx="7" fill="#dcfce7" stroke="#15803d" stroke-width="1.8"/>
+    <rect x="921" y="205" width="58" height="58" rx="7" fill="#dcfce7" stroke="#15803d" stroke-width="1.8"/>
+    <rect x="990" y="205" width="58" height="58" rx="7" fill="#dcfce7" stroke="#15803d" stroke-width="1.8"/>
+    <rect x="1165" y="205" width="170" height="64" rx="8" fill="#ffffff" stroke="#15803d" stroke-width="2"/>
+    <path d="M1335 237 L1460 237" fill="none" stroke="#15803d" stroke-width="2.7" marker-end="url(#arrow)"/>
+    <rect x="1480" y="205" width="170" height="64" rx="8" fill="#ffffff" stroke="#15803d" stroke-width="2"/>
+
+    <rect x="40" y="375" width="1720" height="235" rx="13" fill="url(#orangeHatch)" stroke="#d97706" stroke-width="2.7"/>
+    <path d="M360 375 L360 610 M800 375 L800 610 M1100 375 L1100 610 M1400 375 L1400 610" fill="none" stroke="#d97706" stroke-width="2.1"/>
+    <rect x="380" y="395" width="400" height="175" rx="12" fill="#ffffff" stroke="#d97706" stroke-width="2.3"/>
+    <rect x="395" y="413" width="100" height="135" rx="9" fill="#ffffff" stroke="#d97706" stroke-width="1.9"/>
+    <rect x="530" y="413" width="100" height="135" rx="9" fill="#ffffff" stroke="#d97706" stroke-width="1.9"/>
+    <rect x="665" y="413" width="100" height="135" rx="9" fill="#ffffff" stroke="#d97706" stroke-width="1.9"/>
+    <rect x="835" y="395" width="230" height="190" rx="10" fill="#ffffff" stroke="#d97706" stroke-width="2.2"/>
+    <rect x="852" y="420" width="58" height="105" rx="7" fill="#ffedd5" stroke="#d97706" stroke-width="1.8"/>
+    <rect x="921" y="420" width="58" height="105" rx="7" fill="#ffedd5" stroke="#d97706" stroke-width="1.8"/>
+    <rect x="990" y="420" width="58" height="105" rx="7" fill="#ffedd5" stroke="#d97706" stroke-width="1.8"/>
+    <rect x="1135" y="450" width="230" height="80" rx="9" fill="#ffffff" stroke="#d97706" stroke-width="2"/>
+    <path d="M1365 490 L1415 490" fill="none" stroke="#d97706" stroke-width="2.5" marker-end="url(#arrow)"/>
+    <rect x="1430" y="460" width="85" height="60" rx="8" fill="#ffffff" stroke="#d97706" stroke-width="2"/>
+    <rect x="1530" y="460" width="85" height="60" rx="8" fill="#ffffff" stroke="#d97706" stroke-width="2"/>
+    <rect x="1630" y="460" width="85" height="60" rx="8" fill="#ffffff" stroke="#d97706" stroke-width="2"/>
+
+    <rect x="40" y="625" width="1720" height="230" rx="13" fill="url(#blueHatch)" stroke="#2563eb" stroke-width="2.7"/>
+    <path d="M360 625 L360 855 M800 625 L800 855 M1100 625 L1100 855 M1400 625 L1400 855" fill="none" stroke="#2563eb" stroke-width="2.1"/>
+    <rect x="380" y="675" width="400" height="112" rx="12" fill="#ffffff" stroke="#2563eb" stroke-width="2.3"/>
+    <rect x="395" y="695" width="110" height="64" rx="8" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+    <rect x="525" y="695" width="110" height="64" rx="8" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+    <rect x="655" y="695" width="110" height="64" rx="8" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+    <rect x="835" y="665" width="230" height="150" rx="10" fill="#ffffff" stroke="#2563eb" stroke-width="2.2"/>
+    <rect x="852" y="690" width="58" height="58" rx="7" fill="#dbeafe" stroke="#2563eb" stroke-width="1.8"/>
+    <rect x="921" y="690" width="58" height="58" rx="7" fill="#ffffff" stroke="#2563eb" stroke-width="1.8"/>
+    <rect x="990" y="690" width="58" height="58" rx="7" fill="#ffffff" stroke="#2563eb" stroke-width="1.8"/>
+    <rect x="1135" y="690" width="230" height="80" rx="9" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+    <path d="M1365 730 L1415 730" fill="none" stroke="#2563eb" stroke-width="2.5" marker-end="url(#arrow)"/>
+    <rect x="1430" y="700" width="85" height="60" rx="8" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+    <rect x="1530" y="700" width="85" height="60" rx="8" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+    <rect x="1630" y="700" width="85" height="60" rx="8" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+  </g>
+
+  <g fill="#172033" font-family="Comic Sans MS, Bradley Hand, cursive">
+    <text x="200" y="218" text-anchor="middle" font-size="27" font-weight="700" fill="#15803d">ORDERED +</text>
+    <text x="200" y="253" text-anchor="middle" font-size="27" font-weight="700" fill="#15803d">SUPPORTED</text>
+    <text x="200" y="302" text-anchor="middle" font-size="19">Plain Query / Plain Search</text>
+    <text x="450" y="245" text-anchor="middle" font-size="17" font-weight="700">CHUNK</text>
+    <text x="580" y="245" text-anchor="middle" font-size="17" font-weight="700">CHUNK</text>
+    <text x="710" y="245" text-anchor="middle" font-size="17" font-weight="700">CHUNK</text>
+    <text x="580" y="325" text-anchor="middle" font-size="18">1 CHUNK / child</text>
+    <text x="881" y="241" text-anchor="middle" font-size="12" font-weight="700">CHUNK</text>
+    <text x="950" y="241" text-anchor="middle" font-size="12" font-weight="700">CHUNK</text>
+    <text x="1019" y="241" text-anchor="middle" font-size="12" font-weight="700">CHUNK</text>
+    <text x="950" y="300" text-anchor="middle" font-size="18" font-weight="700">all ready</text>
+    <text x="1250" y="245" text-anchor="middle" font-size="17" font-weight="700">CHUNK</text>
+    <text x="1565" y="245" text-anchor="middle" font-size="17" font-weight="700">CHUNK</text>
+
+    <text x="200" y="445" text-anchor="middle" font-size="25" font-weight="700" fill="#c25a00">ORDERED +</text>
+    <text x="200" y="480" text-anchor="middle" font-size="25" font-weight="700" fill="#c25a00">NOT SUPPORTED</text>
+    <text x="200" y="522" text-anchor="middle" font-size="17">Query ORDER BY</text>
+    <text x="200" y="549" text-anchor="middle" font-size="17">Search GROUP BY / Aggregation</text>
+    <text x="445" y="488" text-anchor="middle" font-size="17" font-weight="700">FULL</text>
+    <text x="580" y="488" text-anchor="middle" font-size="17" font-weight="700">FULL</text>
+    <text x="715" y="488" text-anchor="middle" font-size="17" font-weight="700">FULL</text>
+    <text x="580" y="596" text-anchor="middle" font-size="18">full result / child</text>
+    <text x="881" y="480" text-anchor="middle" font-size="12" font-weight="700">FULL</text>
+    <text x="950" y="480" text-anchor="middle" font-size="12" font-weight="700">FULL</text>
+    <text x="1019" y="480" text-anchor="middle" font-size="12" font-weight="700">FULL</text>
+    <text x="950" y="560" text-anchor="middle" font-size="18" font-weight="700">all drained</text>
+    <text x="1250" y="499" text-anchor="middle" font-size="19" font-weight="700">FULL RESULT</text>
+    <text x="1473" y="497" text-anchor="middle" font-size="13" font-weight="700">CHUNK</text>
+    <text x="1573" y="497" text-anchor="middle" font-size="13" font-weight="700">CHUNK</text>
+    <text x="1673" y="497" text-anchor="middle" font-size="13" font-weight="700">CHUNK</text>
+    <text x="1735" y="497" text-anchor="middle" font-size="24">...</text>
+
+    <text x="200" y="705" text-anchor="middle" font-size="28" font-weight="700" fill="#1d4ed8">IGNORE ORDER</text>
+    <text x="200" y="755" text-anchor="middle" font-size="19">Query GROUP BY</text>
+    <text x="450" y="735" text-anchor="middle" font-size="17" font-weight="700">CHUNK</text>
+    <text x="580" y="735" text-anchor="middle" font-size="17" font-weight="700">CHUNK</text>
+    <text x="710" y="735" text-anchor="middle" font-size="17" font-weight="700">CHUNK</text>
+    <text x="580" y="815" text-anchor="middle" font-size="18">1 CHUNK / child</text>
+    <text x="881" y="726" text-anchor="middle" font-size="12" font-weight="700">CHUNK</text>
+    <text x="950" y="790" text-anchor="middle" font-size="18" font-weight="700">any has data</text>
+    <text x="1250" y="726" text-anchor="middle" font-size="19" font-weight="700">FULL RESULT</text>
+    <text x="1250" y="810" text-anchor="middle" font-size="17">all drained</text>
+    <text x="1473" y="737" text-anchor="middle" font-size="13" font-weight="700">CHUNK</text>
+    <text x="1573" y="737" text-anchor="middle" font-size="13" font-weight="700">CHUNK</text>
+    <text x="1673" y="737" text-anchor="middle" font-size="13" font-weight="700">CHUNK</text>
+    <text x="1735" y="737" text-anchor="middle" font-size="24">...</text>
+  </g>
+</svg>

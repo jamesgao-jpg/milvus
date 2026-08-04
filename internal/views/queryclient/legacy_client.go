@@ -2,10 +2,13 @@ package queryclient
 
 import (
 	"context"
+	"errors"
+	"io"
 	"sync"
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/milvus-io/milvus/internal/util/searchutil"
 	"github.com/milvus-io/milvus/internal/views/queryclient/resolver"
 	"github.com/milvus-io/milvus/internal/views/qviews"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
@@ -84,6 +87,86 @@ func newLegacyClient(
 }
 
 func (c *legacyClient) Search(ctx context.Context, req *LegacySearchRequest) (*LegacySearchResult, error) {
+	if req.Req.GetIsIterator() &&
+		!req.Req.GetIsAdvanced() &&
+		len(req.Req.GetSubReqs()) == 0 &&
+		req.Req.GetGroupByFieldId() <= 0 &&
+		len(req.Req.GetGroupByFieldIds()) == 0 {
+		var lastErr error
+		for attempt := 0; attempt < c.shardClient.maxRetries; attempt++ {
+			vchannels, err := c.shardResolver.ResolveVChannels(ctx, req.Req.GetCollectionID())
+			if err != nil {
+				return nil, err
+			}
+
+			vchannelStreams := make([]searchutil.ReduceStream, len(vchannels))
+			shardPlans := make([]ShardPlan, len(vchannels))
+			var g errgroup.Group
+			for i := range vchannels {
+				i := i
+				g.Go(func() error {
+					stream, plan, err := c.shardClient.SearchStream(ctx, vchannels[i], req.Req)
+					if err != nil {
+						return err
+					}
+					vchannelStreams[i] = stream
+					shardPlans[i] = *plan
+					return nil
+				})
+			}
+
+			if err := g.Wait(); err != nil {
+				for _, stream := range vchannelStreams {
+					if stream != nil {
+						err = errors.Join(err, stream.Close())
+					}
+				}
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				lastErr = err
+				continue
+			}
+
+			finalStream, err := searchutil.NewReduceStream(req.Req, vchannelStreams, defaultSearchStreamChunkSize)
+			if err != nil {
+				for _, stream := range vchannelStreams {
+					err = errors.Join(err, stream.Close())
+				}
+				return nil, err
+			}
+
+			results := make([]*internalpb.SearchResults, 0)
+			receivedChunk := false
+			for {
+				chunk, recvErr := finalStream.Recv()
+				if errors.Is(recvErr, io.EOF) {
+					break
+				}
+				if recvErr != nil {
+					err = recvErr
+					break
+				}
+				receivedChunk = true
+				results = append(results, chunk)
+			}
+			err = errors.Join(err, finalStream.Close())
+			if err != nil {
+				if receivedChunk || ctx.Err() != nil {
+					return nil, err
+				}
+				lastErr = err
+				continue
+			}
+
+			return &LegacySearchResult{
+				Results: results,
+				Plans:   shardPlans,
+			}, nil
+		}
+		return nil, lastErr
+	}
+
 	vchannels, err := c.shardResolver.ResolveVChannels(ctx, req.Req.CollectionID)
 	if err != nil {
 		return nil, err

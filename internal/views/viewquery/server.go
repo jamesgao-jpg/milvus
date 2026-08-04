@@ -72,6 +72,15 @@ func (s *Server) SearchOnViewStream(stream viewpb.ViewQueryService_SearchOnViewS
 		}
 		return status.Error(codes.InvalidArgument, "SearchOnViewStream first message must contain a request")
 	}
+	legacyRequest := request.GetLegacyReq()
+	if legacyRequest == nil ||
+		!legacyRequest.GetIsIterator() ||
+		legacyRequest.GetIsAdvanced() ||
+		len(legacyRequest.GetSubReqs()) > 0 ||
+		legacyRequest.GetGroupByFieldId() > 0 ||
+		len(legacyRequest.GetGroupByFieldIds()) > 0 {
+		return status.Error(codes.InvalidArgument, "SearchOnViewStream supports Plain ANN Search iterator only")
+	}
 
 	response, err := s.SearchOnView(stream.Context(), request)
 	if err != nil {

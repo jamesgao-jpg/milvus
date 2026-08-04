@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="760" viewBox="0 0 1500 760" role="img" aria-labelledby="title desc">
+  <title id="title">Who calls ReduceStream Recv</title>
+  <desc id="desc">In process, the parent component directly calls ReduceStream Recv. Across gRPC, a server forwarding loop calls the internal ReduceStream Recv and sends each CHUNK, while the parent calls its separate ClientRecvStream Recv.</desc>
+  <defs>
+    <pattern id="blueHatch" width="12" height="12" patternUnits="userSpaceOnUse" patternTransform="rotate(12)">
+      <rect width="12" height="12" fill="#dbeafe"/>
+      <path d="M-3 3 L3 -3 M0 12 L12 0 M9 15 L15 9" stroke="#93c5fd" stroke-width="1.4" opacity="0.7"/>
+    </pattern>
+    <pattern id="orangeHatch" width="12" height="12" patternUnits="userSpaceOnUse" patternTransform="rotate(12)">
+      <rect width="12" height="12" fill="#ffedd5"/>
+      <path d="M-3 3 L3 -3 M0 12 L12 0 M9 15 L15 9" stroke="#fdba74" stroke-width="1.4" opacity="0.72"/>
+    </pattern>
+    <pattern id="greenHatch" width="12" height="12" patternUnits="userSpaceOnUse" patternTransform="rotate(12)">
+      <rect width="12" height="12" fill="#dcfce7"/>
+      <path d="M-3 3 L3 -3 M0 12 L12 0 M9 15 L15 9" stroke="#86efac" stroke-width="1.4" opacity="0.75"/>
+    </pattern>
+    <pattern id="grayHatch" width="12" height="12" patternUnits="userSpaceOnUse" patternTransform="rotate(12)">
+      <rect width="12" height="12" fill="#f1f5f9"/>
+      <path d="M-3 3 L3 -3 M0 12 L12 0 M9 15 L15 9" stroke="#cbd5e1" stroke-width="1.4" opacity="0.75"/>
+    </pattern>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M1 1 L11 6 L1 11" fill="none" stroke="#334155" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="greenArrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M1 1 L11 6 L1 11" fill="none" stroke="#16a34a" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <filter id="rough" x="-5%" y="-5%" width="110%" height="110%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="1" seed="63" result="noise"/>
+      <feDisplacementMap in="SourceGraphic" in2="noise" scale="1.4" xChannelSelector="R" yChannelSelector="G"/>
+    </filter>
+  </defs>
+
+  <rect width="1500" height="760" fill="#ffffff"/>
+  <text x="750" y="54" text-anchor="middle" fill="#172033" font-family="Comic Sans MS, Bradley Hand, cursive" font-size="32" font-weight="700">Who Calls ReduceStream.Recv()?</text>
+  <text x="750" y="91" text-anchor="middle" fill="#475569" font-family="Comic Sans MS, Bradley Hand, cursive" font-size="19">The logical API is the same; the direct caller changes at a process boundary.</text>
+
+  <g filter="url(#rough)" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="55" y="130" width="605" height="540" rx="14" fill="url(#grayHatch)" stroke="#64748b" stroke-width="2.6"/>
+    <rect x="110" y="285" width="205" height="105" rx="11" fill="url(#blueHatch)" stroke="#2563eb" stroke-width="2.6"/>
+    <rect x="400" y="285" width="205" height="105" rx="11" fill="url(#greenHatch)" stroke="#16a34a" stroke-width="2.7"/>
+    <path d="M315 322 L382 322" fill="none" stroke="#334155" stroke-width="2.8" marker-end="url(#arrow)"/>
+    <path d="M400 373 C365 430 330 430 292 390" fill="none" stroke="#16a34a" stroke-width="2.8" marker-end="url(#greenArrow)"/>
+
+    <rect x="700" y="130" width="745" height="540" rx="14" fill="url(#grayHatch)" stroke="#64748b" stroke-width="2.6"/>
+    <rect x="820" y="260" width="250" height="105" rx="11" fill="url(#greenHatch)" stroke="#16a34a" stroke-width="2.7"/>
+    <rect x="820" y="465" width="250" height="105" rx="11" fill="url(#orangeHatch)" stroke="#d97706" stroke-width="2.6"/>
+    <path d="M945 365 L945 447" fill="none" stroke="#334155" stroke-width="2.8" marker-end="url(#arrow)"/>
+
+    <rect x="1180" y="465" width="205" height="105" rx="11" fill="url(#blueHatch)" stroke="#2563eb" stroke-width="2.6"/>
+    <rect x="1180" y="260" width="205" height="105" rx="11" fill="url(#blueHatch)" stroke="#2563eb" stroke-width="2.6"/>
+    <path d="M1282 365 L1282 447" fill="none" stroke="#334155" stroke-width="2.8" marker-end="url(#arrow)"/>
+    <path d="M1070 517 L1162 517" fill="none" stroke="#16a34a" stroke-width="3" marker-end="url(#greenArrow)"/>
+  </g>
+
+  <g fill="#172033" font-family="Comic Sans MS, Bradley Hand, cursive">
+    <text x="358" y="184" text-anchor="middle" font-size="27" font-weight="700">In Process</text>
+    <text x="212" y="326" text-anchor="middle" font-size="20" font-weight="700">Parent Component</text>
+    <text x="348" y="296" text-anchor="middle" font-size="16" fill="#475569">calls Recv()</text>
+    <text x="503" y="320" text-anchor="middle" font-size="19" font-weight="700" fill="#15803d">Reduced</text>
+    <text x="503" y="350" text-anchor="middle" font-size="19" font-weight="700" fill="#15803d">ReduceStream</text>
+    <text x="352" y="439" text-anchor="middle" font-size="17" font-weight="700" fill="#15803d">returns CHUNK</text>
+    <text x="358" y="565" text-anchor="middle" font-size="20" fill="#475569">Parent directly calls the returned object.</text>
+
+    <text x="1073" y="184" text-anchor="middle" font-size="27" font-weight="700">Across gRPC</text>
+    <text x="914" y="222" text-anchor="middle" font-size="17" font-weight="700" fill="#475569">CHILD / SERVER PROCESS</text>
+    <text x="1282" y="222" text-anchor="middle" font-size="17" font-weight="700" fill="#475569">PARENT PROCESS</text>
+    <text x="945" y="300" text-anchor="middle" font-size="18" font-weight="700" fill="#15803d">ReduceStream</text>
+    <text x="945" y="330" text-anchor="middle" font-size="18" font-weight="700" fill="#15803d">Recv()</text>
+    <text x="945" y="408" text-anchor="middle" font-size="15" fill="#475569">server method: Recv() -&gt; Send()</text>
+    <text x="945" y="507" text-anchor="middle" font-size="17" font-weight="700">ServerSendStream</text>
+    <text x="945" y="537" text-anchor="middle" font-size="17">Send(CHUNK)</text>
+    <text x="1282" y="300" text-anchor="middle" font-size="18" font-weight="700">Parent Component</text>
+    <text x="1320" y="420" text-anchor="middle" font-size="15" fill="#475569">calls Recv()</text>
+    <text x="1282" y="507" text-anchor="middle" font-size="17" font-weight="700">ClientRecvStream</text>
+    <text x="1282" y="537" text-anchor="middle" font-size="17">Recv()</text>
+    <text x="1118" y="500" text-anchor="middle" font-size="16" font-weight="700" fill="#15803d">CHUNK</text>
+  </g>
+
+  <path d="M1140 205 C1135 320 1146 470 1138 600" fill="none" stroke="#dc2626" stroke-width="3" stroke-dasharray="10 8"/>
+  <text x="1140" y="628" text-anchor="middle" fill="#b91c1c" font-family="Comic Sans MS, Bradley Hand, cursive" font-size="15" font-weight="700">gRPC BOUNDARY</text>
+  <text x="1073" y="700" text-anchor="middle" fill="#b91c1c" font-family="Comic Sans MS, Bradley Hand, cursive" font-size="18" font-weight="700">Parent calls ClientRecvStream.Recv(), not server-side ReduceStream.Recv().</text>
+</svg>

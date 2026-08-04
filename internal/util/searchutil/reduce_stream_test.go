@@ -123,7 +123,7 @@ func TestOrderedReduceStreamMergesANNHits(t *testing.T) {
 	}}
 
 	stream, err := NewReduceStream(
-		&internalpb.SearchRequest{Nq: 1, Topk: 4, MetricType: "IP"},
+		&internalpb.SearchRequest{Nq: 1, Topk: 4, MetricType: "IP", IsIterator: true},
 		[]ReduceStream{left, right},
 		2,
 	)
@@ -151,7 +151,7 @@ func TestOrderedReduceStreamReturnsPartialFinalChunk(t *testing.T) {
 		[]testHit{{id: 2, score: 0.8}})}}}
 
 	stream, err := NewReduceStream(
-		&internalpb.SearchRequest{Nq: 1, Topk: 3, MetricType: "IP"},
+		&internalpb.SearchRequest{Nq: 1, Topk: 3, MetricType: "IP", IsIterator: true},
 		[]ReduceStream{left, right},
 		2,
 	)
@@ -178,7 +178,7 @@ func TestOrderedReduceStreamMergesMultipleQueries(t *testing.T) {
 	}}
 
 	stream, err := NewReduceStream(
-		&internalpb.SearchRequest{Nq: 2, Topk: 2, MetricType: "IP"},
+		&internalpb.SearchRequest{Nq: 2, Topk: 2, MetricType: "IP", IsIterator: true},
 		[]ReduceStream{left, right},
 		3,
 	)
@@ -195,7 +195,7 @@ func TestOrderedReduceStreamBreaksScoreTiesByPK(t *testing.T) {
 		[]testHit{{id: 2, score: 0.9}})}}}
 
 	stream, err := NewReduceStream(
-		&internalpb.SearchRequest{Nq: 1, Topk: 2, MetricType: "IP"},
+		&internalpb.SearchRequest{Nq: 1, Topk: 2, MetricType: "IP", IsIterator: true},
 		[]ReduceStream{left, right},
 		2,
 	)
@@ -205,7 +205,7 @@ func TestOrderedReduceStreamBreaksScoreTiesByPK(t *testing.T) {
 }
 
 func TestOrderedReduceStreamComposesReducedChildStreams(t *testing.T) {
-	request := &internalpb.SearchRequest{Nq: 1, Topk: 3, MetricType: "IP"}
+	request := &internalpb.SearchRequest{Nq: 1, Topk: 3, MetricType: "IP", IsIterator: true}
 	left, err := NewReduceStream(request, []ReduceStream{
 		&fakeReduceStream{recv: []fakeStreamRecv{{chunk: newSearchChunk(1, 3,
 			[]testHit{{id: 1, score: 0.95}, {id: 5, score: 0.50}})}}},
@@ -230,7 +230,7 @@ func TestOrderedReduceStreamComposesReducedChildStreams(t *testing.T) {
 }
 
 func TestOrderedReduceStreamComposesMetadata(t *testing.T) {
-	request := &internalpb.SearchRequest{Nq: 1, Topk: 4, MetricType: "IP"}
+	request := &internalpb.SearchRequest{Nq: 1, Topk: 4, MetricType: "IP", IsIterator: true}
 	leftFirst := newSearchChunk(1, 4, []testHit{{id: 1, score: 0.95}})
 	leftFirst.CostAggregation = &internalpb.CostAggregation{ResponseTime: 10, TotalRelatedDataSize: 10}
 	leftFirst.ChannelsMvcc = map[string]uint64{"channel-a": 100}
@@ -291,7 +291,7 @@ func TestOrderedReduceStreamUsesInternalScoreOrderForL2(t *testing.T) {
 	rightChunk.MetricType = "L2"
 
 	stream, err := NewReduceStream(
-		&internalpb.SearchRequest{Nq: 1, Topk: 2, MetricType: "L2"},
+		&internalpb.SearchRequest{Nq: 1, Topk: 2, MetricType: "L2", IsIterator: true},
 		[]ReduceStream{
 			&fakeReduceStream{recv: []fakeStreamRecv{{chunk: leftChunk}}},
 			&fakeReduceStream{recv: []fakeStreamRecv{{chunk: rightChunk}}},
@@ -311,7 +311,7 @@ func TestOrderedReduceStreamAcceptsEncodedChunk(t *testing.T) {
 	chunk.SlicedBlob = blob
 
 	stream, err := NewReduceStream(
-		&internalpb.SearchRequest{Nq: 1, Topk: 1, MetricType: "IP"},
+		&internalpb.SearchRequest{Nq: 1, Topk: 1, MetricType: "IP", IsIterator: true},
 		[]ReduceStream{&fakeReduceStream{recv: []fakeStreamRecv{{chunk: chunk}}}},
 		1,
 	)
@@ -441,7 +441,7 @@ func TestOrderedReduceStreamAggregatesMetadataOnce(t *testing.T) {
 	rightChunk.ResultData.AllSearchCount = 70
 
 	stream, err := NewReduceStream(
-		&internalpb.SearchRequest{Nq: 1, Topk: 3, MetricType: "IP"},
+		&internalpb.SearchRequest{Nq: 1, Topk: 3, MetricType: "IP", IsIterator: true},
 		[]ReduceStream{
 			&fakeReduceStream{recv: []fakeStreamRecv{{chunk: leftChunk}}},
 			&fakeReduceStream{recv: []fakeStreamRecv{{chunk: rightChunk}}},
@@ -500,7 +500,7 @@ func TestOrderedReduceStreamEmitsMetadataForEmptyResults(t *testing.T) {
 	rightChunk.ResultData.AllSearchCount = 70
 
 	stream, err := NewReduceStream(
-		&internalpb.SearchRequest{Nq: 1, Topk: 1, MetricType: "IP"},
+		&internalpb.SearchRequest{Nq: 1, Topk: 1, MetricType: "IP", IsIterator: true},
 		[]ReduceStream{
 			&fakeReduceStream{recv: []fakeStreamRecv{{chunk: leftChunk}}},
 			&fakeReduceStream{recv: []fakeStreamRecv{{chunk: rightChunk}}},
@@ -537,7 +537,7 @@ func TestOrderedReduceStreamStartsMissingChildReceivesConcurrently(t *testing.T)
 		chunk:   newSearchChunk(1, 2, []testHit{{id: 2, score: 0.8}}),
 	}
 	stream, err := NewReduceStream(
-		&internalpb.SearchRequest{Nq: 1, Topk: 2, MetricType: "IP"},
+		&internalpb.SearchRequest{Nq: 1, Topk: 2, MetricType: "IP", IsIterator: true},
 		[]ReduceStream{left, right},
 		2,
 	)
@@ -574,7 +574,7 @@ func TestOrderedReduceStreamClosesChildrenOnRecvError(t *testing.T) {
 	right := &fakeReduceStream{recv: []fakeStreamRecv{{chunk: newSearchChunk(1, 2,
 		[]testHit{{id: 2, score: 0.8}})}}}
 	stream, err := NewReduceStream(
-		&internalpb.SearchRequest{Nq: 1, Topk: 2, MetricType: "IP"},
+		&internalpb.SearchRequest{Nq: 1, Topk: 2, MetricType: "IP", IsIterator: true},
 		[]ReduceStream{left, right},
 		2,
 	)
@@ -593,7 +593,7 @@ func TestOrderedReduceStreamCloseIsIdempotent(t *testing.T) {
 	closeErr := errors.New("close failed")
 	child := &fakeReduceStream{closeErr: closeErr}
 	stream, err := NewReduceStream(
-		&internalpb.SearchRequest{Nq: 1, Topk: 1},
+		&internalpb.SearchRequest{Nq: 1, Topk: 1, IsIterator: true},
 		[]ReduceStream{child},
 		1,
 	)
@@ -615,30 +615,30 @@ func TestNewReduceStreamValidatesPlainANNSearch(t *testing.T) {
 	_, err := NewReduceStream(nil, []ReduceStream{child}, 1)
 	require.ErrorContains(t, err, "requires a Search request")
 
-	_, err = NewReduceStream(&internalpb.SearchRequest{Topk: 1}, []ReduceStream{child}, 1)
+	_, err = NewReduceStream(&internalpb.SearchRequest{Topk: 1, IsIterator: true}, []ReduceStream{child}, 1)
 	require.ErrorContains(t, err, "positive nq")
 
-	_, err = NewReduceStream(&internalpb.SearchRequest{Nq: 1}, []ReduceStream{child}, 1)
+	_, err = NewReduceStream(&internalpb.SearchRequest{Nq: 1, IsIterator: true}, []ReduceStream{child}, 1)
 	require.ErrorContains(t, err, "positive topK")
 
-	_, err = NewReduceStream(&internalpb.SearchRequest{Nq: 1, Topk: 1, IsAdvanced: true}, []ReduceStream{child}, 1)
-	require.ErrorContains(t, err, "Plain ANN Search only")
+	_, err = NewReduceStream(&internalpb.SearchRequest{Nq: 1, Topk: 1, IsIterator: true, IsAdvanced: true}, []ReduceStream{child}, 1)
+	require.ErrorContains(t, err, "Plain ANN Search iterator only")
 
-	_, err = NewReduceStream(&internalpb.SearchRequest{Nq: 1, Topk: 1, GroupByFieldIds: []int64{101}}, []ReduceStream{child}, 1)
-	require.ErrorContains(t, err, "Plain ANN Search only")
+	_, err = NewReduceStream(&internalpb.SearchRequest{Nq: 1, Topk: 1, IsIterator: true, GroupByFieldIds: []int64{101}}, []ReduceStream{child}, 1)
+	require.ErrorContains(t, err, "Plain ANN Search iterator only")
 
-	_, err = NewReduceStream(&internalpb.SearchRequest{Nq: 1, Topk: 1, IsIterator: true}, []ReduceStream{child}, 1)
-	require.ErrorContains(t, err, "Plain ANN Search only")
+	_, err = NewReduceStream(&internalpb.SearchRequest{Nq: 1, Topk: 1}, []ReduceStream{child}, 1)
+	require.ErrorContains(t, err, "Plain ANN Search iterator only")
 
-	_, err = NewReduceStream(&internalpb.SearchRequest{Nq: 1, Topk: 1}, []ReduceStream{child}, 0)
+	_, err = NewReduceStream(&internalpb.SearchRequest{Nq: 1, Topk: 1, IsIterator: true}, []ReduceStream{child}, 0)
 	require.ErrorContains(t, err, "positive Chunk size")
 
-	_, err = NewReduceStream(&internalpb.SearchRequest{Nq: 1, Topk: 1}, []ReduceStream{nil}, 1)
+	_, err = NewReduceStream(&internalpb.SearchRequest{Nq: 1, Topk: 1, IsIterator: true}, []ReduceStream{nil}, 1)
 	require.ErrorContains(t, err, "child stream 0 is nil")
 }
 
 func TestOrderedReduceStreamInterruptIsUnimplemented(t *testing.T) {
-	stream, err := NewReduceStream(&internalpb.SearchRequest{Nq: 1, Topk: 1}, nil, 1)
+	stream, err := NewReduceStream(&internalpb.SearchRequest{Nq: 1, Topk: 1, IsIterator: true}, nil, 1)
 	require.NoError(t, err)
 
 	metadata, err := stream.Interrupt()

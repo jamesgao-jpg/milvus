@@ -132,6 +132,21 @@ func TestSearchOnViewStreamReturnsServerError(t *testing.T) {
 	require.Equal(t, codes.NotFound, status.Code(err))
 }
 
+func TestSearchOnViewStreamRejectsNonIteratorRequest(t *testing.T) {
+	server := NewServer(&streamTestProvider{}, &streamTestScheduler{})
+	client, cleanup := startSearchStreamTestServer(t, server)
+	defer cleanup()
+
+	request := streamTestRequest()
+	request.LegacyReq.IsIterator = false
+	stream, err := searchutil.NewGRPCReduceStream(context.Background(), client, request)
+	require.NoError(t, err)
+
+	chunk, err := stream.Recv()
+	require.Nil(t, chunk)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
 func TestSearchOnViewStreamCloseCancelsServer(t *testing.T) {
 	started := make(chan struct{})
 	stopped := make(chan struct{})
@@ -205,6 +220,7 @@ func streamTestRequest() *viewpb.SearchOnViewRequest {
 			Nq:           2,
 			Topk:         3,
 			MetricType:   "IP",
+			IsIterator:   true,
 		},
 		ShardId: &viewpb.ShardID{ReplicaId: 1, Vchannel: "by-dev-rootcoord-dml_0_100v0"},
 		Version: &viewpb.QueryViewVersion{

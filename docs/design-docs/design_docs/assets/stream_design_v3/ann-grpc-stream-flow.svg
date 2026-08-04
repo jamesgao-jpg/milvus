@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
-  <title id="title">ANN gRPC Stream Flow</title>
-  <desc id="desc">Proxy resolves vchannels, obtains a QueryPlan from SN for each vchannel, opens SN and QN client streams, reduces each vchannel, and combines the vchannel streams into the final OrderedReduceStream.</desc>
+  <title id="title">M1A Iterator ANN Flow</title>
+  <desc id="desc">For an iterator ANN request, Proxy resolves vchannels, obtains a QueryPlan from SN for each vchannel, opens SN and QN client streams, reduces each vchannel, and combines the vchannel streams into the final OrderedReduceStream. Non-iterator requests remain on the batch path.</desc>
   <defs>
     <pattern id="blueHatch" width="12" height="12" patternUnits="userSpaceOnUse" patternTransform="rotate(12)">
       <rect width="12" height="12" fill="#eff6ff"/>
@@ -36,7 +36,7 @@
   </defs>
 
   <rect width="1600" height="900" fill="#ffffff"/>
-  <text x="800" y="48" text-anchor="middle" class="hand title">ANN gRPC Stream Flow</text>
+  <text x="80" y="48" class="hand title">M1A Iterator ANN Flow</text>
 
   <!-- Proxy process -->
   <rect x="55" y="75" width="1490" height="575" rx="14" fill="url(#grayHatch)" stroke="#64748b" stroke-width="2.2" stroke-dasharray="9 7"/>
@@ -93,10 +93,10 @@
   <text x="620" y="756" text-anchor="middle" class="hand component-title">QN(s) - vchannel A</text>
   <text x="980" y="756" text-anchor="middle" class="hand component-title">SN - vchannel B</text>
   <text x="1340" y="756" text-anchor="middle" class="hand component-title">QN(s) - vchannel B</text>
-  <text x="260" y="792" text-anchor="middle" class="box-title">SearchOnView()</text>
-  <text x="620" y="792" text-anchor="middle" class="box-title">SearchOnView()</text>
-  <text x="980" y="792" text-anchor="middle" class="box-title">SearchOnView()</text>
-  <text x="1340" y="792" text-anchor="middle" class="box-title">SearchOnView()</text>
+  <text x="260" y="792" text-anchor="middle" class="box-title">SearchOnViewStream()</text>
+  <text x="620" y="792" text-anchor="middle" class="box-title">SearchOnViewStream()</text>
+  <text x="980" y="792" text-anchor="middle" class="box-title">SearchOnViewStream()</text>
+  <text x="1340" y="792" text-anchor="middle" class="box-title">SearchOnViewStream()</text>
   <text x="260" y="822" text-anchor="middle" class="small">generated client stream</text>
   <text x="620" y="822" text-anchor="middle" class="small">generated client stream</text>
   <text x="980" y="822" text-anchor="middle" class="small">generated client stream</text>

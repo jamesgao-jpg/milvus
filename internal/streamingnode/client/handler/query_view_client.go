@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 
+	"github.com/milvus-io/milvus/internal/util/searchutil"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/service/lazygrpc"
 	"github.com/milvus-io/milvus/internal/views/qviews"
 	"github.com/milvus-io/milvus/internal/views/viewerror"
@@ -23,6 +24,7 @@ type QueryViewClient interface {
 
 	// SearchOnView executes a QueryView search on the StreamingNode owning the pchannel.
 	SearchOnView(ctx context.Context, pchannel types.PChannelInfo, req *viewpb.SearchOnViewRequest) (*viewpb.SearchOnViewResponse, error)
+	SearchOnViewStream(ctx context.Context, pchannel types.PChannelInfo, req *viewpb.SearchOnViewRequest) (searchutil.ReduceStream, error)
 
 	// QueryOnView executes a QueryView retrieve on the StreamingNode owning the pchannel.
 	QueryOnView(ctx context.Context, pchannel types.PChannelInfo, req *viewpb.QueryOnViewRequest) (*viewpb.QueryOnViewResponse, error)
@@ -71,6 +73,13 @@ func (qvc *queryViewClient) GetMVCCTimestamp(ctx context.Context, shardID qviews
 func (qvc *queryViewClient) SearchOnView(ctx context.Context, pchannel types.PChannelInfo, req *viewpb.SearchOnViewRequest) (*viewpb.SearchOnViewResponse, error) {
 	result, err := executeViewQueryRPC(ctx, qvc, pchannel, "ViewQueryService.SearchOnView", func(ctx context.Context, client viewpb.ViewQueryServiceClient) (*viewpb.SearchOnViewResponse, error) {
 		return client.SearchOnView(ctx, req)
+	})
+	return result, err
+}
+
+func (qvc *queryViewClient) SearchOnViewStream(ctx context.Context, pchannel types.PChannelInfo, req *viewpb.SearchOnViewRequest) (searchutil.ReduceStream, error) {
+	result, err := executeViewQueryRPC(ctx, qvc, pchannel, "ViewQueryService.SearchOnViewStream", func(ctx context.Context, client viewpb.ViewQueryServiceClient) (searchutil.ReduceStream, error) {
+		return searchutil.NewGRPCReduceStream(ctx, client, req)
 	})
 	return result, err
 }

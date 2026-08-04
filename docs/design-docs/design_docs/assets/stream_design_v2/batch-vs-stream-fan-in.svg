@@ -1,0 +1,138 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1160" viewBox="0 0 1400 1160" role="img" aria-labelledby="title desc">
+  <title id="title">Current batch fan-in compared with proposed stream fan-in</title>
+  <desc id="desc">The current batch fan-in retains complete child results and may exceed its memory budget. The proposed stream fan-in retains chunks, applies path-specific stream reduction, and remains below the memory budget.</desc>
+  <defs>
+    <pattern id="blueHatch" width="12" height="12" patternUnits="userSpaceOnUse" patternTransform="rotate(12)">
+      <rect width="12" height="12" fill="#dbeafe"/>
+      <path d="M-3 3 L3 -3 M0 12 L12 0 M9 15 L15 9" stroke="#93c5fd" stroke-width="1.4" opacity="0.7"/>
+    </pattern>
+    <pattern id="orangeHatch" width="12" height="12" patternUnits="userSpaceOnUse" patternTransform="rotate(12)">
+      <rect width="12" height="12" fill="#ffedd5"/>
+      <path d="M-3 3 L3 -3 M0 12 L12 0 M9 15 L15 9" stroke="#fdba74" stroke-width="1.4" opacity="0.72"/>
+    </pattern>
+    <pattern id="redHatch" width="12" height="12" patternUnits="userSpaceOnUse" patternTransform="rotate(12)">
+      <rect width="12" height="12" fill="#fee2e2"/>
+      <path d="M-3 3 L3 -3 M0 12 L12 0 M9 15 L15 9" stroke="#fca5a5" stroke-width="1.5" opacity="0.75"/>
+    </pattern>
+    <pattern id="greenHatch" width="12" height="12" patternUnits="userSpaceOnUse" patternTransform="rotate(12)">
+      <rect width="12" height="12" fill="#dcfce7"/>
+      <path d="M-3 3 L3 -3 M0 12 L12 0 M9 15 L15 9" stroke="#86efac" stroke-width="1.4" opacity="0.75"/>
+    </pattern>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M1 1 L11 6 L1 11" fill="none" stroke="#334155" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="redArrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M1 1 L11 6 L1 11" fill="none" stroke="#dc2626" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="greenArrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M1 1 L11 6 L1 11" fill="none" stroke="#16a34a" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <filter id="rough" x="-5%" y="-5%" width="110%" height="110%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="1" seed="17" result="noise"/>
+      <feDisplacementMap in="SourceGraphic" in2="noise" scale="1.4" xChannelSelector="R" yChannelSelector="G"/>
+    </filter>
+  </defs>
+
+  <rect width="1400" height="1160" fill="#ffffff"/>
+  <path d="M45 570 C420 566 980 574 1355 569" fill="none" stroke="#94a3b8" stroke-width="2" opacity="0.7"/>
+
+  <text x="700" y="48" text-anchor="middle" fill="#172033" font-family="Comic Sans MS, Bradley Hand, cursive" font-size="30" font-weight="700">Current batch fan-in</text>
+
+  <g filter="url(#rough)" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="48" y="105" width="240" height="96" rx="10" fill="url(#blueHatch)" stroke="#2563eb" stroke-width="2.4"/>
+    <rect x="48" y="235" width="240" height="96" rx="10" fill="url(#blueHatch)" stroke="#2563eb" stroke-width="2.4"/>
+    <rect x="48" y="365" width="240" height="96" rx="10" fill="url(#blueHatch)" stroke="#2563eb" stroke-width="2.4"/>
+    <path d="M288 153 C340 153 355 220 405 245" fill="none" stroke="#334155" stroke-width="2.8" marker-end="url(#arrow)"/>
+    <path d="M288 283 L405 283" fill="none" stroke="#334155" stroke-width="2.8" marker-end="url(#arrow)"/>
+    <path d="M288 413 C340 413 355 346 405 321" fill="none" stroke="#334155" stroke-width="2.8" marker-end="url(#arrow)"/>
+
+    <rect x="420" y="82" width="555" height="405" rx="14" fill="url(#orangeHatch)" stroke="#d97706" stroke-width="2.8"/>
+    <rect x="485" y="155" width="235" height="57" rx="8" fill="#ffffff" stroke="#d97706" stroke-width="2.1"/>
+    <rect x="485" y="230" width="235" height="57" rx="8" fill="#ffffff" stroke="#d97706" stroke-width="2.1"/>
+    <rect x="485" y="305" width="235" height="57" rx="8" fill="#ffffff" stroke="#d97706" stroke-width="2.1"/>
+    <path d="M720 258 L790 258" fill="none" stroke="#334155" stroke-width="2.6" marker-end="url(#arrow)"/>
+    <rect x="805" y="203" width="120" height="110" rx="9" fill="#fff7ed" stroke="#d97706" stroke-width="2.2"/>
+
+    <path d="M975 258 L1030 258" fill="none" stroke="#dc2626" stroke-width="3" marker-end="url(#redArrow)"/>
+    <rect x="1050" y="125" width="58" height="285" rx="8" fill="#ffffff" stroke="#dc2626" stroke-width="2.4"/>
+    <rect x="1058" y="215" width="42" height="187" rx="5" fill="url(#redHatch)" stroke="#dc2626" stroke-width="1.7"/>
+    <path d="M1025 235 C1090 229 1150 235 1212 230" fill="none" stroke="#dc2626" stroke-width="2.3" stroke-dasharray="9 8"/>
+    <path d="M1108 258 L1190 258" fill="none" stroke="#dc2626" stroke-width="3" marker-end="url(#redArrow)"/>
+    <ellipse cx="1270" cy="258" rx="72" ry="55" fill="url(#redHatch)" stroke="#dc2626" stroke-width="3.1"/>
+  </g>
+
+  <g fill="#172033" font-family="Comic Sans MS, Bradley Hand, cursive">
+    <text x="168" y="142" text-anchor="middle" font-size="20" font-weight="700">Child 1</text>
+    <text x="168" y="178" text-anchor="middle" font-size="16">Complete result</text>
+    <text x="168" y="272" text-anchor="middle" font-size="20" font-weight="700">Child 2</text>
+    <text x="168" y="308" text-anchor="middle" font-size="16">Complete result</text>
+    <text x="168" y="402" text-anchor="middle" font-size="20" font-weight="700">Child N</text>
+    <text x="168" y="438" text-anchor="middle" font-size="16">Complete result</text>
+    <text x="698" y="125" text-anchor="middle" font-size="24" font-weight="700">Parent fan-in</text>
+    <text x="602" y="191" text-anchor="middle" font-size="17">Retain result 1</text>
+    <text x="602" y="266" text-anchor="middle" font-size="17">Retain result 2</text>
+    <text x="602" y="341" text-anchor="middle" font-size="17">Retain result N</text>
+    <text x="865" y="250" text-anchor="middle" font-size="17" font-weight="700">Batch</text>
+    <text x="865" y="276" text-anchor="middle" font-size="17" font-weight="700">reduce</text>
+    <text x="1079" y="108" text-anchor="middle" font-size="18" font-weight="700" fill="#dc2626">Memory</text>
+    <text x="1180" y="219" text-anchor="middle" font-size="16" font-weight="700" fill="#dc2626">Memory budget</text>
+    <text x="1270" y="269" text-anchor="middle" font-size="28" font-weight="800" fill="#b91c1c">OOM</text>
+  </g>
+  <text x="700" y="530" text-anchor="middle" fill="#475569" font-family="Comic Sans MS, Bradley Hand, cursive" font-size="20">All complete child results remain resident before reduction.</text>
+
+  <text x="700" y="622" text-anchor="middle" fill="#172033" font-family="Comic Sans MS, Bradley Hand, cursive" font-size="30" font-weight="700">Proposed stream fan-in</text>
+
+  <g filter="url(#rough)" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="48" y="680" width="250" height="96" rx="10" fill="url(#blueHatch)" stroke="#2563eb" stroke-width="2.4"/>
+    <rect x="48" y="810" width="250" height="96" rx="10" fill="url(#blueHatch)" stroke="#2563eb" stroke-width="2.4"/>
+    <rect x="48" y="940" width="250" height="96" rx="10" fill="url(#blueHatch)" stroke="#2563eb" stroke-width="2.4"/>
+    <rect x="78" y="726" width="100" height="33" rx="6" fill="#ffffff" stroke="#2563eb" stroke-width="1.8"/>
+    <rect x="78" y="856" width="100" height="33" rx="6" fill="#ffffff" stroke="#2563eb" stroke-width="1.8"/>
+    <rect x="78" y="986" width="100" height="33" rx="6" fill="#ffffff" stroke="#2563eb" stroke-width="1.8"/>
+    <path d="M298 728 C345 728 365 790 410 810" fill="none" stroke="#334155" stroke-width="2.8" marker-end="url(#arrow)"/>
+    <path d="M298 858 L410 858" fill="none" stroke="#334155" stroke-width="2.8" marker-end="url(#arrow)"/>
+    <path d="M298 988 C345 988 365 926 410 906" fill="none" stroke="#334155" stroke-width="2.8" marker-end="url(#arrow)"/>
+
+    <rect x="425" y="655" width="585" height="405" rx="14" fill="url(#orangeHatch)" stroke="#d97706" stroke-width="2.8"/>
+    <rect x="470" y="735" width="125" height="54" rx="8" fill="#ffffff" stroke="#d97706" stroke-width="2.1"/>
+    <rect x="470" y="831" width="125" height="54" rx="8" fill="#ffffff" stroke="#d97706" stroke-width="2.1"/>
+    <rect x="470" y="927" width="125" height="54" rx="8" fill="#ffffff" stroke="#d97706" stroke-width="2.1"/>
+    <path d="M595 762 C635 762 650 805 685 822" fill="none" stroke="#334155" stroke-width="2.5" marker-end="url(#arrow)"/>
+    <path d="M595 858 L680 858" fill="none" stroke="#334155" stroke-width="2.5" marker-end="url(#arrow)"/>
+    <path d="M595 954 C635 954 650 911 685 894" fill="none" stroke="#334155" stroke-width="2.5" marker-end="url(#arrow)"/>
+    <rect x="695" y="800" width="185" height="116" rx="9" fill="#fff7ed" stroke="#d97706" stroke-width="2.2"/>
+    <path d="M880 858 L910 858" fill="none" stroke="#334155" stroke-width="2.5" marker-end="url(#arrow)"/>
+    <rect x="925" y="827" width="62" height="62" rx="7" fill="#ffffff" stroke="#d97706" stroke-width="2.1"/>
+
+    <path d="M1010 858 L1040 858" fill="none" stroke="#16a34a" stroke-width="3" marker-end="url(#greenArrow)"/>
+    <rect x="1055" y="793" width="145" height="130" rx="12" fill="url(#greenHatch)" stroke="#16a34a" stroke-width="2.6"/>
+    <rect x="1280" y="705" width="58" height="285" rx="8" fill="#ffffff" stroke="#16a34a" stroke-width="2.4"/>
+    <rect x="1288" y="890" width="42" height="92" rx="5" fill="url(#greenHatch)" stroke="#16a34a" stroke-width="1.7"/>
+    <path d="M1235 810 C1295 804 1340 810 1372 805" fill="none" stroke="#dc2626" stroke-width="2.3" stroke-dasharray="9 8"/>
+  </g>
+
+  <g fill="#172033" font-family="Comic Sans MS, Bradley Hand, cursive">
+    <text x="173" y="711" text-anchor="middle" font-size="17" font-weight="700">Child 1 ReduceStream</text>
+    <text x="128" y="748" text-anchor="middle" font-size="15" font-weight="700">CHUNK</text>
+    <text x="235" y="749" text-anchor="middle" font-size="24">...</text>
+    <text x="173" y="841" text-anchor="middle" font-size="17" font-weight="700">Child 2 ReduceStream</text>
+    <text x="128" y="878" text-anchor="middle" font-size="15" font-weight="700">CHUNK</text>
+    <text x="235" y="879" text-anchor="middle" font-size="24">...</text>
+    <text x="173" y="971" text-anchor="middle" font-size="17" font-weight="700">Child N ReduceStream</text>
+    <text x="128" y="1008" text-anchor="middle" font-size="15" font-weight="700">CHUNK</text>
+    <text x="235" y="1009" text-anchor="middle" font-size="24">...</text>
+    <text x="718" y="700" text-anchor="middle" font-size="24" font-weight="700">StreamReducer</text>
+    <text x="532" y="768" text-anchor="middle" font-size="16" font-weight="700">CHUNK</text>
+    <text x="532" y="864" text-anchor="middle" font-size="16" font-weight="700">CHUNK</text>
+    <text x="532" y="960" text-anchor="middle" font-size="16" font-weight="700">CHUNK</text>
+    <text x="788" y="847" text-anchor="middle" font-size="16" font-weight="700">Path-specific</text>
+    <text x="788" y="875" text-anchor="middle" font-size="16" font-weight="700">stream reduction</text>
+    <text x="956" y="864" text-anchor="middle" font-size="13" font-weight="700">CHUNK</text>
+    <text x="1127" y="848" text-anchor="middle" font-size="17" font-weight="700" fill="#15803d">Reduced</text>
+    <text x="1127" y="876" text-anchor="middle" font-size="17" font-weight="700" fill="#15803d">ReduceStream</text>
+    <text x="1309" y="688" text-anchor="middle" font-size="18" font-weight="700" fill="#15803d">Memory</text>
+    <text x="1270" y="794" text-anchor="end" font-size="15" font-weight="700" fill="#dc2626">Memory budget</text>
+    <text x="1309" y="1025" text-anchor="middle" font-size="17" font-weight="700" fill="#15803d">Bounded</text>
+  </g>
+  <text x="700" y="1115" text-anchor="middle" fill="#475569" font-family="Comic Sans MS, Bradley Hand, cursive" font-size="20">Only CHUNK data remains resident while stream reduction continues.</text>
+</svg>
