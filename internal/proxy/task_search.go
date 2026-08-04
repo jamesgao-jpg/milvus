@@ -1440,6 +1440,83 @@ func appendFinalSearchChunk(
 	return appendedSize, nil
 }
 
+func (t *searchTask) consumeResultStream(
+	stream searchutil.ReduceStream,
+	metricType string,
+	collectMetadata func(*internalpb.SearchResults),
+) (*milvuspb.SearchResults, string, error) {
+	limit := t.GetTopk() - t.GetOffset()
+	if limit <= 0 {
+		return nil, metricType, merr.Combine(fmt.Errorf("invalid final Search limit %d", limit), stream.Close())
+	}
+
+	data := &schemapb.SearchResultData{
+		NumQueries: t.GetNq(),
+		TopK:       limit,
+		Ids:        &schemapb.IDs{},
+		Scores:     make([]float32, 0, t.GetNq()*limit),
+		Topks:      make([]int64, t.GetNq()),
+	}
+	seenPerQuery := make([]int64, t.GetNq())
+	var resultSize int64
+	for {
+		chunk, recvErr := stream.Recv()
+		if errors.Is(recvErr, io.EOF) {
+			break
+		}
+		if recvErr != nil {
+			return nil, metricType, merr.Combine(recvErr, stream.Close())
+		}
+		if chunk == nil || chunk.GetResultData() == nil {
+			return nil, metricType, merr.Combine(errors.New("final ReduceStream returned a CHUNK without result data"), stream.Close())
+		}
+
+		collectMetadata(chunk)
+		if chunk.GetMetricType() != "" {
+			metricType = chunk.GetMetricType()
+		}
+		appendedSize, appendErr := appendFinalSearchChunk(
+			data,
+			chunk.GetResultData(),
+			seenPerQuery,
+			t.GetOffset(),
+			limit,
+			metricType,
+		)
+		if appendErr != nil {
+			return nil, metricType, merr.Combine(appendErr, stream.Close())
+		}
+		resultSize += appendedSize
+		if resultSize > paramtable.Get().QuotaConfig.MaxOutputSize.GetAsInt64() {
+			return nil, metricType, merr.Combine(
+				merr.WrapErrParameterInvalidMsg("search results exceed the maxOutputSize Limit %d", paramtable.Get().QuotaConfig.MaxOutputSize.GetAsInt64()),
+				stream.Close(),
+			)
+		}
+
+		complete := true
+		for _, count := range data.GetTopks() {
+			if count < limit {
+				complete = false
+				break
+			}
+		}
+		if complete {
+			break
+		}
+	}
+	if closeErr := stream.Close(); closeErr != nil {
+		return nil, metricType, closeErr
+	}
+	if len(data.GetTopks()) > 0 {
+		data.TopK = data.GetTopks()[len(data.GetTopks())-1]
+	}
+	return &milvuspb.SearchResults{
+		Status:  merr.Success(),
+		Results: data,
+	}, metricType, nil
+}
+
 func isEmbeddingListPlaceholderType(pt commonpb.PlaceholderType) bool {
 	switch pt {
 	case commonpb.PlaceholderType_EmbListFloatVector,
@@ -1507,9 +1584,6 @@ func (t *searchTask) PostExecute(ctx context.Context) error {
 		}
 		storageCost.ScannedRemoteBytes += r.GetScannedRemoteBytes()
 		storageCost.ScannedTotalBytes += r.GetScannedTotalBytes()
-		if r.GetMetricType() != "" {
-			metricType = r.GetMetricType()
-		}
 	}
 
 	var (
@@ -1520,72 +1594,9 @@ func (t *searchTask) PostExecute(ctx context.Context) error {
 	if t.resultStream != nil {
 		stream := t.resultStream
 		t.resultStream = nil
-		limit := t.GetTopk() - t.GetOffset()
-		if limit <= 0 {
-			return merr.Combine(fmt.Errorf("invalid final Search limit %d", limit), stream.Close())
-		}
-
-		data := &schemapb.SearchResultData{
-			NumQueries: t.GetNq(),
-			TopK:       limit,
-			Ids:        &schemapb.IDs{},
-			Scores:     make([]float32, 0, t.GetNq()*limit),
-			Topks:      make([]int64, t.GetNq()),
-		}
-		seenPerQuery := make([]int64, t.GetNq())
-		var resultSize int64
-		for {
-			chunk, recvErr := stream.Recv()
-			if errors.Is(recvErr, io.EOF) {
-				break
-			}
-			if recvErr != nil {
-				return merr.Combine(recvErr, stream.Close())
-			}
-			if chunk == nil || chunk.GetResultData() == nil {
-				return merr.Combine(errors.New("final ReduceStream returned a CHUNK without result data"), stream.Close())
-			}
-
-			collectMetadata(chunk)
-			appendedSize, appendErr := appendFinalSearchChunk(
-				data,
-				chunk.GetResultData(),
-				seenPerQuery,
-				t.GetOffset(),
-				limit,
-				metricType,
-			)
-			if appendErr != nil {
-				return merr.Combine(appendErr, stream.Close())
-			}
-			resultSize += appendedSize
-			if resultSize > paramtable.Get().QuotaConfig.MaxOutputSize.GetAsInt64() {
-				return merr.Combine(
-					merr.WrapErrParameterInvalidMsg("search results exceed the maxOutputSize Limit %d", paramtable.Get().QuotaConfig.MaxOutputSize.GetAsInt64()),
-					stream.Close(),
-				)
-			}
-
-			complete := true
-			for _, count := range data.GetTopks() {
-				if count < limit {
-					complete = false
-					break
-				}
-			}
-			if complete {
-				break
-			}
-		}
-		if closeErr := stream.Close(); closeErr != nil {
-			return closeErr
-		}
-		if len(data.GetTopks()) > 0 {
-			data.TopK = data.GetTopks()[len(data.GetTopks())-1]
-		}
-		reducedResult = &milvuspb.SearchResults{
-			Status:  merr.Success(),
-			Results: data,
+		reducedResult, metricType, err = t.consumeResultStream(stream, metricType, collectMetadata)
+		if err != nil {
+			return err
 		}
 	} else {
 		toReduceResults, err = t.collectSearchResults(ctx)
