@@ -27,6 +27,7 @@ M1A_TEST_PLAN_DIR="${QUERYVIEW_M1A_TEST_PLAN_DIR:-}"
 M1A_PYTHON="${QUERYVIEW_M1A_PYTHON:-}"
 M1A_MEMORY_MODE="${QUERYVIEW_M1A_MEMORY_MODE:-}"
 M1A_MEMORY_CONCURRENCY="${QUERYVIEW_M1A_MEMORY_CONCURRENCY:-32}"
+M1A_SHARDS_NUM="${QUERYVIEW_M1A_SHARDS_NUM:-2}"
 
 RUN_ID="${QUERYVIEW_SMOKE_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 RUN_ROOT="${QUERYVIEW_SMOKE_RUN_ROOT:-$REPO_ROOT/_artifacts/queryview-smoke}"
@@ -266,7 +267,7 @@ log "Running QueryView PyMilvus smoke test"
 if [[ -n "$M1A_TEST_PLAN_DIR" ]]; then
     log "Preparing OpenAI 50K M1A collection"
     "$M1A_PYTHON" "$M1A_TEST_PLAN_DIR/scripts/prepare_openai_50k.py" \
-        --host "$MILVUS_HOST" --port "$MILVUS_PORT" \
+        --host "$MILVUS_HOST" --port "$MILVUS_PORT" --shards-num "$M1A_SHARDS_NUM" \
         2>&1 | tee "$LOG_DIR/m1a-prepare.log"
 
     if [[ -n "$M1A_MEMORY_MODE" ]]; then
