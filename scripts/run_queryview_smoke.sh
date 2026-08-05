@@ -23,6 +23,8 @@ COMPOSE_FILE="$REPO_ROOT/deployments/docker/dev/docker-compose-apple-silicon.yml
 MILVUS_BIN="$REPO_ROOT/bin/milvus"
 SMOKE_TEST="$REPO_ROOT/tests/python_client/queryview_smoke.py"
 VENV_DIR="${QUERYVIEW_SMOKE_VENV:-$REPO_ROOT/.venv-smoke}"
+M1A_TEST_PLAN_DIR="${QUERYVIEW_M1A_TEST_PLAN_DIR:-}"
+M1A_PYTHON="${QUERYVIEW_M1A_PYTHON:-}"
 
 RUN_ID="${QUERYVIEW_SMOKE_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 RUN_ROOT="${QUERYVIEW_SMOKE_RUN_ROOT:-$REPO_ROOT/_artifacts/queryview-smoke}"
@@ -210,6 +212,13 @@ docker compose version >/dev/null
 [[ -x "$MILVUS_BIN" ]] || fail "Milvus binary is missing or not executable: $MILVUS_BIN"
 [[ -f "$COMPOSE_FILE" ]] || fail "Compose file is missing: $COMPOSE_FILE"
 [[ -f "$SMOKE_TEST" ]] || fail "Smoke test is missing: $SMOKE_TEST"
+if [[ -n "$M1A_TEST_PLAN_DIR" ]]; then
+    [[ -x "$M1A_PYTHON" ]] || fail "M1A Python is missing or not executable: $M1A_PYTHON"
+    [[ -f "$M1A_TEST_PLAN_DIR/scripts/prepare_openai_50k.py" ]] \
+        || fail "M1A preparation script is missing"
+    [[ -f "$M1A_TEST_PLAN_DIR/scripts/run_m1a_openai_correctness.py" ]] \
+        || fail "M1A correctness script is missing"
+fi
 
 mkdir -p "$LOG_DIR" "$INFRA_DIR" "$LOCAL_DIR"
 
@@ -243,3 +252,16 @@ log "Running QueryView PyMilvus smoke test"
     --host "$MILVUS_HOST" \
     --port "$MILVUS_PORT" \
     2>&1 | tee "$LOG_DIR/pymilvus.log"
+
+if [[ -n "$M1A_TEST_PLAN_DIR" ]]; then
+    log "Preparing OpenAI 50K M1A collection"
+    "$M1A_PYTHON" "$M1A_TEST_PLAN_DIR/scripts/prepare_openai_50k.py" \
+        --host "$MILVUS_HOST" --port "$MILVUS_PORT" \
+        2>&1 | tee "$LOG_DIR/m1a-prepare.log"
+
+    log "Running OpenAI 50K M1A correctness cases"
+    "$M1A_PYTHON" "$M1A_TEST_PLAN_DIR/scripts/run_m1a_openai_correctness.py" \
+        --host "$MILVUS_HOST" --port "$MILVUS_PORT" \
+        --artifact-root "$RUN_DIR/m1a-artifacts" \
+        2>&1 | tee "$LOG_DIR/m1a-correctness.log"
+fi
