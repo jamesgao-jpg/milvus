@@ -55,8 +55,9 @@ func (c *legacyOnlyClient) Legacy() LegacyClient {
 }
 
 type legacyClient struct {
-	shardClient   *shardViewQueryClient
-	shardResolver resolver.ShardResolver
+	shardClient              *shardViewQueryClient
+	shardResolver            resolver.ShardResolver
+	disableIteratorStreaming bool
 }
 
 type prefetchedReduceStream struct {
@@ -106,8 +107,9 @@ func newLegacyClient(
 		cfg.MaxRetries = defaultMaxRetries
 	}
 	return &legacyClient{
-		shardClient:   newShardViewQueryClient(cfg.MaxRetries, queryPlanClient, queryServiceClient, shardResolver, replicaPicker),
-		shardResolver: shardResolver,
+		shardClient:              newShardViewQueryClient(cfg.MaxRetries, queryPlanClient, queryServiceClient, shardResolver, replicaPicker),
+		shardResolver:            shardResolver,
+		disableIteratorStreaming: cfg.DisableIteratorStreaming,
 	}
 }
 
@@ -121,7 +123,7 @@ func supportsSearchStream(req *internalpb.SearchRequest) bool {
 }
 
 func (c *legacyClient) Search(ctx context.Context, req *LegacySearchRequest) (*LegacySearchResult, error) {
-	if supportsSearchStream(req.Req) {
+	if !c.disableIteratorStreaming && supportsSearchStream(req.Req) {
 		return c.searchStream(ctx, req)
 	}
 

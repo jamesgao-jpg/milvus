@@ -2208,8 +2208,9 @@ type proxyConfig struct {
 
 	GracefulStopTimeout ParamItem `refreshable:"true"`
 
-	SlowQuerySpanInSeconds ParamItem `refreshable:"true"`
-	QueryNodePoolingSize   ParamItem `refreshable:"false"`
+	SlowQuerySpanInSeconds   ParamItem `refreshable:"true"`
+	QueryNodePoolingSize     ParamItem `refreshable:"false"`
+	DisableIteratorStreaming ParamItem `refreshable:"false"`
 
 	HybridSearchRequeryPolicy ParamItem `refreshable:"true"`
 }
@@ -2850,6 +2851,15 @@ Disabled if the value is less or equal to 0.`,
 		Export:       true,
 	}
 	p.QueryNodePoolingSize.Init(base.mgr)
+
+	p.DisableIteratorStreaming = ParamItem{
+		Key:          "proxy.queryView.disableIteratorStreaming",
+		Version:      "3.0.0",
+		DefaultValue: "false",
+		Doc:          "route supported iterator Search through the existing batch path instead of Streaming Reduce",
+		Export:       true,
+	}
+	p.DisableIteratorStreaming.Init(base.mgr)
 }
 
 // /////////////////////////////////////////////////////////////////////////////

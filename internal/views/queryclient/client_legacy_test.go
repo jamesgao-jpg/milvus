@@ -116,6 +116,44 @@ func TestLegacyClientSearchReducesIteratorVChannelStreams(t *testing.T) {
 	require.Len(t, result.Plans, 2)
 }
 
+func TestLegacyClientSearchUsesBatchWhenIteratorStreamingDisabled(t *testing.T) {
+	shardID := qviews.ShardID{ReplicaID: 1, VChannel: "by-dev-rootcoord-dml_0_100v0"}
+	queryNode := qviews.NewQueryNode(11)
+	batchResult := newTestSearchChunk(1, []int64{10}, []float32{0.9})
+	client := NewLegacyViewQueryClient(
+		ViewQueryClientConfig{MaxRetries: 1, DisableIteratorStreaming: true},
+		&legacyPlanClient{plans: map[string]*viewpb.QueryPlan{
+			shardID.VChannel: legacySearchPlan(shardID, queryNode),
+		}},
+		&legacyServiceClient{
+			searchResults: map[string]*internalpb.SearchResults{shardID.VChannel: batchResult},
+			searchOnViewStream: func(context.Context, qviews.WorkNode, *viewpb.SearchOnViewRequest) (searchutil.ReduceStream, error) {
+				return nil, errors.New("stream path should not be used")
+			},
+		},
+		&legacyResolver{
+			vchannels: []string{shardID.VChannel},
+			replicas: map[string]*resolver.ShardReplicas{
+				shardID.VChannel: {VChannel: shardID.VChannel, PrimaryShardID: shardID, ShardIDs: []qviews.ShardID{shardID}},
+			},
+		},
+		firstReplicaPicker{},
+	)
+
+	result, err := client.Legacy().Search(context.Background(), &LegacySearchRequest{Req: &internalpb.SearchRequest{
+		CollectionID:     100,
+		ConsistencyLevel: commonpb.ConsistencyLevel_Bounded,
+		Nq:               1,
+		Topk:             1,
+		MetricType:       "IP",
+		IsIterator:       true,
+	}})
+	require.NoError(t, err)
+	require.Nil(t, result.Stream)
+	require.Len(t, result.Results, 1)
+	require.Same(t, batchResult, result.Results[0])
+}
+
 func TestLegacyClientSearchUsesBatchForUnsupportedIterator(t *testing.T) {
 	shardID := qviews.ShardID{ReplicaID: 1, VChannel: "by-dev-rootcoord-dml_0_100v0"}
 	queryNode := qviews.NewQueryNode(11)

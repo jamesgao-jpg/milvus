@@ -32,6 +32,21 @@ func shouldPanic(t *testing.T, name string, f func()) {
 	t.Errorf("%s should have panicked", name)
 }
 
+func TestProxyDisableIteratorStreaming(t *testing.T) {
+	base := NewBaseTable(SkipRemote(true), SkipEnv(true))
+	config := proxyConfig{}
+	config.init(base)
+	assert.False(t, config.DisableIteratorStreaming.GetAsBool())
+	assert.NoError(t, base.Save(config.DisableIteratorStreaming.Key, "true"))
+	assert.True(t, config.DisableIteratorStreaming.GetAsBool())
+
+	t.Setenv("PROXY_QUERYVIEW_DISABLEITERATORSTREAMING", "true")
+	envBase := NewBaseTable(SkipRemote(true))
+	envConfig := proxyConfig{}
+	envConfig.init(envBase)
+	assert.True(t, envConfig.DisableIteratorStreaming.GetAsBool())
+}
+
 func TestComponentParam_DataCoordBumpSchemaVersionCompactionParams(t *testing.T) {
 	Init()
 	params := Get()

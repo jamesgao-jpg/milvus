@@ -29,6 +29,7 @@ M1A_MEMORY_MODE="${QUERYVIEW_M1A_MEMORY_MODE:-}"
 M1A_MEMORY_CONCURRENCY="${QUERYVIEW_M1A_MEMORY_CONCURRENCY:-32}"
 M1A_MEMORY_TOP_K="${QUERYVIEW_M1A_MEMORY_TOP_K:-16384}"
 M1A_SHARDS_NUM="${QUERYVIEW_M1A_SHARDS_NUM:-2}"
+DISABLE_ITERATOR_STREAMING="${QUERYVIEW_DISABLE_ITERATOR_STREAMING:-false}"
 
 RUN_ID="${QUERYVIEW_SMOKE_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 RUN_ROOT="${QUERYVIEW_SMOKE_RUN_ROOT:-$REPO_ROOT/_artifacts/queryview-smoke}"
@@ -174,6 +175,7 @@ start_role() {
         export LOCALSTORAGE_PATH="$role_local_dir"
         export METRICS_PORT="$metrics_port"
         export PROXY_PORT="$MILVUS_PORT"
+        export PROXY_QUERYVIEW_DISABLEITERATORSTREAMING="$DISABLE_ITERATOR_STREAMING"
         export LD_LIBRARY_PATH="$REPO_ROOT/internal/core/output/lib:${LD_LIBRARY_PATH:-}"
 
         if [[ -f "$REPO_ROOT/internal/core/output/lib/libjemalloc.so" ]]; then
@@ -216,6 +218,8 @@ docker compose version >/dev/null
 [[ -x "$MILVUS_BIN" ]] || fail "Milvus binary is missing or not executable: $MILVUS_BIN"
 [[ -f "$COMPOSE_FILE" ]] || fail "Compose file is missing: $COMPOSE_FILE"
 [[ -f "$SMOKE_TEST" ]] || fail "Smoke test is missing: $SMOKE_TEST"
+[[ "$DISABLE_ITERATOR_STREAMING" == "true" || "$DISABLE_ITERATOR_STREAMING" == "false" ]] \
+    || fail "QUERYVIEW_DISABLE_ITERATOR_STREAMING must be true or false"
 if [[ -n "$M1A_TEST_PLAN_DIR" ]]; then
     [[ -x "$M1A_PYTHON" ]] || fail "M1A Python is missing or not executable: $M1A_PYTHON"
     [[ -f "$M1A_TEST_PLAN_DIR/scripts/prepare_openai_50k.py" ]] \
@@ -243,6 +247,7 @@ services:
 EOF
 
 log "Run ID: $RUN_ID"
+log "Disable iterator streaming: $DISABLE_ITERATOR_STREAMING"
 log "Starting etcd, Pulsar, and MinIO"
 compose up -d etcd pulsar minio
 
