@@ -356,8 +356,13 @@ func (s *OrderedReduceStream) Recv() (*internalpb.SearchResults, error) {
 }
 
 func (s *OrderedReduceStream) allocBuffer() *orderedOutputBuffer {
+	capacity := 0
+	for queryIndex := s.currentQuery; queryIndex < s.nq && capacity < s.chunkSize; queryIndex++ {
+		remaining := max(int64(0), s.topK-s.emittedPerQuery[queryIndex])
+		capacity += min(s.chunkSize-capacity, int(remaining))
+	}
 	return &orderedOutputBuffer{
-		units: make([]orderedUnit, 0, s.chunkSize),
+		units: make([]orderedUnit, 0, capacity),
 	}
 }
 

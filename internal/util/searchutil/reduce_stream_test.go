@@ -161,6 +161,19 @@ func TestOrderedReduceStreamReturnsPartialFinalChunk(t *testing.T) {
 	assertSearchChunk(t, recvChunk(t, stream), []int64{3}, []float32{0.7}, []int64{1})
 }
 
+func TestOrderedReduceStreamAllocBufferUsesRemainingUnits(t *testing.T) {
+	stream := &OrderedReduceStream{
+		nq:              2,
+		topK:            5,
+		chunkSize:       1024,
+		emittedPerQuery: []int64{4, 3},
+	}
+	require.Equal(t, 3, cap(stream.allocBuffer().units))
+
+	stream.chunkSize = 2
+	require.Equal(t, 2, cap(stream.allocBuffer().units))
+}
+
 func TestOrderedReduceStreamMergesMultipleQueries(t *testing.T) {
 	left := &fakeReduceStream{recv: []fakeStreamRecv{{chunk: newSearchChunk(2, 2,
 		[]testHit{{id: 1, score: 0.90}},
