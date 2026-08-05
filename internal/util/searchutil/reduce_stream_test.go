@@ -113,6 +113,40 @@ type testHit struct {
 	score float32
 }
 
+type retainedInputStats struct {
+	chunks        int
+	bufferedUnits int
+	unreadUnits   int
+	protobufBytes int
+}
+
+func assertRetainedInputBound(t *testing.T, stream *OrderedReduceStream) retainedInputStats {
+	t.Helper()
+
+	stats := retainedInputStats{}
+	for i := range stream.childBuffers {
+		buffer := &stream.childBuffers[i]
+		require.LessOrEqual(t, len(buffer.units), stream.chunkSize)
+		if !buffer.hasUnit() {
+			continue
+		}
+
+		chunk := buffer.front().result
+		for _, unit := range buffer.units {
+			require.Same(t, chunk, unit.result)
+		}
+		stats.chunks++
+		stats.bufferedUnits += len(buffer.units)
+		stats.unreadUnits += len(buffer.units) - buffer.cursor
+		stats.protobufBytes += proto.Size(chunk)
+	}
+
+	require.LessOrEqual(t, stats.chunks, len(stream.childStreams))
+	require.LessOrEqual(t, stats.bufferedUnits, stream.chunkSize*len(stream.childStreams))
+	require.LessOrEqual(t, stats.unreadUnits, stream.chunkSize*len(stream.childStreams))
+	return stats
+}
+
 func TestOrderedReduceStreamMergesANNHits(t *testing.T) {
 	left := &fakeReduceStream{recv: []fakeStreamRecv{
 		{chunk: newSearchChunk(1, 4, []testHit{{id: 1, score: 0.95}, {id: 4, score: 0.70}})},
@@ -240,6 +274,101 @@ func TestOrderedReduceStreamComposesReducedChildStreams(t *testing.T) {
 
 	assertSearchChunk(t, recvChunk(t, stream), []int64{1, 2}, []float32{0.95, 0.90}, []int64{2})
 	assertSearchChunk(t, recvChunk(t, stream), []int64{3}, []float32{0.75}, []int64{1})
+}
+
+func TestOrderedReduceStreamRetainsOneChunkPerChild(t *testing.T) {
+	request := &internalpb.SearchRequest{Nq: 1, Topk: 8, MetricType: "IP", IsIterator: true}
+	leftHighFirst := newSearchChunk(1, 8, []testHit{{id: 1, score: 0.99}, {id: 2, score: 0.98}})
+	leftHighSecond := newSearchChunk(1, 8, []testHit{{id: 3, score: 0.95}, {id: 4, score: 0.94}})
+	leftOtherChunk := newSearchChunk(1, 8, []testHit{{id: 5, score: 0.80}, {id: 6, score: 0.79}})
+	rightHighChunk := newSearchChunk(1, 8, []testHit{{id: 7, score: 0.70}, {id: 8, score: 0.69}})
+	rightOtherChunk := newSearchChunk(1, 8, []testHit{{id: 9, score: 0.60}, {id: 10, score: 0.59}})
+
+	leftHigh := &fakeReduceStream{recv: []fakeStreamRecv{{chunk: leftHighFirst}, {chunk: leftHighSecond}}}
+	leftOther := &fakeReduceStream{recv: []fakeStreamRecv{{chunk: leftOtherChunk}}}
+	rightHigh := &fakeReduceStream{recv: []fakeStreamRecv{{chunk: rightHighChunk}}}
+	rightOther := &fakeReduceStream{recv: []fakeStreamRecv{{chunk: rightOtherChunk}}}
+
+	leftStream, err := NewReduceStream(request, []ReduceStream{leftHigh, leftOther}, 2)
+	require.NoError(t, err)
+	left := leftStream.(*OrderedReduceStream)
+	rightStream, err := NewReduceStream(request, []ReduceStream{rightHigh, rightOther}, 2)
+	require.NoError(t, err)
+	right := rightStream.(*OrderedReduceStream)
+
+	leftReady, err := left.getReadyBuffers()
+	require.NoError(t, err)
+	require.Len(t, leftReady, 2)
+	leftStats := assertRetainedInputBound(t, left)
+	require.Equal(t, retainedInputStats{
+		chunks:        2,
+		bufferedUnits: 4,
+		unreadUnits:   4,
+		protobufBytes: proto.Size(leftHighFirst) + proto.Size(leftOtherChunk),
+	}, leftStats)
+
+	rightReady, err := right.getReadyBuffers()
+	require.NoError(t, err)
+	require.Len(t, rightReady, 2)
+	rightStats := assertRetainedInputBound(t, right)
+	require.Equal(t, retainedInputStats{
+		chunks:        2,
+		bufferedUnits: 4,
+		unreadUnits:   4,
+		protobufBytes: proto.Size(rightHighChunk) + proto.Size(rightOtherChunk),
+	}, rightStats)
+
+	finalStream, err := NewReduceStream(request, []ReduceStream{left, right}, 2)
+	require.NoError(t, err)
+	final := finalStream.(*OrderedReduceStream)
+	readyBuffers, err := final.getReadyBuffers()
+	require.NoError(t, err)
+	require.Len(t, readyBuffers, 2)
+	require.Equal(t, retainedInputStats{chunks: 1, bufferedUnits: 2, unreadUnits: 2, protobufBytes: proto.Size(leftOtherChunk)}, assertRetainedInputBound(t, left))
+	require.Equal(t, retainedInputStats{chunks: 1, bufferedUnits: 2, unreadUnits: 2, protobufBytes: proto.Size(rightOtherChunk)}, assertRetainedInputBound(t, right))
+	finalStats := assertRetainedInputBound(t, final)
+	require.Equal(t, 2, finalStats.chunks)
+	require.Equal(t, 4, finalStats.bufferedUnits)
+	require.Equal(t, 4, finalStats.unreadUnits)
+	require.Positive(t, finalStats.protobufBytes)
+
+	outputBuffer := final.allocBuffer()
+	for range 2 {
+		unit, err := final.produceNextUnits(readyBuffers)
+		require.NoError(t, err)
+		require.NotNil(t, unit)
+		final.merge(outputBuffer, unit)
+	}
+	require.True(t, final.isChunkReady(outputBuffer))
+	finalStats = assertRetainedInputBound(t, final)
+	require.Equal(t, 1, finalStats.chunks)
+	require.Equal(t, 2, finalStats.bufferedUnits)
+	require.Equal(t, 2, finalStats.unreadUnits)
+
+	readyBuffers, err = final.getReadyBuffers()
+	require.NoError(t, err)
+	require.Len(t, readyBuffers, 2)
+	finalStats = assertRetainedInputBound(t, final)
+	require.Equal(t, 2, finalStats.chunks)
+	require.Equal(t, 4, finalStats.bufferedUnits)
+	require.Equal(t, 4, finalStats.unreadUnits)
+	leftHighRecv, _ := leftHigh.calls()
+	leftOtherRecv, _ := leftOther.calls()
+	rightHighRecv, _ := rightHigh.calls()
+	rightOtherRecv, _ := rightOther.calls()
+	require.Equal(t, 2, leftHighRecv)
+	require.Equal(t, 1, leftOtherRecv)
+	require.Equal(t, 1, rightHighRecv)
+	require.Equal(t, 1, rightOtherRecv)
+
+	require.NoError(t, final.Close())
+	require.Equal(t, retainedInputStats{}, assertRetainedInputBound(t, final))
+	require.Equal(t, retainedInputStats{}, assertRetainedInputBound(t, left))
+	require.Equal(t, retainedInputStats{}, assertRetainedInputBound(t, right))
+	for _, child := range []*fakeReduceStream{leftHigh, leftOther, rightHigh, rightOther} {
+		_, closeCalls := child.calls()
+		require.Equal(t, 1, closeCalls)
+	}
 }
 
 func TestOrderedReduceStreamComposesMetadata(t *testing.T) {
