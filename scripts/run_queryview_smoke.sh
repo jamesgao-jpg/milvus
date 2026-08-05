@@ -274,6 +274,7 @@ if [[ -n "$M1A_TEST_PLAN_DIR" ]]; then
         log "Measuring Proxy memory for $M1A_MEMORY_MODE requests"
         "$M1A_PYTHON" "$M1A_TEST_PLAN_DIR/scripts/run_m1a_proxy_memory.py" \
             --mode "$M1A_MEMORY_MODE" --proxy-pid "$proxy_pid" \
+            --proxy-metrics-url "http://127.0.0.1:$((METRICS_BASE + 5))/metrics_default" \
             --host "$MILVUS_HOST" --port "$MILVUS_PORT" \
             --concurrency "$M1A_MEMORY_CONCURRENCY" \
             --artifact-root "$RUN_DIR/m1a-memory" \
