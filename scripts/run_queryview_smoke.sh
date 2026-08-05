@@ -27,6 +27,7 @@ M1A_TEST_PLAN_DIR="${QUERYVIEW_M1A_TEST_PLAN_DIR:-}"
 M1A_PYTHON="${QUERYVIEW_M1A_PYTHON:-}"
 M1A_MEMORY_MODE="${QUERYVIEW_M1A_MEMORY_MODE:-}"
 M1A_MEMORY_CONCURRENCY="${QUERYVIEW_M1A_MEMORY_CONCURRENCY:-32}"
+M1A_MEMORY_TOP_K="${QUERYVIEW_M1A_MEMORY_TOP_K:-16384}"
 M1A_SHARDS_NUM="${QUERYVIEW_M1A_SHARDS_NUM:-2}"
 
 RUN_ID="${QUERYVIEW_SMOKE_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
@@ -277,7 +278,7 @@ if [[ -n "$M1A_TEST_PLAN_DIR" ]]; then
             --mode "$M1A_MEMORY_MODE" --proxy-pid "$proxy_pid" \
             --proxy-metrics-url "http://127.0.0.1:$((METRICS_BASE + 5))/metrics_default" \
             --host "$MILVUS_HOST" --port "$MILVUS_PORT" \
-            --concurrency "$M1A_MEMORY_CONCURRENCY" \
+            --concurrency "$M1A_MEMORY_CONCURRENCY" --top-k "$M1A_MEMORY_TOP_K" \
             --artifact-root "$RUN_DIR/m1a-memory" \
             2>&1 | tee "$LOG_DIR/m1a-memory-$M1A_MEMORY_MODE.log"
     else
