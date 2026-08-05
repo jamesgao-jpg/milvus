@@ -25,6 +25,8 @@ SMOKE_TEST="$REPO_ROOT/tests/python_client/queryview_smoke.py"
 VENV_DIR="${QUERYVIEW_SMOKE_VENV:-$REPO_ROOT/.venv-smoke}"
 M1A_TEST_PLAN_DIR="${QUERYVIEW_M1A_TEST_PLAN_DIR:-}"
 M1A_PYTHON="${QUERYVIEW_M1A_PYTHON:-}"
+M1A_MEMORY_MODE="${QUERYVIEW_M1A_MEMORY_MODE:-}"
+M1A_MEMORY_CONCURRENCY="${QUERYVIEW_M1A_MEMORY_CONCURRENCY:-32}"
 
 RUN_ID="${QUERYVIEW_SMOKE_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 RUN_ROOT="${QUERYVIEW_SMOKE_RUN_ROOT:-$REPO_ROOT/_artifacts/queryview-smoke}"
@@ -218,6 +220,14 @@ if [[ -n "$M1A_TEST_PLAN_DIR" ]]; then
         || fail "M1A preparation script is missing"
     [[ -f "$M1A_TEST_PLAN_DIR/scripts/run_m1a_openai_correctness.py" ]] \
         || fail "M1A correctness script is missing"
+    if [[ -n "$M1A_MEMORY_MODE" ]]; then
+        [[ "$M1A_MEMORY_MODE" == "batch" || "$M1A_MEMORY_MODE" == "iterator" ]] \
+            || fail "M1A memory mode must be batch or iterator"
+        [[ -f "$M1A_TEST_PLAN_DIR/scripts/run_m1a_proxy_memory.py" ]] \
+            || fail "M1A Proxy memory script is missing"
+    fi
+elif [[ -n "$M1A_MEMORY_MODE" ]]; then
+    fail "M1A memory mode requires QUERYVIEW_M1A_TEST_PLAN_DIR"
 fi
 
 mkdir -p "$LOG_DIR" "$INFRA_DIR" "$LOCAL_DIR"
@@ -259,9 +269,20 @@ if [[ -n "$M1A_TEST_PLAN_DIR" ]]; then
         --host "$MILVUS_HOST" --port "$MILVUS_PORT" \
         2>&1 | tee "$LOG_DIR/m1a-prepare.log"
 
-    log "Running OpenAI 50K M1A correctness cases"
-    "$M1A_PYTHON" "$M1A_TEST_PLAN_DIR/scripts/run_m1a_openai_correctness.py" \
-        --host "$MILVUS_HOST" --port "$MILVUS_PORT" \
-        --artifact-root "$RUN_DIR/m1a-artifacts" \
-        2>&1 | tee "$LOG_DIR/m1a-correctness.log"
+    if [[ -n "$M1A_MEMORY_MODE" ]]; then
+        proxy_pid="${MILVUS_PIDS[${#MILVUS_PIDS[@]}-1]}"
+        log "Measuring Proxy memory for $M1A_MEMORY_MODE requests"
+        "$M1A_PYTHON" "$M1A_TEST_PLAN_DIR/scripts/run_m1a_proxy_memory.py" \
+            --mode "$M1A_MEMORY_MODE" --proxy-pid "$proxy_pid" \
+            --host "$MILVUS_HOST" --port "$MILVUS_PORT" \
+            --concurrency "$M1A_MEMORY_CONCURRENCY" \
+            --artifact-root "$RUN_DIR/m1a-memory" \
+            2>&1 | tee "$LOG_DIR/m1a-memory-$M1A_MEMORY_MODE.log"
+    else
+        log "Running OpenAI 50K M1A correctness cases"
+        "$M1A_PYTHON" "$M1A_TEST_PLAN_DIR/scripts/run_m1a_openai_correctness.py" \
+            --host "$MILVUS_HOST" --port "$MILVUS_PORT" \
+            --artifact-root "$RUN_DIR/m1a-artifacts" \
+            2>&1 | tee "$LOG_DIR/m1a-correctness.log"
+    fi
 fi
