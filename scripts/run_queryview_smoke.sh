@@ -30,6 +30,11 @@ M1A_MEMORY_CONCURRENCY="${QUERYVIEW_M1A_MEMORY_CONCURRENCY:-32}"
 M1A_MEMORY_TOP_K="${QUERYVIEW_M1A_MEMORY_TOP_K:-16384}"
 M1A_SHARDS_NUM="${QUERYVIEW_M1A_SHARDS_NUM:-2}"
 DISABLE_ITERATOR_STREAMING="${QUERYVIEW_DISABLE_ITERATOR_STREAMING:-false}"
+if [[ "$M1A_MEMORY_MODE" == "batch" ]]; then
+    DISABLE_ITERATOR_STREAMING=true
+elif [[ "$M1A_MEMORY_MODE" == "streaming" || "$M1A_MEMORY_MODE" == "iterator" ]]; then
+    DISABLE_ITERATOR_STREAMING=false
+fi
 
 RUN_ID="${QUERYVIEW_SMOKE_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 RUN_ROOT="${QUERYVIEW_SMOKE_RUN_ROOT:-$REPO_ROOT/_artifacts/queryview-smoke}"
@@ -40,6 +45,10 @@ LOCAL_DIR="$RUN_DIR/local"
 COMPOSE_OVERRIDE_FILE="$RUN_DIR/docker-compose.override.yml"
 COMPOSE_PROJECT_NAME="qv-smoke-${RUN_ID,,}"
 CLUSTER_ID="qvsmoke${RUN_ID//[^[:alnum:]]/}"
+RETAINED_MEMORY_OUTPUT_PATH=""
+if [[ -n "$M1A_MEMORY_MODE" ]]; then
+    RETAINED_MEMORY_OUTPUT_PATH="$RUN_DIR/m1a-memory/retained_memory.jsonl"
+fi
 
 MILVUS_HOST="${MILVUS_HOST:-127.0.0.1}"
 MILVUS_PORT="${MILVUS_PORT:-19532}"
@@ -176,6 +185,7 @@ start_role() {
         export METRICS_PORT="$metrics_port"
         export PROXY_PORT="$MILVUS_PORT"
         export PROXY_QUERYVIEW_DISABLEITERATORSTREAMING="$DISABLE_ITERATOR_STREAMING"
+        export PROXY_QUERYVIEW_RETAINEDMEMORYOUTPUTPATH="$RETAINED_MEMORY_OUTPUT_PATH"
         export LD_LIBRARY_PATH="$REPO_ROOT/internal/core/output/lib:${LD_LIBRARY_PATH:-}"
 
         if [[ -f "$REPO_ROOT/internal/core/output/lib/libjemalloc.so" ]]; then
@@ -227,8 +237,9 @@ if [[ -n "$M1A_TEST_PLAN_DIR" ]]; then
     [[ -f "$M1A_TEST_PLAN_DIR/scripts/run_m1a_openai_correctness.py" ]] \
         || fail "M1A correctness script is missing"
     if [[ -n "$M1A_MEMORY_MODE" ]]; then
-        [[ "$M1A_MEMORY_MODE" == "batch" || "$M1A_MEMORY_MODE" == "iterator" ]] \
-            || fail "M1A memory mode must be batch or iterator"
+        [[ "$M1A_MEMORY_MODE" == "batch" || "$M1A_MEMORY_MODE" == "streaming" \
+            || "$M1A_MEMORY_MODE" == "iterator" ]] \
+            || fail "M1A memory mode must be batch or streaming"
         [[ -f "$M1A_TEST_PLAN_DIR/scripts/run_m1a_proxy_memory.py" ]] \
             || fail "M1A Proxy memory script is missing"
     fi
@@ -237,6 +248,9 @@ elif [[ -n "$M1A_MEMORY_MODE" ]]; then
 fi
 
 mkdir -p "$LOG_DIR" "$INFRA_DIR" "$LOCAL_DIR"
+if [[ -n "$RETAINED_MEMORY_OUTPUT_PATH" ]]; then
+    mkdir -p "$(dirname "$RETAINED_MEMORY_OUTPUT_PATH")"
+fi
 
 cat >"$COMPOSE_OVERRIDE_FILE" <<EOF
 services:
@@ -277,11 +291,9 @@ if [[ -n "$M1A_TEST_PLAN_DIR" ]]; then
         2>&1 | tee "$LOG_DIR/m1a-prepare.log"
 
     if [[ -n "$M1A_MEMORY_MODE" ]]; then
-        proxy_pid="${MILVUS_PIDS[${#MILVUS_PIDS[@]}-1]}"
-        log "Measuring Proxy memory for $M1A_MEMORY_MODE requests"
+        log "Measuring Proxy retained result bytes for $M1A_MEMORY_MODE requests"
         "$M1A_PYTHON" "$M1A_TEST_PLAN_DIR/scripts/run_m1a_proxy_memory.py" \
-            --mode "$M1A_MEMORY_MODE" --proxy-pid "$proxy_pid" \
-            --proxy-metrics-url "http://127.0.0.1:$((METRICS_BASE + 5))/metrics_default" \
+            --mode "$M1A_MEMORY_MODE" --accounting-file "$RETAINED_MEMORY_OUTPUT_PATH" \
             --host "$MILVUS_HOST" --port "$MILVUS_PORT" \
             --concurrency "$M1A_MEMORY_CONCURRENCY" --top-k "$M1A_MEMORY_TOP_K" \
             --artifact-root "$RUN_DIR/m1a-memory" \

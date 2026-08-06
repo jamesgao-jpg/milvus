@@ -2,11 +2,15 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -63,6 +67,8 @@ const (
 	iterativeFilterKey = "iterative_filter"
 )
 
+var retainedMemoryOutputMu sync.Mutex
+
 // type requery func(span trace.Span, ids *schemapb.IDs, outputFields []string) (*milvuspb.QueryResults, error)
 
 type searchTask struct {
@@ -87,12 +93,14 @@ type searchTask struct {
 	isTopkReduce           bool
 	isRecallEvaluation     bool
 
-	translatedOutputFields []string
-	userOutputFields       []string
-	userDynamicFields      []string
-	highlighter            Highlighter
-	resultBuf              *typeutil.ConcurrentSet[*internalpb.SearchResults]
-	resultStream           searchutil.ReduceStream
+	translatedOutputFields   []string
+	userOutputFields         []string
+	userDynamicFields        []string
+	highlighter              Highlighter
+	resultBuf                *typeutil.ConcurrentSet[*internalpb.SearchResults]
+	resultStream             searchutil.ReduceStream
+	retainedMemory           *searchutil.RetainedMemoryAccounting
+	retainedMemoryOutputPath string
 
 	partitionIDsSet *typeutil.ConcurrentSet[UniqueID]
 
@@ -1313,10 +1321,13 @@ func (t *searchTask) Execute(ctx context.Context) error {
 }
 
 func (t *searchTask) executeByQueryView(ctx context.Context) error {
+	t.startRetainedMemoryAccounting()
 	result, err := t.viewQueryClient.Legacy().Search(ctx, &queryclient.LegacySearchRequest{
-		Req: t.SearchRequest,
+		Req:            t.SearchRequest,
+		RetainedMemory: t.retainedMemory,
 	})
 	if err != nil {
+		t.finishRetainedMemoryAccounting(ctx)
 		return err
 	}
 	if t.resultBuf == nil {
@@ -1558,6 +1569,7 @@ func validateElementFilterVectorSearch(plan *planpb.PlanNode, schema *schemapb.C
 func (t *searchTask) PostExecute(ctx context.Context) error {
 	ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-Search-PostExecute")
 	defer sp.End()
+	defer t.finishRetainedMemoryAccounting(ctx)
 
 	tr := timerecord.NewTimeRecorder("searchTask PostExecute")
 	defer func() {
@@ -1607,6 +1619,11 @@ func (t *searchTask) PostExecute(ctx context.Context) error {
 		for _, r := range toReduceResults {
 			collectMetadata(r)
 		}
+		defer func() {
+			for _, result := range toReduceResults {
+				t.retainedMemory.Release(result, result)
+			}
+		}()
 		metricType = getMetricType(toReduceResults)
 	}
 
@@ -1730,6 +1747,57 @@ func (t *searchTask) PostExecute(ctx context.Context) error {
 		mlog.Int64("collection", t.GetCollectionID()),
 		mlog.Int64s("partitionIDs", t.GetPartitionIDs()))
 	return nil
+}
+
+func (t *searchTask) startRetainedMemoryAccounting() {
+	if t.retainedMemory != nil || !t.GetIsIterator() {
+		return
+	}
+	outputPath := paramtable.Get().ProxyCfg.RetainedMemoryOutputPath.GetValue()
+	if outputPath == "" {
+		return
+	}
+	t.retainedMemory = searchutil.NewRetainedMemoryAccounting(t.ID(), t.GetNq(), t.GetTopk())
+	t.retainedMemoryOutputPath = outputPath
+}
+
+func (t *searchTask) finishRetainedMemoryAccounting(ctx context.Context) {
+	if t.retainedMemory == nil {
+		return
+	}
+	retainedMemory := t.retainedMemory
+	outputPath := t.retainedMemoryOutputPath
+	t.retainedMemory = nil
+	t.retainedMemoryOutputPath = ""
+
+	finalResponseBytes := int64(0)
+	if t.result != nil {
+		finalResponseBytes = int64(proto.Size(t.result))
+	}
+	snapshot := retainedMemory.Finish(finalResponseBytes)
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		mlog.With(mlog.Err(err)).Warn(ctx, "marshal QueryView retained-memory accounting")
+		return
+	}
+
+	retainedMemoryOutputMu.Lock()
+	defer retainedMemoryOutputMu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
+		mlog.With(mlog.Err(err)).Warn(ctx, "create QueryView retained-memory output directory")
+		return
+	}
+	file, err := os.OpenFile(outputPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		mlog.With(mlog.Err(err)).Warn(ctx, "open QueryView retained-memory output")
+		return
+	}
+	if _, err = file.Write(append(encoded, '\n')); err != nil {
+		mlog.With(mlog.Err(err)).Warn(ctx, "write QueryView retained-memory output")
+	}
+	if err := file.Close(); err != nil {
+		mlog.With(mlog.Err(err)).Warn(ctx, "close QueryView retained-memory output")
+	}
 }
 
 func (t *searchTask) searchShard(ctx context.Context, nodeID int64, qn types.QueryNodeClient, channel string) error {

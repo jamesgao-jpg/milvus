@@ -92,12 +92,6 @@ func (b *orderedChildBuffer) pop() orderedUnit {
 	return unit
 }
 
-func (b *orderedChildBuffer) discardQuery(queryIndex int64) {
-	for b.hasUnit() && b.front().queryIndex == queryIndex {
-		b.pop()
-	}
-}
-
 func (b *orderedChildBuffer) accept(chunk *internalpb.SearchResults, nq, topK int64) (*schemapb.SearchResultData, error) {
 	data, err := decodeChunk(chunk, nq, topK)
 	if err != nil {
@@ -259,6 +253,8 @@ type OrderedReduceStream struct {
 	isRecallEval    bool
 	metadata        *internalpb.SearchResults
 	metadataEmitted bool
+	retainedMemory  *RetainedMemoryAccounting
+	retainedRole    RetainedMemoryReduceStreamRole
 
 	closed         bool
 	finished       bool
@@ -268,6 +264,26 @@ type OrderedReduceStream struct {
 
 // NewReduceStream creates the Plain ANN Search iterator OrderedReduceStream implementation.
 func NewReduceStream(request *internalpb.SearchRequest, childStreams []ReduceStream, chunkSize int) (ReduceStream, error) {
+	return newReduceStream(request, childStreams, chunkSize, nil, "")
+}
+
+func NewReduceStreamWithRetainedMemory(
+	request *internalpb.SearchRequest,
+	childStreams []ReduceStream,
+	chunkSize int,
+	retainedMemory *RetainedMemoryAccounting,
+	role RetainedMemoryReduceStreamRole,
+) (ReduceStream, error) {
+	return newReduceStream(request, childStreams, chunkSize, retainedMemory, role)
+}
+
+func newReduceStream(
+	request *internalpb.SearchRequest,
+	childStreams []ReduceStream,
+	chunkSize int,
+	retainedMemory *RetainedMemoryAccounting,
+	role RetainedMemoryReduceStreamRole,
+) (ReduceStream, error) {
 	if request == nil {
 		return nil, errors.New("NewReduceStream requires a Search request")
 	}
@@ -288,6 +304,9 @@ func NewReduceStream(request *internalpb.SearchRequest, childStreams []ReduceStr
 			return nil, fmt.Errorf("NewReduceStream child stream %d is nil", i)
 		}
 	}
+	if retainedMemory != nil {
+		retainedMemory.RegisterReduceStream(role, len(childStreams))
+	}
 
 	return &OrderedReduceStream{
 		childStreams:         append([]ReduceStream(nil), childStreams...),
@@ -300,6 +319,8 @@ func NewReduceStream(request *internalpb.SearchRequest, childStreams []ReduceStr
 		chunkSize:            chunkSize,
 		metricType:           request.GetMetricType(),
 		emittedPerQuery:      make([]int64, request.GetNq()),
+		retainedMemory:       retainedMemory,
+		retainedRole:         role,
 	}, nil
 }
 
@@ -313,6 +334,7 @@ func (s *OrderedReduceStream) Recv() (*internalpb.SearchResults, error) {
 	}
 
 	outputBuffer := s.allocBuffer()
+	defer s.releaseOutputBuffer(outputBuffer)
 
 	for !s.isChunkReady(outputBuffer) {
 		readyBuffers, err := s.getReadyBuffers()
@@ -433,6 +455,13 @@ func (s *OrderedReduceStream) getReadyBuffers() ([]*orderedChildBuffer, error) {
 		if err != nil {
 			return nil, fmt.Errorf("child stream %d returned an invalid Chunk: %w", received.childIndex, err)
 		}
+		if s.childBuffers[received.childIndex].hasUnit() {
+			s.retainedMemory.Retain(
+				&s.childBuffers[received.childIndex],
+				s.childBufferCategory(),
+				received.chunk,
+			)
+		}
 		s.acceptMetadata(received.chunk, data)
 	}
 }
@@ -515,7 +544,7 @@ func (s *OrderedReduceStream) produceNextUnits(readyBuffers []*orderedChildBuffe
 			}
 
 			for _, buffer := range readyBuffers {
-				buffer.discardQuery(s.currentQuery)
+				s.discardQuery(buffer, s.currentQuery)
 			}
 			for i := range s.childBuffers {
 				if !s.childDrained[i] && !s.childBuffers[i].hasUnit() {
@@ -555,7 +584,7 @@ func (s *OrderedReduceStream) produceNextUnits(readyBuffers []*orderedChildBuffe
 			continue
 		}
 
-		oneReduceResult := readyBuffers[winner].pop()
+		oneReduceResult := s.pop(readyBuffers[winner])
 		s.emittedPerQuery[s.currentQuery]++
 		if s.emittedPerQuery[s.currentQuery] == s.topK && s.currentQuery == s.nq-1 {
 			s.currentQuery++
@@ -567,8 +596,43 @@ func (s *OrderedReduceStream) produceNextUnits(readyBuffers []*orderedChildBuffe
 
 func (s *OrderedReduceStream) merge(outputBuffer *orderedOutputBuffer, oneReduceResult *orderedUnit) {
 	if oneReduceResult != nil {
+		s.retainedMemory.Retain(outputBuffer, s.outputBufferCategory(), oneReduceResult.result)
 		outputBuffer.units = append(outputBuffer.units, *oneReduceResult)
 	}
+}
+
+func (s *OrderedReduceStream) pop(buffer *orderedChildBuffer) orderedUnit {
+	oneReduceResult := buffer.pop()
+	if !buffer.hasUnit() {
+		s.retainedMemory.Release(buffer, oneReduceResult.result)
+	}
+	return oneReduceResult
+}
+
+func (s *OrderedReduceStream) discardQuery(buffer *orderedChildBuffer, queryIndex int64) {
+	for buffer.hasUnit() && buffer.front().queryIndex == queryIndex {
+		s.pop(buffer)
+	}
+}
+
+func (s *OrderedReduceStream) releaseOutputBuffer(outputBuffer *orderedOutputBuffer) {
+	for _, unit := range outputBuffer.units {
+		s.retainedMemory.Release(outputBuffer, unit.result)
+	}
+}
+
+func (s *OrderedReduceStream) childBufferCategory() RetainedMemoryCategory {
+	if s.retainedRole == RetainedMemoryFinalReduceStreamRole {
+		return RetainedMemoryFinalChildBuffer
+	}
+	return RetainedMemoryPerVChannelChildBuffer
+}
+
+func (s *OrderedReduceStream) outputBufferCategory() RetainedMemoryCategory {
+	if s.retainedRole == RetainedMemoryFinalReduceStreamRole {
+		return RetainedMemoryFinalOutputBuffer
+	}
+	return RetainedMemoryPerVChannelOutputBuffer
 }
 
 func (s *OrderedReduceStream) createOutputChunk(outputBuffer *orderedOutputBuffer) (*internalpb.SearchResults, error) {
@@ -721,6 +785,9 @@ func (s *OrderedReduceStream) closeChildren() error {
 	for i := range s.childStreams {
 		if err := s.childStreams[i].Close(); err != nil {
 			closeErrors = append(closeErrors, fmt.Errorf("close child stream %d: %w", i, err))
+		}
+		if s.childBuffers[i].hasUnit() {
+			s.retainedMemory.Release(&s.childBuffers[i], s.childBuffers[i].front().result)
 		}
 		s.childBuffers[i].units = nil
 		s.childBuffers[i].cursor = 0

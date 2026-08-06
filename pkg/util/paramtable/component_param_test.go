@@ -37,14 +37,19 @@ func TestProxyDisableIteratorStreaming(t *testing.T) {
 	config := proxyConfig{}
 	config.init(base)
 	assert.False(t, config.DisableIteratorStreaming.GetAsBool())
+	assert.Empty(t, config.RetainedMemoryOutputPath.GetValue())
 	assert.NoError(t, base.Save(config.DisableIteratorStreaming.Key, "true"))
+	assert.NoError(t, base.Save(config.RetainedMemoryOutputPath.Key, "/tmp/queryview-memory.jsonl"))
 	assert.True(t, config.DisableIteratorStreaming.GetAsBool())
+	assert.Equal(t, "/tmp/queryview-memory.jsonl", config.RetainedMemoryOutputPath.GetValue())
 
 	t.Setenv("PROXY_QUERYVIEW_DISABLEITERATORSTREAMING", "true")
+	t.Setenv("PROXY_QUERYVIEW_RETAINEDMEMORYOUTPUTPATH", "/tmp/queryview-memory-env.jsonl")
 	envBase := NewBaseTable(SkipRemote(true))
 	envConfig := proxyConfig{}
 	envConfig.init(envBase)
 	assert.True(t, envConfig.DisableIteratorStreaming.GetAsBool())
+	assert.Equal(t, "/tmp/queryview-memory-env.jsonl", envConfig.RetainedMemoryOutputPath.GetValue())
 }
 
 func TestComponentParam_DataCoordBumpSchemaVersionCompactionParams(t *testing.T) {

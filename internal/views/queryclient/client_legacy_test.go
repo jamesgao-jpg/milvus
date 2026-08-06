@@ -94,6 +94,7 @@ func TestLegacyClientSearchReducesIteratorVChannelStreams(t *testing.T) {
 		firstReplicaPicker{},
 	)
 
+	accounting := searchutil.NewRetainedMemoryAccounting(1, 1, 3)
 	result, err := client.Legacy().Search(context.Background(), &LegacySearchRequest{
 		Req: &internalpb.SearchRequest{
 			CollectionID:     collectionID,
@@ -103,6 +104,7 @@ func TestLegacyClientSearchReducesIteratorVChannelStreams(t *testing.T) {
 			MetricType:       "IP",
 			IsIterator:       true,
 		},
+		RetainedMemory: accounting,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, result.Stream)
@@ -114,6 +116,12 @@ func TestLegacyClientSearchReducesIteratorVChannelStreams(t *testing.T) {
 	require.ErrorIs(t, err, io.EOF)
 	require.NoError(t, result.Stream.Close())
 	require.Len(t, result.Plans, 2)
+	snapshot := accounting.Finish(0)
+	require.Equal(t, searchutil.RetainedMemoryModeStreaming, snapshot.Mode)
+	require.Zero(t, snapshot.CurrentRetainedBytes)
+	require.Equal(t, snapshot.AcceptedBytesTotal, snapshot.ReleasedBytesTotal)
+	require.Len(t, snapshot.ReduceStreams, 3)
+	require.NotZero(t, snapshot.Categories[string(searchutil.RetainedMemoryFinalChunkHandoff)].PeakBytes)
 }
 
 func TestLegacyClientSearchUsesBatchWhenIteratorStreamingDisabled(t *testing.T) {
@@ -140,6 +148,7 @@ func TestLegacyClientSearchUsesBatchWhenIteratorStreamingDisabled(t *testing.T) 
 		firstReplicaPicker{},
 	)
 
+	accounting := searchutil.NewRetainedMemoryAccounting(2, 1, 1)
 	result, err := client.Legacy().Search(context.Background(), &LegacySearchRequest{Req: &internalpb.SearchRequest{
 		CollectionID:     100,
 		ConsistencyLevel: commonpb.ConsistencyLevel_Bounded,
@@ -147,11 +156,17 @@ func TestLegacyClientSearchUsesBatchWhenIteratorStreamingDisabled(t *testing.T) 
 		Topk:             1,
 		MetricType:       "IP",
 		IsIterator:       true,
-	}})
+	}, RetainedMemory: accounting})
 	require.NoError(t, err)
 	require.Nil(t, result.Stream)
 	require.Len(t, result.Results, 1)
 	require.Same(t, batchResult, result.Results[0])
+	accounting.Release(batchResult, batchResult)
+	snapshot := accounting.Finish(0)
+	require.Equal(t, searchutil.RetainedMemoryModeBatch, snapshot.Mode)
+	require.Zero(t, snapshot.CurrentRetainedBytes)
+	require.Equal(t, snapshot.AcceptedBytesTotal, snapshot.ReleasedBytesTotal)
+	require.NotZero(t, snapshot.Categories[string(searchutil.RetainedMemoryBatchResults)].PeakBytes)
 }
 
 func TestLegacyClientSearchUsesBatchForUnsupportedIterator(t *testing.T) {

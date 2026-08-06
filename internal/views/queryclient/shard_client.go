@@ -156,6 +156,7 @@ func (s *shardViewQueryClient) SearchStream(
 	ctx context.Context,
 	vchannel string,
 	req *internalpb.SearchRequest,
+	retainedMemory *searchutil.RetainedMemoryAccounting,
 ) (searchutil.ReduceStream, *ShardPlan, error) {
 	if req == nil {
 		return nil, nil, errors.New("SearchStream requires a Search request")
@@ -233,7 +234,13 @@ func (s *shardViewQueryClient) SearchStream(
 			continue
 		}
 
-		reducedStream, err := searchutil.NewReduceStream(req, childStreams, defaultSearchStreamChunkSize)
+		reducedStream, err := searchutil.NewReduceStreamWithRetainedMemory(
+			req,
+			childStreams,
+			defaultSearchStreamChunkSize,
+			retainedMemory,
+			searchutil.RetainedMemoryPerVChannelReduceStreamRole,
+		)
 		if err != nil {
 			for _, childStream := range childStreams {
 				err = errors.Join(err, childStream.Close())

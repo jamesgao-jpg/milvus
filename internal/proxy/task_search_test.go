@@ -20,6 +20,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -47,6 +49,7 @@ import (
 	"github.com/milvus-io/milvus/internal/util/function/embedding"
 	"github.com/milvus-io/milvus/internal/util/function/highlight"
 	"github.com/milvus-io/milvus/internal/util/reduce"
+	"github.com/milvus-io/milvus/internal/util/searchutil"
 	"github.com/milvus-io/milvus/internal/util/segcore"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
@@ -61,6 +64,47 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
+
+func TestSearchTaskWritesRetainedMemoryAccounting(t *testing.T) {
+	outputPath := filepath.Join(t.TempDir(), "retained-memory.jsonl")
+	chunk := &internalpb.SearchResults{
+		ResultData: &schemapb.SearchResultData{
+			Ids: &schemapb.IDs{IdField: &schemapb.IDs_IntId{
+				IntId: &schemapb.LongArray{Data: []int64{1, 2}},
+			}},
+		},
+	}
+	accounting := searchutil.NewRetainedMemoryAccounting(10, 1, 2)
+	accounting.SetMode(searchutil.RetainedMemoryModeBatch)
+	accounting.Retain(chunk, searchutil.RetainedMemoryBatchResults, chunk)
+	accounting.Release(chunk, chunk)
+	result := &milvuspb.SearchResults{
+		Status: merr.Success(),
+		Results: &schemapb.SearchResultData{
+			Ids: &schemapb.IDs{IdField: &schemapb.IDs_IntId{
+				IntId: &schemapb.LongArray{Data: []int64{1, 2}},
+			}},
+		},
+	}
+	task := &searchTask{
+		result:                   result,
+		retainedMemory:           accounting,
+		retainedMemoryOutputPath: outputPath,
+	}
+
+	task.finishRetainedMemoryAccounting(context.Background())
+	task.finishRetainedMemoryAccounting(context.Background())
+
+	encoded, err := os.ReadFile(outputPath)
+	require.NoError(t, err)
+	require.Equal(t, 1, strings.Count(string(encoded), "\n"))
+	var snapshot searchutil.RetainedMemorySnapshot
+	require.NoError(t, json.Unmarshal(encoded, &snapshot))
+	require.Equal(t, searchutil.RetainedMemoryModeBatch, snapshot.Mode)
+	require.Equal(t, int64(proto.Size(result)), snapshot.FinalResponseBytes)
+	require.Zero(t, snapshot.CurrentRetainedBytes)
+	require.Equal(t, snapshot.AcceptedBytesTotal, snapshot.ReleasedBytesTotal)
+}
 
 func TestAppendFinalSearchChunkPreservesOrderAndAppliesOffset(t *testing.T) {
 	output := &schemapb.SearchResultData{
