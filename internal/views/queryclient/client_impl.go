@@ -16,8 +16,10 @@ const defaultMaxRetries = 3
 
 // ViewQueryClientConfig holds configuration for the ViewQueryClient.
 type ViewQueryClientConfig struct {
-	MaxRetries               int  // Maximum per-shard retries on retryable errors. 0 uses default (3).
-	DisableIteratorStreaming bool // Route supported iterator Search through the existing batch path.
+	MaxRetries                 int  // Maximum per-shard retries on retryable errors. 0 uses default (3).
+	DisableIteratorStreaming   bool // Route supported iterator Search through the existing batch path.
+	EnablePlainSearchStreaming bool // Route supported non-iterator Plain ANN Search through Streaming Reduce.
+	SearchStreamChunkSize      int  // Maximum Units per Search stream Chunk. 0 uses the default (1024).
 }
 
 // viewQueryClientImpl implements ViewQueryClient.

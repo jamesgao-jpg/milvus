@@ -30,6 +30,8 @@ M1A_MEMORY_CONCURRENCY="${QUERYVIEW_M1A_MEMORY_CONCURRENCY:-32}"
 M1A_MEMORY_TOP_K="${QUERYVIEW_M1A_MEMORY_TOP_K:-16384}"
 M1A_SHARDS_NUM="${QUERYVIEW_M1A_SHARDS_NUM:-2}"
 DISABLE_ITERATOR_STREAMING="${QUERYVIEW_DISABLE_ITERATOR_STREAMING:-false}"
+ENABLE_PLAIN_SEARCH_STREAMING="${QUERYVIEW_ENABLE_PLAIN_SEARCH_STREAMING:-false}"
+SEARCH_STREAM_CHUNK_SIZE="${QUERYVIEW_SEARCH_STREAM_CHUNK_SIZE:-1024}"
 if [[ "$M1A_MEMORY_MODE" == "batch" ]]; then
     DISABLE_ITERATOR_STREAMING=true
 elif [[ "$M1A_MEMORY_MODE" == "streaming" || "$M1A_MEMORY_MODE" == "iterator" ]]; then
@@ -185,6 +187,8 @@ start_role() {
         export METRICS_PORT="$metrics_port"
         export PROXY_PORT="$MILVUS_PORT"
         export PROXY_QUERYVIEW_DISABLEITERATORSTREAMING="$DISABLE_ITERATOR_STREAMING"
+        export PROXY_QUERYVIEW_ENABLEPLAINSEARCHSTREAMING="$ENABLE_PLAIN_SEARCH_STREAMING"
+        export PROXY_QUERYVIEW_SEARCHSTREAMCHUNKSIZE="$SEARCH_STREAM_CHUNK_SIZE"
         export PROXY_QUERYVIEW_RETAINEDMEMORYOUTPUTPATH="$RETAINED_MEMORY_OUTPUT_PATH"
         export LD_LIBRARY_PATH="$REPO_ROOT/internal/core/output/lib:${LD_LIBRARY_PATH:-}"
 
@@ -230,6 +234,10 @@ docker compose version >/dev/null
 [[ -f "$SMOKE_TEST" ]] || fail "Smoke test is missing: $SMOKE_TEST"
 [[ "$DISABLE_ITERATOR_STREAMING" == "true" || "$DISABLE_ITERATOR_STREAMING" == "false" ]] \
     || fail "QUERYVIEW_DISABLE_ITERATOR_STREAMING must be true or false"
+[[ "$ENABLE_PLAIN_SEARCH_STREAMING" == "true" || "$ENABLE_PLAIN_SEARCH_STREAMING" == "false" ]] \
+    || fail "QUERYVIEW_ENABLE_PLAIN_SEARCH_STREAMING must be true or false"
+[[ "$SEARCH_STREAM_CHUNK_SIZE" =~ ^[1-9][0-9]*$ ]] \
+    || fail "QUERYVIEW_SEARCH_STREAM_CHUNK_SIZE must be a positive integer"
 if [[ -n "$M1A_TEST_PLAN_DIR" ]]; then
     [[ -x "$M1A_PYTHON" ]] || fail "M1A Python is missing or not executable: $M1A_PYTHON"
     [[ -f "$M1A_TEST_PLAN_DIR/scripts/prepare_openai_50k.py" ]] \
@@ -262,6 +270,8 @@ EOF
 
 log "Run ID: $RUN_ID"
 log "Disable iterator streaming: $DISABLE_ITERATOR_STREAMING"
+log "Enable Plain ANN Search streaming: $ENABLE_PLAIN_SEARCH_STREAMING"
+log "Search stream Chunk size: $SEARCH_STREAM_CHUNK_SIZE"
 log "Starting etcd, Pulsar, and MinIO"
 compose up -d etcd pulsar minio
 

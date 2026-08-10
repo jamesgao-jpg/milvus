@@ -156,6 +156,7 @@ func (s *shardViewQueryClient) SearchStream(
 	ctx context.Context,
 	vchannel string,
 	req *internalpb.SearchRequest,
+	chunkSize int,
 	retainedMemory *searchutil.RetainedMemoryAccounting,
 ) (searchutil.ReduceStream, *ShardPlan, error) {
 	if req == nil {
@@ -205,10 +206,11 @@ func (s *shardViewQueryClient) SearchStream(
 		childStreams := make([]searchutil.ReduceStream, 0, len(workNodes))
 		for _, node := range workNodes {
 			childStream, openErr := s.queryServiceClient.SearchOnViewStream(ctx, node, &viewpb.SearchOnViewRequest{
-				LegacyReq: legacySearchRequestForNode(plan, node),
-				ShardId:   shardID.IntoProto(),
-				Version:   plan.Version,
-				Mvcc:      plan.GetMvcc(),
+				LegacyReq:       legacySearchRequestForNode(plan, node),
+				ShardId:         shardID.IntoProto(),
+				Version:         plan.Version,
+				Mvcc:            plan.GetMvcc(),
+				StreamChunkSize: int64(chunkSize),
 			})
 			if openErr != nil {
 				err = openErr
@@ -237,7 +239,7 @@ func (s *shardViewQueryClient) SearchStream(
 		reducedStream, err := searchutil.NewReduceStreamWithRetainedMemory(
 			req,
 			childStreams,
-			defaultSearchStreamChunkSize,
+			chunkSize,
 			retainedMemory,
 			searchutil.RetainedMemoryPerVChannelReduceStreamRole,
 		)

@@ -44,11 +44,12 @@ func TestSearchOnViewStreamSendsChunksAndEOF(t *testing.T) {
 	provider := &streamTestProvider{searchTasks: tasks}
 	scheduler := &streamTestScheduler{result: streamTestResult()}
 	server := NewServer(provider, scheduler)
-	server.searchStreamChunkSize = 2
 
 	client, cleanup := startSearchStreamTestServer(t, server)
 	defer cleanup()
-	stream, err := searchutil.NewGRPCReduceStream(context.Background(), client, streamTestRequest())
+	request := streamTestRequest()
+	request.StreamChunkSize = 2
+	stream, err := searchutil.NewGRPCReduceStream(context.Background(), client, request)
 	require.NoError(t, err)
 
 	first := recvSearchStreamChunk(t, stream)
@@ -132,13 +133,34 @@ func TestSearchOnViewStreamReturnsServerError(t *testing.T) {
 	require.Equal(t, codes.NotFound, status.Code(err))
 }
 
-func TestSearchOnViewStreamRejectsNonIteratorRequest(t *testing.T) {
-	server := NewServer(&streamTestProvider{}, &streamTestScheduler{})
+func TestSearchOnViewStreamAcceptsPlainANNRequest(t *testing.T) {
+	server := NewServer(
+		&streamTestProvider{searchTasks: &streamTestSearchTasks{tasks: []SearchSegmentTask{struct{}{}}}},
+		&streamTestScheduler{result: streamTestResult()},
+	)
 	client, cleanup := startSearchStreamTestServer(t, server)
 	defer cleanup()
 
 	request := streamTestRequest()
 	request.LegacyReq.IsIterator = false
+	stream, err := searchutil.NewGRPCReduceStream(context.Background(), client, request)
+	require.NoError(t, err)
+
+	chunk := recvSearchStreamChunk(t, stream)
+	assertStreamChunk(t, chunk, []int64{1, 2, 3, 10, 11}, []int64{3, 2})
+	chunk, err = stream.Recv()
+	require.Nil(t, chunk)
+	require.ErrorIs(t, err, io.EOF)
+	require.NoError(t, stream.Close())
+}
+
+func TestSearchOnViewStreamRejectsUnsupportedSearch(t *testing.T) {
+	server := NewServer(&streamTestProvider{}, &streamTestScheduler{})
+	client, cleanup := startSearchStreamTestServer(t, server)
+	defer cleanup()
+
+	request := streamTestRequest()
+	request.LegacyReq.GroupByFieldId = 100
 	stream, err := searchutil.NewGRPCReduceStream(context.Background(), client, request)
 	require.NoError(t, err)
 

@@ -75,7 +75,7 @@ func TestLegacyClientSearchReducesIteratorVChannelStreams(t *testing.T) {
 	queryNode := qviews.NewQueryNode(11)
 
 	client := NewLegacyViewQueryClient(
-		ViewQueryClientConfig{MaxRetries: 1},
+		ViewQueryClientConfig{MaxRetries: 1, SearchStreamChunkSize: 2},
 		&legacyPlanClient{plans: map[string]*viewpb.QueryPlan{
 			shardA.VChannel: legacySearchPlan(shardA, queryNode),
 			shardB.VChannel: legacySearchPlan(shardB, queryNode),
@@ -110,8 +110,12 @@ func TestLegacyClientSearchReducesIteratorVChannelStreams(t *testing.T) {
 	require.NotNil(t, result.Stream)
 	chunk, err := result.Stream.Recv()
 	require.NoError(t, err)
-	require.Equal(t, []int64{1, 2, 3}, chunk.GetResultData().GetIds().GetIntId().GetData())
-	require.Equal(t, []float32{0.9, 0.8, 0.7}, chunk.GetResultData().GetScores())
+	require.Equal(t, []int64{1, 2}, chunk.GetResultData().GetIds().GetIntId().GetData())
+	require.Equal(t, []float32{0.9, 0.8}, chunk.GetResultData().GetScores())
+	chunk, err = result.Stream.Recv()
+	require.NoError(t, err)
+	require.Equal(t, []int64{3}, chunk.GetResultData().GetIds().GetIntId().GetData())
+	require.Equal(t, []float32{0.7}, chunk.GetResultData().GetScores())
 	_, err = result.Stream.Recv()
 	require.ErrorIs(t, err, io.EOF)
 	require.NoError(t, result.Stream.Close())
@@ -122,6 +126,45 @@ func TestLegacyClientSearchReducesIteratorVChannelStreams(t *testing.T) {
 	require.Equal(t, snapshot.AcceptedBytesTotal, snapshot.ReleasedBytesTotal)
 	require.Len(t, snapshot.ReduceStreams, 3)
 	require.NotZero(t, snapshot.Categories[string(searchutil.RetainedMemoryFinalChunkHandoff)].PeakBytes)
+}
+
+func TestLegacyClientSearchReducesPlainANNWhenEnabled(t *testing.T) {
+	shardID := qviews.ShardID{ReplicaID: 1, VChannel: "by-dev-rootcoord-dml_0_100v0"}
+	queryNode := qviews.NewQueryNode(11)
+	client := NewLegacyViewQueryClient(
+		ViewQueryClientConfig{MaxRetries: 1, EnablePlainSearchStreaming: true},
+		&legacyPlanClient{plans: map[string]*viewpb.QueryPlan{
+			shardID.VChannel: legacySearchPlan(shardID, queryNode),
+		}},
+		&legacyServiceClient{searchResults: map[string]*internalpb.SearchResults{
+			shardID.VChannel: newTestSearchChunk(2, []int64{10, 20}, []float32{0.9, 0.8}),
+		}},
+		&legacyResolver{
+			vchannels: []string{shardID.VChannel},
+			replicas: map[string]*resolver.ShardReplicas{
+				shardID.VChannel: {VChannel: shardID.VChannel, PrimaryShardID: shardID, ShardIDs: []qviews.ShardID{shardID}},
+			},
+		},
+		firstReplicaPicker{},
+	)
+
+	result, err := client.Legacy().Search(context.Background(), &LegacySearchRequest{Req: &internalpb.SearchRequest{
+		CollectionID:     100,
+		ConsistencyLevel: commonpb.ConsistencyLevel_Bounded,
+		Nq:               1,
+		Topk:             2,
+		MetricType:       "IP",
+	}})
+	require.NoError(t, err)
+	require.NotNil(t, result.Stream)
+	require.Empty(t, result.Results)
+
+	chunk, err := result.Stream.Recv()
+	require.NoError(t, err)
+	require.Equal(t, []int64{10, 20}, chunk.GetResultData().GetIds().GetIntId().GetData())
+	_, err = result.Stream.Recv()
+	require.ErrorIs(t, err, io.EOF)
+	require.NoError(t, result.Stream.Close())
 }
 
 func TestLegacyClientSearchUsesBatchWhenIteratorStreamingDisabled(t *testing.T) {

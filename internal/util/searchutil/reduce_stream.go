@@ -293,8 +293,8 @@ func newReduceStream(
 	if request.GetTopk() <= 0 {
 		return nil, fmt.Errorf("NewReduceStream requires a positive topK, got %d", request.GetTopk())
 	}
-	if !request.GetIsIterator() || request.GetIsAdvanced() || len(request.GetSubReqs()) > 0 || request.GetGroupByFieldId() > 0 || len(request.GetGroupByFieldIds()) > 0 {
-		return nil, errors.New("NewReduceStream currently supports Plain ANN Search iterator only")
+	if request.GetIsAdvanced() || len(request.GetSubReqs()) > 0 || request.GetGroupByFieldId() > 0 || len(request.GetGroupByFieldIds()) > 0 {
+		return nil, errors.New("NewReduceStream currently supports Plain ANN Search only")
 	}
 	if chunkSize <= 0 {
 		return nil, fmt.Errorf("NewReduceStream requires a positive Chunk size, got %d", chunkSize)

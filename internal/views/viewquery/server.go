@@ -18,16 +18,14 @@ const defaultSearchStreamChunkSize = 1024
 // Server implements ViewQueryService as a thin provider+scheduler adapter.
 type Server struct {
 	viewpb.UnimplementedViewQueryServiceServer
-	provider              TaskProvider
-	scheduler             Scheduler
-	searchStreamChunkSize int
+	provider  TaskProvider
+	scheduler Scheduler
 }
 
 func NewServer(provider TaskProvider, scheduler Scheduler) *Server {
 	return &Server{
-		provider:              provider,
-		scheduler:             scheduler,
-		searchStreamChunkSize: defaultSearchStreamChunkSize,
+		provider:  provider,
+		scheduler: scheduler,
 	}
 }
 
@@ -74,19 +72,22 @@ func (s *Server) SearchOnViewStream(stream viewpb.ViewQueryService_SearchOnViewS
 	}
 	legacyRequest := request.GetLegacyReq()
 	if legacyRequest == nil ||
-		!legacyRequest.GetIsIterator() ||
 		legacyRequest.GetIsAdvanced() ||
 		len(legacyRequest.GetSubReqs()) > 0 ||
 		legacyRequest.GetGroupByFieldId() > 0 ||
 		len(legacyRequest.GetGroupByFieldIds()) > 0 {
-		return status.Error(codes.InvalidArgument, "SearchOnViewStream supports Plain ANN Search iterator only")
+		return status.Error(codes.InvalidArgument, "SearchOnViewStream supports Plain ANN Search only")
 	}
 
 	response, err := s.SearchOnView(stream.Context(), request)
 	if err != nil {
 		return err
 	}
-	chunks, err := searchutil.SplitSearchResult(response.GetLegacyResults(), s.searchStreamChunkSize)
+	chunkSize := int(request.GetStreamChunkSize())
+	if chunkSize <= 0 {
+		chunkSize = defaultSearchStreamChunkSize
+	}
+	chunks, err := searchutil.SplitSearchResult(response.GetLegacyResults(), chunkSize)
 	if err != nil {
 		return status.Errorf(codes.Internal, "split SearchOnView result: %v", err)
 	}

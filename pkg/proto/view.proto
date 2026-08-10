@@ -392,6 +392,7 @@ message SearchOnViewRequest {
     ShardID shard_id = 2;
     QueryViewVersion version = 3;
     QueryPlanMVCC mvcc = 4;
+    int64 stream_chunk_size = 5;
 }
 
 message SearchOnViewResponse {

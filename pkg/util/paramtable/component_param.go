@@ -2208,10 +2208,12 @@ type proxyConfig struct {
 
 	GracefulStopTimeout ParamItem `refreshable:"true"`
 
-	SlowQuerySpanInSeconds   ParamItem `refreshable:"true"`
-	QueryNodePoolingSize     ParamItem `refreshable:"false"`
-	DisableIteratorStreaming ParamItem `refreshable:"false"`
-	RetainedMemoryOutputPath ParamItem `refreshable:"false"`
+	SlowQuerySpanInSeconds     ParamItem `refreshable:"true"`
+	QueryNodePoolingSize       ParamItem `refreshable:"false"`
+	DisableIteratorStreaming   ParamItem `refreshable:"false"`
+	EnablePlainSearchStreaming ParamItem `refreshable:"false"`
+	SearchStreamChunkSize      ParamItem `refreshable:"false"`
+	RetainedMemoryOutputPath   ParamItem `refreshable:"false"`
 
 	HybridSearchRequeryPolicy ParamItem `refreshable:"true"`
 }
@@ -2861,6 +2863,24 @@ Disabled if the value is less or equal to 0.`,
 		Export:       true,
 	}
 	p.DisableIteratorStreaming.Init(base.mgr)
+
+	p.EnablePlainSearchStreaming = ParamItem{
+		Key:          "proxy.queryView.enablePlainSearchStreaming",
+		Version:      "3.0.0",
+		DefaultValue: "false",
+		Doc:          "route supported non-iterator Plain ANN Search through Streaming Reduce",
+		Export:       true,
+	}
+	p.EnablePlainSearchStreaming.Init(base.mgr)
+
+	p.SearchStreamChunkSize = ParamItem{
+		Key:          "proxy.queryView.searchStreamChunkSize",
+		Version:      "3.0.0",
+		DefaultValue: "1024",
+		Doc:          "maximum number of Units in each Search stream Chunk",
+		Export:       true,
+	}
+	p.SearchStreamChunkSize.Init(base.mgr)
 
 	p.RetainedMemoryOutputPath = ParamItem{
 		Key:          "proxy.queryView.retainedMemoryOutputPath",

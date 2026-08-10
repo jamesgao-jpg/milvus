@@ -56,9 +56,11 @@ func (c *legacyOnlyClient) Legacy() LegacyClient {
 }
 
 type legacyClient struct {
-	shardClient              *shardViewQueryClient
-	shardResolver            resolver.ShardResolver
-	disableIteratorStreaming bool
+	shardClient                *shardViewQueryClient
+	shardResolver              resolver.ShardResolver
+	disableIteratorStreaming   bool
+	enablePlainSearchStreaming bool
+	searchStreamChunkSize      int
 }
 
 type prefetchedReduceStream struct {
@@ -129,16 +131,20 @@ func newLegacyClient(
 	if cfg.MaxRetries <= 0 {
 		cfg.MaxRetries = defaultMaxRetries
 	}
+	if cfg.SearchStreamChunkSize <= 0 {
+		cfg.SearchStreamChunkSize = defaultSearchStreamChunkSize
+	}
 	return &legacyClient{
-		shardClient:              newShardViewQueryClient(cfg.MaxRetries, queryPlanClient, queryServiceClient, shardResolver, replicaPicker),
-		shardResolver:            shardResolver,
-		disableIteratorStreaming: cfg.DisableIteratorStreaming,
+		shardClient:                newShardViewQueryClient(cfg.MaxRetries, queryPlanClient, queryServiceClient, shardResolver, replicaPicker),
+		shardResolver:              shardResolver,
+		disableIteratorStreaming:   cfg.DisableIteratorStreaming,
+		enablePlainSearchStreaming: cfg.EnablePlainSearchStreaming,
+		searchStreamChunkSize:      cfg.SearchStreamChunkSize,
 	}
 }
 
 func supportsSearchStream(req *internalpb.SearchRequest) bool {
 	return req != nil &&
-		req.GetIsIterator() &&
 		!req.GetIsAdvanced() &&
 		len(req.GetSubReqs()) == 0 &&
 		req.GetGroupByFieldId() <= 0 &&
@@ -146,7 +152,11 @@ func supportsSearchStream(req *internalpb.SearchRequest) bool {
 }
 
 func (c *legacyClient) Search(ctx context.Context, req *LegacySearchRequest) (*LegacySearchResult, error) {
-	if !c.disableIteratorStreaming && supportsSearchStream(req.Req) {
+	streamEnabled := !c.disableIteratorStreaming
+	if !req.Req.GetIsIterator() {
+		streamEnabled = c.enablePlainSearchStreaming
+	}
+	if streamEnabled && supportsSearchStream(req.Req) {
 		req.RetainedMemory.SetMode(searchutil.RetainedMemoryModeStreaming)
 		return c.searchStream(ctx, req)
 	}
@@ -199,7 +209,7 @@ func (c *legacyClient) searchStream(ctx context.Context, req *LegacySearchReques
 		for i := range vchannels {
 			i := i
 			g.Go(func() error {
-				stream, plan, err := c.shardClient.SearchStream(ctx, vchannels[i], req.Req, req.RetainedMemory)
+				stream, plan, err := c.shardClient.SearchStream(ctx, vchannels[i], req.Req, c.searchStreamChunkSize, req.RetainedMemory)
 				if err != nil {
 					return err
 				}
@@ -225,7 +235,7 @@ func (c *legacyClient) searchStream(ctx context.Context, req *LegacySearchReques
 		finalStream, err := searchutil.NewReduceStreamWithRetainedMemory(
 			req.Req,
 			vchannelStreams,
-			defaultSearchStreamChunkSize,
+			c.searchStreamChunkSize,
 			req.RetainedMemory,
 			searchutil.RetainedMemoryFinalReduceStreamRole,
 		)

@@ -140,7 +140,7 @@ func TestSearchTaskExecuteUsesQueryViewLegacyClient(t *testing.T) {
 	require.Zero(t, task.queryChannelsNode.Len())
 }
 
-func TestSearchTaskExecuteKeepsIteratorReduceStream(t *testing.T) {
+func TestSearchTaskExecuteKeepsReduceStream(t *testing.T) {
 	stream := &fakeLegacySearchStream{}
 	legacy := &fakeLegacyQueryClient{
 		searchResult: &queryclient.LegacySearchResult{Stream: stream},
@@ -151,7 +151,6 @@ func TestSearchTaskExecuteKeepsIteratorReduceStream(t *testing.T) {
 			CollectionID: 1,
 			Nq:           1,
 			Topk:         1,
-			IsIterator:   true,
 		},
 		request:         &milvuspb.SearchRequest{DbName: "default"},
 		resultBuf:       typeutil.NewConcurrentSet[*internalpb.SearchResults](),

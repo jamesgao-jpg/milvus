@@ -65,7 +65,9 @@ func newDefaultProxyViewQueryClient(etcdCli *clientv3.Client) (queryclient.Clien
 	)
 	client := queryclient.NewLegacyViewQueryClient(
 		queryclient.ViewQueryClientConfig{
-			DisableIteratorStreaming: paramtable.Get().ProxyCfg.DisableIteratorStreaming.GetAsBool(),
+			DisableIteratorStreaming:   paramtable.Get().ProxyCfg.DisableIteratorStreaming.GetAsBool(),
+			EnablePlainSearchStreaming: paramtable.Get().ProxyCfg.EnablePlainSearchStreaming.GetAsBool(),
+			SearchStreamChunkSize:      paramtable.Get().ProxyCfg.SearchStreamChunkSize.GetAsInt(),
 		},
 		queryPlanClient,
 		queryServiceClient,

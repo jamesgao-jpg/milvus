@@ -189,14 +189,19 @@ func TestShardSearchStreamReturnsPerVChannelReduceStream(t *testing.T) {
 	}
 	client := newTestShardClient(1, shardID, plan, queryService)
 
-	stream, shardPlan, err := client.SearchStream(context.Background(), shardID.VChannel, request, nil)
+	stream, shardPlan, err := client.SearchStream(context.Background(), shardID.VChannel, request, 2, nil)
 
 	require.NoError(t, err)
 	require.Equal(t, shardID, shardPlan.ShardID)
+	require.Equal(t, int64(2), queryService.searchReq.GetStreamChunkSize())
 	chunk, err := stream.Recv()
 	require.NoError(t, err)
-	require.Equal(t, []int64{1, 2, 3}, chunk.GetResultData().GetIds().GetIntId().GetData())
-	require.Equal(t, []float32{0.9, 0.8, 0.7}, chunk.GetResultData().GetScores())
+	require.Equal(t, []int64{1, 2}, chunk.GetResultData().GetIds().GetIntId().GetData())
+	require.Equal(t, []float32{0.9, 0.8}, chunk.GetResultData().GetScores())
+	chunk, err = stream.Recv()
+	require.NoError(t, err)
+	require.Equal(t, []int64{3}, chunk.GetResultData().GetIds().GetIntId().GetData())
+	require.Equal(t, []float32{0.7}, chunk.GetResultData().GetScores())
 	chunk, err = stream.Recv()
 	require.Nil(t, chunk)
 	require.ErrorIs(t, err, io.EOF)
@@ -232,7 +237,7 @@ func TestShardSearchStreamCloseCompletesReplicaPicker(t *testing.T) {
 		},
 	)
 
-	stream, _, err := client.SearchStream(context.Background(), shardID.VChannel, request, nil)
+	stream, _, err := client.SearchStream(context.Background(), shardID.VChannel, request, defaultSearchStreamChunkSize, nil)
 	require.NoError(t, err)
 	require.NoError(t, stream.Close())
 
@@ -264,7 +269,7 @@ func TestShardSearchClosesOpenedStreamsOnSetupFailure(t *testing.T) {
 	}
 	client := newTestShardClient(1, shardID, plan, queryService)
 
-	_, _, err := client.SearchStream(context.Background(), shardID.VChannel, request, nil)
+	_, _, err := client.SearchStream(context.Background(), shardID.VChannel, request, defaultSearchStreamChunkSize, nil)
 
 	require.ErrorContains(t, err, "open failed")
 	require.Equal(t, 1, openedStream.closeCount())

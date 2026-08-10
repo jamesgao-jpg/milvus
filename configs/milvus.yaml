@@ -428,6 +428,8 @@ proxy:
     size: 10 # the size for shardleader(querynode) client pool
   queryView:
     disableIteratorStreaming: false # Route supported iterator Search through the existing batch path instead of Streaming Reduce.
+    enablePlainSearchStreaming: false # Route supported non-iterator Plain ANN Search through Streaming Reduce.
+    searchStreamChunkSize: 1024 # Maximum number of Units in each Search stream Chunk.
   partialResultRequiredDataRatio: 1 # partial result required data ratio, default to 1 which means disable partial result, otherwise, it will be used as the minimum data ratio for partial result
   http:
     enabled: true # Whether to enable the http server
