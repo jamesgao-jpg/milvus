@@ -18,6 +18,7 @@
 #include "common/JsonCastType.h"
 #include "common/Types.h"
 #include "common/Consts.h"
+#include "knowhere/object.h"
 
 namespace milvus::index {
 
@@ -42,6 +43,9 @@ struct CreateIndexInfo {
     std::optional<NgramParams> ngram_params{std::nullopt};
     bool is_text_match{false};
     std::string analyzer_extra_info;
+    int64_t mrl_dim{-1};
+    bool with_mrl_refine{false};
+    knowhere::ViewDataOp view_data;
 };
 
 }  // namespace milvus::index

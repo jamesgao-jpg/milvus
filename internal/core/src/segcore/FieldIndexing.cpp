@@ -200,7 +200,11 @@ VectorFieldIndexing::recreate_index(DataType data_type,
             config_->GetIndexType(),
             config_->GetMetricType(),
             knowhere::Version::GetCurrentVersion().VersionNumber(),
-            view_data);
+            view_data,
+            true,
+            get_dim(),
+            config_->GetMRLDim(),
+            config_->WithMRLRefine());
     } else if (data_type == DataType::VECTOR_FLOAT16) {
         auto concurrent_fp16_vec =
             reinterpret_cast<const ConcurrentVector<Float16Vector>*>(
@@ -217,7 +221,11 @@ VectorFieldIndexing::recreate_index(DataType data_type,
             config_->GetIndexType(),
             config_->GetMetricType(),
             knowhere::Version::GetCurrentVersion().VersionNumber(),
-            view_data);
+            view_data,
+            true,
+            get_dim(),
+            config_->GetMRLDim(),
+            config_->WithMRLRefine());
     } else if (data_type == DataType::VECTOR_BFLOAT16) {
         auto concurrent_bf16_vec =
             reinterpret_cast<const ConcurrentVector<BFloat16Vector>*>(
@@ -234,7 +242,11 @@ VectorFieldIndexing::recreate_index(DataType data_type,
             config_->GetIndexType(),
             config_->GetMetricType(),
             knowhere::Version::GetCurrentVersion().VersionNumber(),
-            view_data);
+            view_data,
+            true,
+            get_dim(),
+            config_->GetMRLDim(),
+            config_->WithMRLRefine());
     }
 }
 

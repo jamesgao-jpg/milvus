@@ -21,6 +21,7 @@
 #include "common/type_c.h"
 #include "common/Types.h"
 #include "index/Index.h"
+#include "knowhere/object.h"
 #include "cachinglayer/Utils.h"
 #include "segcore/ConcurrentVector.h"
 #include "segcore/Types.h"
@@ -197,7 +198,8 @@ getCellDataType(bool is_vector, bool is_index);
 void
 LoadIndexData(milvus::tracer::TraceContext& ctx,
               milvus::segcore::LoadIndexInfo* load_index_info,
-              milvus::OpContext* op_ctx = nullptr);
+              milvus::OpContext* op_ctx = nullptr,
+              knowhere::ViewDataOp view_data = {});
 
 /**
  * Convert Milvus timestamp to physical time in milliseconds.

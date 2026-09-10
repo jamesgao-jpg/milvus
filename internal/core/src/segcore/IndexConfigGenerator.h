@@ -54,6 +54,12 @@ class VecIndexConfig {
     knowhere::MetricType
     GetMetricType() const noexcept;
 
+    int64_t
+    GetMRLDim() const noexcept;
+
+    bool
+    WithMRLRefine() const noexcept;
+
     knowhere::Json
     GetBuildBaseParams(DataType data_type) const;
 
@@ -72,6 +78,10 @@ class VecIndexConfig {
     knowhere::MetricType metric_type_;
 
     bool is_sparse_;
+
+    int64_t mrl_dim_{-1};
+
+    bool with_mrl_refine_{false};
 
     knowhere::Json build_params_;
 
