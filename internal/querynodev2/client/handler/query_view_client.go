@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 
+	"github.com/milvus-io/milvus/internal/util/searchutil"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/service/contextutil"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/service/lazygrpc"
 	"github.com/milvus-io/milvus/internal/views/viewerror"
@@ -13,6 +14,7 @@ import (
 // QueryViewClient is the QueryView domain client under the QueryNode handler client.
 type QueryViewClient interface {
 	SearchOnView(ctx context.Context, nodeID int64, req *viewpb.SearchOnViewRequest) (*viewpb.SearchOnViewResponse, error)
+	SearchOnViewStream(ctx context.Context, nodeID int64, req *viewpb.SearchOnViewRequest) (searchutil.ReduceStream, error)
 	QueryOnView(ctx context.Context, nodeID int64, req *viewpb.QueryOnViewRequest) (*viewpb.QueryOnViewResponse, error)
 	RequeryOnView(ctx context.Context, nodeID int64, req *viewpb.RequeryOnViewRequest) (*viewpb.RequeryOnViewResponse, error)
 }
@@ -32,6 +34,12 @@ func newQueryViewClient(owner *clientImpl, conn lazygrpc.Conn) *queryViewClient 
 func (qvc *queryViewClient) SearchOnView(ctx context.Context, nodeID int64, req *viewpb.SearchOnViewRequest) (*viewpb.SearchOnViewResponse, error) {
 	return executeViewQueryRPC(ctx, qvc, nodeID, "ViewQueryService.SearchOnView", func(ctx context.Context, client viewpb.ViewQueryServiceClient) (*viewpb.SearchOnViewResponse, error) {
 		return client.SearchOnView(ctx, req)
+	})
+}
+
+func (qvc *queryViewClient) SearchOnViewStream(ctx context.Context, nodeID int64, req *viewpb.SearchOnViewRequest) (searchutil.ReduceStream, error) {
+	return executeViewQueryRPC(ctx, qvc, nodeID, "ViewQueryService.SearchOnViewStream", func(ctx context.Context, client viewpb.ViewQueryServiceClient) (searchutil.ReduceStream, error) {
+		return searchutil.NewGRPCReduceStream(ctx, client, req)
 	})
 }
 
