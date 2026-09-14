@@ -3,6 +3,7 @@ package queryclient
 import (
 	"context"
 
+	"github.com/milvus-io/milvus/internal/util/searchutil"
 	"github.com/milvus-io/milvus/internal/views/qviews"
 	"github.com/milvus-io/milvus/internal/views/viewerror"
 	"github.com/milvus-io/milvus/pkg/v3/proto/viewpb"
@@ -16,11 +17,13 @@ type compositeViewQueryServiceClient struct {
 
 type StreamingNodeViewQueryServiceClient interface {
 	SearchOnView(ctx context.Context, pchannel types.PChannelInfo, req *viewpb.SearchOnViewRequest) (*viewpb.SearchOnViewResponse, error)
+	SearchOnViewStream(ctx context.Context, pchannel types.PChannelInfo, req *viewpb.SearchOnViewRequest) (searchutil.ReduceStream, error)
 	QueryOnView(ctx context.Context, pchannel types.PChannelInfo, req *viewpb.QueryOnViewRequest) (*viewpb.QueryOnViewResponse, error)
 }
 
 type QueryNodeViewQueryServiceClient interface {
 	SearchOnView(ctx context.Context, nodeID int64, req *viewpb.SearchOnViewRequest) (*viewpb.SearchOnViewResponse, error)
+	SearchOnViewStream(ctx context.Context, nodeID int64, req *viewpb.SearchOnViewRequest) (searchutil.ReduceStream, error)
 	QueryOnView(ctx context.Context, nodeID int64, req *viewpb.QueryOnViewRequest) (*viewpb.QueryOnViewResponse, error)
 }
 
@@ -37,6 +40,17 @@ func (c *compositeViewQueryServiceClient) SearchOnView(ctx context.Context, node
 		return c.streamingNode.SearchOnView(ctx, types.PChannelInfo{Name: typed.PChannel}, req)
 	case qviews.QueryNode:
 		return c.queryNode.SearchOnView(ctx, typed.ID, req)
+	default:
+		return nil, invalidWorkNodeError(node)
+	}
+}
+
+func (c *compositeViewQueryServiceClient) SearchOnViewStream(ctx context.Context, node qviews.WorkNode, req *viewpb.SearchOnViewRequest) (searchutil.ReduceStream, error) {
+	switch typed := node.(type) {
+	case qviews.StreamingNode:
+		return c.streamingNode.SearchOnViewStream(ctx, types.PChannelInfo{Name: typed.PChannel}, req)
+	case qviews.QueryNode:
+		return c.queryNode.SearchOnViewStream(ctx, typed.ID, req)
 	default:
 		return nil, invalidWorkNodeError(node)
 	}
