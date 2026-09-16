@@ -275,6 +275,7 @@ const (
 	ViewQueryService_SearchOnView_FullMethodName       = "/milvus.proto.view.ViewQueryService/SearchOnView"
 	ViewQueryService_SearchOnViewStream_FullMethodName = "/milvus.proto.view.ViewQueryService/SearchOnViewStream"
 	ViewQueryService_QueryOnView_FullMethodName        = "/milvus.proto.view.ViewQueryService/QueryOnView"
+	ViewQueryService_QueryOnViewStream_FullMethodName  = "/milvus.proto.view.ViewQueryService/QueryOnViewStream"
 )
 
 // ViewQueryServiceClient is the client API for ViewQueryService service.
@@ -289,6 +290,8 @@ type ViewQueryServiceClient interface {
 	SearchOnViewStream(ctx context.Context, opts ...grpc.CallOption) (ViewQueryService_SearchOnViewStreamClient, error)
 	// QueryOnView executes a query (retrieve by expression) on segments belonging to the given view version.
 	QueryOnView(ctx context.Context, in *QueryOnViewRequest, opts ...grpc.CallOption) (*QueryOnViewResponse, error)
+	// QueryOnViewStream executes the same query over a bidirectional stream.
+	QueryOnViewStream(ctx context.Context, opts ...grpc.CallOption) (ViewQueryService_QueryOnViewStreamClient, error)
 }
 
 type viewQueryServiceClient struct {
@@ -348,6 +351,37 @@ func (c *viewQueryServiceClient) QueryOnView(ctx context.Context, in *QueryOnVie
 	return out, nil
 }
 
+func (c *viewQueryServiceClient) QueryOnViewStream(ctx context.Context, opts ...grpc.CallOption) (ViewQueryService_QueryOnViewStreamClient, error) {
+	stream, err := c.cc.NewStream(ctx, &ViewQueryService_ServiceDesc.Streams[1], ViewQueryService_QueryOnViewStream_FullMethodName, opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &viewQueryServiceQueryOnViewStreamClient{stream}
+	return x, nil
+}
+
+type ViewQueryService_QueryOnViewStreamClient interface {
+	Send(*QueryOnViewStreamRequest) error
+	Recv() (*QueryOnViewStreamResponse, error)
+	grpc.ClientStream
+}
+
+type viewQueryServiceQueryOnViewStreamClient struct {
+	grpc.ClientStream
+}
+
+func (x *viewQueryServiceQueryOnViewStreamClient) Send(m *QueryOnViewStreamRequest) error {
+	return x.ClientStream.SendMsg(m)
+}
+
+func (x *viewQueryServiceQueryOnViewStreamClient) Recv() (*QueryOnViewStreamResponse, error) {
+	m := new(QueryOnViewStreamResponse)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 // ViewQueryServiceServer is the server API for ViewQueryService service.
 // All implementations should embed UnimplementedViewQueryServiceServer
 // for forward compatibility
@@ -360,6 +394,8 @@ type ViewQueryServiceServer interface {
 	SearchOnViewStream(ViewQueryService_SearchOnViewStreamServer) error
 	// QueryOnView executes a query (retrieve by expression) on segments belonging to the given view version.
 	QueryOnView(context.Context, *QueryOnViewRequest) (*QueryOnViewResponse, error)
+	// QueryOnViewStream executes the same query over a bidirectional stream.
+	QueryOnViewStream(ViewQueryService_QueryOnViewStreamServer) error
 }
 
 // UnimplementedViewQueryServiceServer should be embedded to have forward compatible implementations.
@@ -374,6 +410,9 @@ func (UnimplementedViewQueryServiceServer) SearchOnViewStream(ViewQueryService_S
 }
 func (UnimplementedViewQueryServiceServer) QueryOnView(context.Context, *QueryOnViewRequest) (*QueryOnViewResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method QueryOnView not implemented")
+}
+func (UnimplementedViewQueryServiceServer) QueryOnViewStream(ViewQueryService_QueryOnViewStreamServer) error {
+	return status.Errorf(codes.Unimplemented, "method QueryOnViewStream not implemented")
 }
 
 // UnsafeViewQueryServiceServer may be embedded to opt out of forward compatibility for this service.
@@ -449,6 +488,32 @@ func _ViewQueryService_QueryOnView_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ViewQueryService_QueryOnViewStream_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(ViewQueryServiceServer).QueryOnViewStream(&viewQueryServiceQueryOnViewStreamServer{stream})
+}
+
+type ViewQueryService_QueryOnViewStreamServer interface {
+	Send(*QueryOnViewStreamResponse) error
+	Recv() (*QueryOnViewStreamRequest, error)
+	grpc.ServerStream
+}
+
+type viewQueryServiceQueryOnViewStreamServer struct {
+	grpc.ServerStream
+}
+
+func (x *viewQueryServiceQueryOnViewStreamServer) Send(m *QueryOnViewStreamResponse) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func (x *viewQueryServiceQueryOnViewStreamServer) Recv() (*QueryOnViewStreamRequest, error) {
+	m := new(QueryOnViewStreamRequest)
+	if err := x.ServerStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 // ViewQueryService_ServiceDesc is the grpc.ServiceDesc for ViewQueryService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -469,6 +534,12 @@ var ViewQueryService_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "SearchOnViewStream",
 			Handler:       _ViewQueryService_SearchOnViewStream_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "QueryOnViewStream",
+			Handler:       _ViewQueryService_QueryOnViewStream_Handler,
 			ServerStreams: true,
 			ClientStreams: true,
 		},
