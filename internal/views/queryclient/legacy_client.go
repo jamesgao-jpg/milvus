@@ -24,7 +24,7 @@ type Client interface {
 	Legacy() LegacyClient
 }
 
-// LegacyClient returns batch results or the final iterator ReduceStream.
+// LegacyClient returns batch results or the final ReduceStream.
 type LegacyClient interface {
 	Search(ctx context.Context, req *LegacySearchRequest) (*LegacySearchResult, error)
 	Query(ctx context.Context, req *LegacyQueryRequest) (*LegacyQueryResult, error)
@@ -342,7 +342,6 @@ func (c *legacyClient) Query(ctx context.Context, req *LegacyQueryRequest) (*Leg
 
 func supportsQueryStream(req *internalpb.RetrieveRequest) bool {
 	return req != nil &&
-		req.GetIsIterator() &&
 		req.GetLimit() > 0 &&
 		!req.GetIsCount() &&
 		len(req.GetGroupByFieldIds()) == 0 &&
