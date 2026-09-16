@@ -74,6 +74,8 @@ func newDefaultProxyViewQueryClient(etcdCli *clientv3.Client, vchannelProvider r
 		queryclient.ViewQueryClientConfig{
 			EnableSearchStreaming: paramtable.Get().ProxyCfg.EnableSearchStreaming.GetAsBool(),
 			SearchStreamChunkSize: paramtable.Get().ProxyCfg.SearchStreamChunkSize.GetAsInt(),
+			EnableQueryStreaming:  paramtable.Get().ProxyCfg.EnableQueryStreaming.GetAsBool(),
+			QueryStreamChunkSize:  paramtable.Get().ProxyCfg.QueryStreamChunkSize.GetAsInt(),
 		},
 		queryPlanClient,
 		queryServiceClient,

@@ -373,6 +373,8 @@ service ViewQueryService {
     rpc SearchOnViewStream(stream SearchOnViewStreamRequest) returns (stream SearchOnViewStreamResponse) {}
     // QueryOnView executes a query (retrieve by expression) on segments belonging to the given view version.
     rpc QueryOnView(QueryOnViewRequest) returns (QueryOnViewResponse) {}
+    // QueryOnViewStream executes the same query over a bidirectional stream.
+    rpc QueryOnViewStream(stream QueryOnViewStreamRequest) returns (stream QueryOnViewStreamResponse) {}
     // RequeryOnView fetches output fields for a set of PKs after Proxy-side reduce.
     // Uses the same view version as the preceding search/query to ensure consistency.
     rpc RequeryOnView(RequeryOnViewRequest) returns (RequeryOnViewResponse) {}
@@ -415,11 +417,29 @@ message QueryOnViewRequest {
     ShardID shard_id = 2;
     QueryViewVersion version = 3;
     QueryPlanMVCC mvcc = 4;
+    int64 stream_chunk_size = 5;
 }
 
 message QueryOnViewResponse {
     // TODO: replace with native view result types once legacy internal protos are removed.
     internal.RetrieveResults legacy_results = 1;
+}
+
+message QueryOnViewStreamRequest {
+    oneof payload {
+        QueryOnViewRequest request = 1;
+        QueryOnViewInterrupt interrupt = 2;
+    }
+}
+
+message QueryOnViewInterrupt {
+}
+
+message QueryOnViewStreamResponse {
+    oneof payload {
+        internal.RetrieveResults chunk = 1;
+        internal.RetrieveResults metadata = 2;
+    }
 }
 
 message RequeryOnViewRequest {

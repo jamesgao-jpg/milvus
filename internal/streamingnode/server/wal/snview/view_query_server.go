@@ -72,6 +72,26 @@ func (s *PChannelViewQueryServer) QueryOnView(ctx context.Context, req *viewpb.Q
 	return viewquery.NewServer(provider, s.scheduler).QueryOnView(ctx, req)
 }
 
+func (s *PChannelViewQueryServer) QueryOnViewStream(stream viewpb.ViewQueryService_QueryOnViewStreamServer) error {
+	initial, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	prefetched := &prefetchedQueryOnViewStream{
+		ViewQueryService_QueryOnViewStreamServer: stream,
+		initial:                                  initial,
+	}
+	request := initial.GetRequest()
+	if request == nil || request.GetShardId() == nil {
+		return viewquery.NewServer(nil, s.scheduler).QueryOnViewStream(prefetched)
+	}
+	provider, err := s.taskProviderForVChannel(stream.Context(), request.GetShardId().GetVchannel())
+	if err != nil {
+		return asViewQueryGRPCError(err)
+	}
+	return viewquery.NewServer(provider, s.scheduler).QueryOnViewStream(prefetched)
+}
+
 func (s *PChannelViewQueryServer) RequeryOnView(ctx context.Context, req *viewpb.RequeryOnViewRequest) (*viewpb.RequeryOnViewResponse, error) {
 	return viewquery.NewServer(nil, s.scheduler).RequeryOnView(ctx, req)
 }
@@ -128,4 +148,18 @@ func (s *prefetchedSearchOnViewStream) Recv() (*viewpb.SearchOnViewStreamRequest
 		return initial, nil
 	}
 	return s.ViewQueryService_SearchOnViewStreamServer.Recv()
+}
+
+type prefetchedQueryOnViewStream struct {
+	viewpb.ViewQueryService_QueryOnViewStreamServer
+	initial *viewpb.QueryOnViewStreamRequest
+}
+
+func (s *prefetchedQueryOnViewStream) Recv() (*viewpb.QueryOnViewStreamRequest, error) {
+	if s.initial != nil {
+		initial := s.initial
+		s.initial = nil
+		return initial, nil
+	}
+	return s.ViewQueryService_QueryOnViewStreamServer.Recv()
 }

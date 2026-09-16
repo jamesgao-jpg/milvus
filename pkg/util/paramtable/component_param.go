@@ -2565,6 +2565,8 @@ type proxyConfig struct {
 	QueryNodePoolingSize         ParamItem `refreshable:"false"`
 	EnableSearchStreaming        ParamItem `refreshable:"false"`
 	SearchStreamChunkSize        ParamItem `refreshable:"false"`
+	EnableQueryStreaming         ParamItem `refreshable:"false"`
+	QueryStreamChunkSize         ParamItem `refreshable:"false"`
 	EnableSearchBenchmarkMetrics ParamItem `refreshable:"false"`
 
 	HybridSearchRequeryPolicy ParamItem `refreshable:"true"`
@@ -3371,6 +3373,24 @@ Disabled if the value is less or equal to 0.`,
 		Export:       true,
 	}
 	p.SearchStreamChunkSize.Init(base.mgr)
+
+	p.EnableQueryStreaming = ParamItem{
+		Key:          "proxy.queryView.enableQueryStreaming",
+		Version:      "3.0.0",
+		DefaultValue: "false",
+		Doc:          "route supported Query requests through Streaming Reduce",
+		Export:       true,
+	}
+	p.EnableQueryStreaming.Init(base.mgr)
+
+	p.QueryStreamChunkSize = ParamItem{
+		Key:          "proxy.queryView.queryStreamChunkSize",
+		Version:      "3.0.0",
+		DefaultValue: "1024",
+		Doc:          "maximum number of Units in each Query stream Chunk",
+		Export:       true,
+	}
+	p.QueryStreamChunkSize.Init(base.mgr)
 
 	p.EnableSearchBenchmarkMetrics = ParamItem{
 		Key:          "proxy.queryView.enableSearchBenchmarkMetrics",
