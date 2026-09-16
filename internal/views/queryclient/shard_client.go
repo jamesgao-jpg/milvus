@@ -332,6 +332,25 @@ func (s *shardViewQueryClient) QueryStream(
 
 		shardID := qviews.FromProtoShardID(plan.ShardId)
 		workNodes := workNodesFromPlan(plan)
+		if mlog.LevelEnabled(mlog.DebugLevel) {
+			queryNodeIDs := make([]int64, 0, len(workNodes))
+			streamingNodePresent := false
+			for _, workNode := range workNodes {
+				switch node := workNode.(type) {
+				case qviews.QueryNode:
+					queryNodeIDs = append(queryNodeIDs, node.ID)
+				case qviews.StreamingNode:
+					streamingNodePresent = true
+				}
+			}
+			mlog.Debug(ctx, "query view work nodes selected",
+				mlog.FieldVChannel(vchannel),
+				mlog.Int64("replicaID", shardID.ReplicaID),
+				mlog.Int64s("queryNodeIDs", queryNodeIDs),
+				mlog.Bool("streamingNodePresent", streamingNodePresent),
+				mlog.Int("workNodeCount", len(workNodes)),
+			)
+		}
 		childStreams := make([]queryutil.ReduceStream, 0, len(workNodes))
 		for _, node := range workNodes {
 			childStream, openErr := s.queryServiceClient.QueryOnViewStream(ctx, node, &viewpb.QueryOnViewRequest{
