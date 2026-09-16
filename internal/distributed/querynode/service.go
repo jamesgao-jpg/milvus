@@ -39,6 +39,7 @@ import (
 	"github.com/milvus-io/milvus/internal/util/componentutil"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	_ "github.com/milvus-io/milvus/internal/util/grpcclient"
+	"github.com/milvus-io/milvus/internal/util/searchutil"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
@@ -264,6 +265,9 @@ func (s *Server) startGrpcLoop() {
 		)),
 		grpc.StatsHandler(tracer.GetDynamicOtelGrpcServerStatsHandler()),
 	}
+	if searchutil.SearchBenchmarkMetricsEnabled() {
+		grpcOpts = append(grpcOpts, grpc.StatsHandler(searchutil.NewSearchBenchmarkGRPCStatsHandler(true)))
+	}
 
 	grpcOpts = append(grpcOpts, utils.EnableInternalTLS("QueryNode"))
 	s.grpcServer = grpc.NewServer(grpcOpts...)
@@ -274,7 +278,7 @@ func (s *Server) startGrpcLoop() {
 	defer cancel()
 
 	go funcutil.CheckGrpcReady(ctx, s.grpcErrChan)
-	if err := s.grpcServer.Serve(s.listener); err != nil {
+	if err := s.grpcServer.Serve(searchutil.TrackSearchBenchmarkListener(s.listener)); err != nil {
 		mlog.Debug(s.ctx, "QueryNode Start Grpc Failed!!!!")
 		s.grpcErrChan <- err
 	}

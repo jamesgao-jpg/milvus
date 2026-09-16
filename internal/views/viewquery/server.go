@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
@@ -34,6 +35,17 @@ func NewServer(provider TaskProvider, scheduler Scheduler) *Server {
 }
 
 func (s *Server) SearchOnView(ctx context.Context, req *viewpb.SearchOnViewRequest) (*viewpb.SearchOnViewResponse, error) {
+	metrics := searchutil.SearchBenchmarkMetricsFromContext(ctx)
+	metrics.SetRequest(req)
+	response, err := s.searchOnView(ctx, req)
+	if err == nil {
+		metrics.RecordSendAttempt(response)
+		metrics.RecordSendComplete(response)
+	}
+	return response, err
+}
+
+func (s *Server) searchOnView(ctx context.Context, req *viewpb.SearchOnViewRequest) (*viewpb.SearchOnViewResponse, error) {
 	if err := validateSearchRequest(req); err != nil {
 		return nil, err
 	}
@@ -49,6 +61,7 @@ func (s *Server) SearchOnView(ctx context.Context, req *viewpb.SearchOnViewReque
 	if err != nil {
 		return nil, toRPCError(err)
 	}
+	searchutil.SearchBenchmarkMetricsFromContext(ctx).RecordGeneratedResult(result)
 	return &viewpb.SearchOnViewResponse{LegacyResults: result}, nil
 }
 
@@ -114,7 +127,9 @@ func (s *Server) executeSearch(ctx context.Context, req *viewpb.SearchOnViewRequ
 		return emptySearchResults(searchReq), nil
 	}
 
+	startedAt := time.Now()
 	result, err := s.scheduler.Search(ctx, tasks)
+	searchutil.SearchBenchmarkMetricsFromContext(ctx).AddANNDuration(time.Since(startedAt))
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +160,9 @@ func (s *Server) SearchOnViewStream(stream viewpb.ViewQueryService_SearchOnViewS
 		return status.Error(codes.InvalidArgument, "SearchOnViewStream supports Plain ANN Search only")
 	}
 
-	response, err := s.SearchOnView(stream.Context(), request)
+	metrics := searchutil.SearchBenchmarkMetricsFromContext(stream.Context())
+	metrics.SetRequest(request)
+	response, err := s.searchOnView(stream.Context(), request)
 	if err != nil {
 		return err
 	}
@@ -153,16 +170,21 @@ func (s *Server) SearchOnViewStream(stream viewpb.ViewQueryService_SearchOnViewS
 	if chunkSize <= 0 {
 		chunkSize = defaultSearchStreamChunkSize
 	}
+	splitStartedAt := time.Now()
 	chunks, err := searchutil.SplitSearchResult(response.GetLegacyResults(), chunkSize)
+	metrics.AddSplitDuration(time.Since(splitStartedAt))
 	if err != nil {
 		return status.Errorf(codes.Internal, "split SearchOnView result: %v", err)
 	}
 	for _, chunk := range chunks {
-		if err := stream.Send(&viewpb.SearchOnViewStreamResponse{
+		message := &viewpb.SearchOnViewStreamResponse{
 			Payload: &viewpb.SearchOnViewStreamResponse_Chunk{Chunk: chunk},
-		}); err != nil {
+		}
+		metrics.RecordSendAttempt(message)
+		if err := stream.Send(message); err != nil {
 			return err
 		}
+		metrics.RecordSendComplete(message)
 	}
 	return nil
 }

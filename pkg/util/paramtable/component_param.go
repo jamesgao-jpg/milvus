@@ -2561,10 +2561,11 @@ type proxyConfig struct {
 
 	GracefulStopTimeout ParamItem `refreshable:"true"`
 
-	SlowQuerySpanInSeconds ParamItem `refreshable:"true"`
-	QueryNodePoolingSize   ParamItem `refreshable:"false"`
-	EnableSearchStreaming  ParamItem `refreshable:"false"`
-	SearchStreamChunkSize  ParamItem `refreshable:"false"`
+	SlowQuerySpanInSeconds       ParamItem `refreshable:"true"`
+	QueryNodePoolingSize         ParamItem `refreshable:"false"`
+	EnableSearchStreaming        ParamItem `refreshable:"false"`
+	SearchStreamChunkSize        ParamItem `refreshable:"false"`
+	EnableSearchBenchmarkMetrics ParamItem `refreshable:"false"`
 
 	HybridSearchRequeryPolicy ParamItem `refreshable:"true"`
 }
@@ -3370,6 +3371,15 @@ Disabled if the value is less or equal to 0.`,
 		Export:       true,
 	}
 	p.SearchStreamChunkSize.Init(base.mgr)
+
+	p.EnableSearchBenchmarkMetrics = ParamItem{
+		Key:          "proxy.queryView.enableSearchBenchmarkMetrics",
+		Version:      "3.0.0",
+		DefaultValue: "false",
+		Doc:          "enable diagnostic QueryView Search phase, payload, and transport metrics",
+		Export:       true,
+	}
+	p.EnableSearchBenchmarkMetrics.Init(base.mgr)
 }
 
 // /////////////////////////////////////////////////////////////////////////////

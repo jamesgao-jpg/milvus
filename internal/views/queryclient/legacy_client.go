@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 
@@ -64,6 +65,7 @@ type legacyClient struct {
 type prefetchedReduceStream struct {
 	stream     searchutil.ReduceStream
 	firstChunk *internalpb.SearchResults
+	metrics    *searchutil.SearchBenchmarkMetrics
 }
 
 func (s *prefetchedReduceStream) Recv() (*internalpb.SearchResults, error) {
@@ -72,7 +74,10 @@ func (s *prefetchedReduceStream) Recv() (*internalpb.SearchResults, error) {
 		s.firstChunk = nil
 		return chunk, nil
 	}
-	return s.stream.Recv()
+	startedAt := time.Now()
+	chunk, err := s.stream.Recv()
+	s.metrics.AddFinalReduceDuration(time.Since(startedAt))
+	return chunk, err
 }
 
 func (s *prefetchedReduceStream) Close() error {
@@ -127,8 +132,10 @@ func supportsSearchStream(req *internalpb.SearchRequest) bool {
 
 func (c *legacyClient) Search(ctx context.Context, req *LegacySearchRequest) (*LegacySearchResult, error) {
 	if c.enableSearchStreaming && supportsSearchStream(req.Req) {
+		searchutil.SearchBenchmarkMetricsFromContext(ctx).SetMode("streaming")
 		return c.searchStream(ctx, req)
 	}
+	searchutil.SearchBenchmarkMetricsFromContext(ctx).SetMode("batch")
 
 	vchannels, err := c.shardResolver.ResolveVChannels(ctx, req.Req.CollectionID)
 	if err != nil {
@@ -207,7 +214,10 @@ func (c *legacyClient) searchStream(ctx context.Context, req *LegacySearchReques
 			return nil, err
 		}
 
+		metrics := searchutil.SearchBenchmarkMetricsFromContext(ctx)
+		startedAt := time.Now()
 		firstChunk, recvErr := finalStream.Recv()
+		metrics.AddFinalReduceDuration(time.Since(startedAt))
 		if recvErr != nil && !errors.Is(recvErr, io.EOF) {
 			err = errors.Join(recvErr, finalStream.Close())
 			if ctx.Err() != nil {
@@ -219,9 +229,11 @@ func (c *legacyClient) searchStream(ctx context.Context, req *LegacySearchReques
 
 		stream := finalStream
 		if firstChunk != nil {
+			metrics.RecordFirstFinalChunk()
 			stream = &prefetchedReduceStream{
 				stream:     finalStream,
 				firstChunk: firstChunk,
+				metrics:    metrics,
 			}
 		}
 

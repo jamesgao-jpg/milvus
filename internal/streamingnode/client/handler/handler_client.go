@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"net"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -14,6 +15,7 @@ import (
 	"github.com/milvus-io/milvus/internal/streamingnode/client/handler/producer"
 	transformlogclient "github.com/milvus-io/milvus/internal/streamingnode/client/handler/transformlog"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal"
+	"github.com/milvus-io/milvus/internal/util/searchutil"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/service/balancer/picker"
 	streamingserviceinterceptor "github.com/milvus-io/milvus/internal/util/streamingutil/service/interceptor"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/service/lazygrpc"
@@ -200,5 +202,13 @@ func getDialOptions(rb resolver.Builder) []grpc.DialOption {
 		grpc.WithReturnConnectionError(),
 		grpc.WithDefaultServiceConfig(string(defaultServiceConfigJSON)),
 	)
+	if searchutil.SearchBenchmarkMetricsEnabled() {
+		dialOptions = append(dialOptions,
+			grpc.WithStatsHandler(searchutil.NewSearchBenchmarkGRPCStatsHandler(false)),
+			grpc.WithContextDialer(func(ctx context.Context, address string) (net.Conn, error) {
+				return searchutil.DialSearchBenchmarkConnection(ctx, address)
+			}),
+		)
+	}
 	return dialOptions
 }

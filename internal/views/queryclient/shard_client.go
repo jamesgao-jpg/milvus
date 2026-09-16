@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
@@ -77,7 +78,8 @@ func (s *shardViewQueryClient) Search(ctx context.Context, req *ShardSearchReque
 			}
 		},
 		dispatchNode: func(ctx context.Context, node qviews.WorkNode, plan *viewpb.QueryPlan, shardID qviews.ShardID) error {
-			resp, err := s.queryServiceClient.SearchOnView(ctx, node, &viewpb.SearchOnViewRequest{
+			rpcCtx, metrics := withSearchBenchmarkChild(ctx, node, shardID.VChannel, "batch")
+			resp, err := s.queryServiceClient.SearchOnView(rpcCtx, node, &viewpb.SearchOnViewRequest{
 				LegacyReq: legacySearchRequestForNode(plan, node),
 				ShardId:   shardID.IntoProto(),
 				Version:   plan.Version,
@@ -86,6 +88,7 @@ func (s *shardViewQueryClient) Search(ctx context.Context, req *ShardSearchReque
 			if err != nil {
 				return err
 			}
+			metrics.RecordApplicationReceive(resp, resp.GetLegacyResults())
 			return req.Reducer.Add(shardID, resp)
 		},
 		resetShard: req.Reducer.ResetShard,
@@ -93,11 +96,14 @@ func (s *shardViewQueryClient) Search(ctx context.Context, req *ShardSearchReque
 }
 
 type vchannelReduceStream struct {
-	stream searchutil.ReduceStream
+	stream  searchutil.ReduceStream
+	metrics *searchutil.SearchBenchmarkMetrics
 }
 
 func (s *vchannelReduceStream) Recv() (*internalpb.SearchResults, error) {
+	startedAt := time.Now()
 	chunk, err := s.stream.Recv()
+	s.metrics.AddPerVchannelReduceDuration(time.Since(startedAt))
 	if err == nil {
 		return chunk, nil
 	}
@@ -185,7 +191,8 @@ func (s *shardViewQueryClient) SearchStream(
 		}
 		childStreams := make([]searchutil.ReduceStream, 0, len(workNodes))
 		for _, node := range workNodes {
-			childStream, openErr := s.queryServiceClient.SearchOnViewStream(ctx, node, &viewpb.SearchOnViewRequest{
+			rpcCtx, _ := withSearchBenchmarkChild(ctx, node, vchannel, "streaming")
+			childStream, openErr := s.queryServiceClient.SearchOnViewStream(rpcCtx, node, &viewpb.SearchOnViewRequest{
 				LegacyReq:       legacySearchRequestForNode(plan, node),
 				ShardId:         shardID.IntoProto(),
 				Version:         plan.Version,
@@ -225,7 +232,8 @@ func (s *shardViewQueryClient) SearchStream(
 		}
 
 		return &vchannelReduceStream{
-				stream: reducedStream,
+				stream:  reducedStream,
+				metrics: searchutil.SearchBenchmarkMetricsFromContext(ctx),
 			}, &ShardPlan{
 				ShardID:   shardID,
 				Version:   plan.Version,
@@ -234,6 +242,19 @@ func (s *shardViewQueryClient) SearchStream(
 			}, nil
 	}
 	return nil, nil, lastErr
+}
+
+func withSearchBenchmarkChild(ctx context.Context, node qviews.WorkNode, vchannel, mode string) (context.Context, *searchutil.SearchBenchmarkMetrics) {
+	parent := searchutil.SearchBenchmarkMetricsFromContext(ctx)
+	if parent == nil {
+		return ctx, nil
+	}
+	nodeID := int64(0)
+	if queryNode, ok := node.(qviews.QueryNode); ok {
+		nodeID = queryNode.ID
+	}
+	child := parent.Child(mode, node.String(), vchannel, nodeID)
+	return searchutil.WithSearchBenchmarkMetrics(ctx, child), child
 }
 
 // Query executes Phase 1 + Phase 2 for a single shard's query (retrieve).

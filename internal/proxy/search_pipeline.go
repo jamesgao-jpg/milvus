@@ -23,6 +23,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/apache/arrow/go/v17/arrow/memory"
 	"github.com/samber/lo"
@@ -40,6 +41,7 @@ import (
 	"github.com/milvus-io/milvus/internal/util/function/chain"
 	chaintypes "github.com/milvus-io/milvus/internal/util/function/chain/types"
 	"github.com/milvus-io/milvus/internal/util/function/models"
+	"github.com/milvus-io/milvus/internal/util/searchutil"
 	"github.com/milvus-io/milvus/internal/util/segcore"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
@@ -210,9 +212,11 @@ func (op *searchReduceOperator) run(ctx context.Context, span trace.Span, inputs
 	defer sp.End()
 	toReduceResults := inputs[0].([]*internalpb.SearchResults)
 	metricType := getMetricType(toReduceResults)
+	startedAt := time.Now()
 	result, err := reduceResults(
 		op.traceCtx, toReduceResults, op.nq, op.topK, op.offset,
 		metricType, op.primaryFieldSchema.GetDataType(), op.queryInfos[0], false, op.isSearchAggregation, op.collectionID, op.partitionIDs)
+	searchutil.SearchBenchmarkMetricsFromContext(ctx).AddFinalReduceDuration(time.Since(startedAt))
 	if err != nil {
 		return nil, err
 	}

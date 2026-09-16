@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"net"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -9,6 +10,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/milvus-io/milvus/internal/json"
+	"github.com/milvus-io/milvus/internal/util/searchutil"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/service/balancer/picker"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/service/discoverer"
@@ -93,5 +95,13 @@ func getDialOptions(rb resolver.Builder) []grpc.DialOption {
 		grpc.WithReturnConnectionError(),
 		grpc.WithDefaultServiceConfig(string(defaultServiceConfigJSON)),
 	)
+	if searchutil.SearchBenchmarkMetricsEnabled() {
+		dialOptions = append(dialOptions,
+			grpc.WithStatsHandler(searchutil.NewSearchBenchmarkGRPCStatsHandler(false)),
+			grpc.WithContextDialer(func(ctx context.Context, address string) (net.Conn, error) {
+				return searchutil.DialSearchBenchmarkConnection(ctx, address)
+			}),
+		)
+	}
 	return dialOptions
 }

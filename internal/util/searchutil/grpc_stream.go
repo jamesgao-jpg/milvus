@@ -28,8 +28,9 @@ import (
 )
 
 type grpcReduceStream struct {
-	client viewpb.ViewQueryService_SearchOnViewStreamClient
-	cancel context.CancelFunc
+	client  viewpb.ViewQueryService_SearchOnViewStreamClient
+	cancel  context.CancelFunc
+	metrics *SearchBenchmarkMetrics
 
 	closeOnce sync.Once
 	closeErr  error
@@ -61,8 +62,9 @@ func NewGRPCReduceStream(ctx context.Context, client viewpb.ViewQueryServiceClie
 	}
 
 	return &grpcReduceStream{
-		client: clientStream,
-		cancel: cancel,
+		client:  clientStream,
+		cancel:  cancel,
+		metrics: SearchBenchmarkMetricsFromContext(ctx),
 	}, nil
 }
 
@@ -86,6 +88,7 @@ func (s *grpcReduceStream) Recv() (*internalpb.SearchResults, error) {
 		return nil, errors.New("SearchOnViewStream returned a nil response")
 	}
 	if chunk := response.GetChunk(); chunk != nil {
+		s.metrics.RecordApplicationReceive(response, chunk)
 		return chunk, nil
 	}
 	if response.GetMetadata() != nil {

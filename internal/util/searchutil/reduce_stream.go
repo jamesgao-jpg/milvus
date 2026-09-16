@@ -70,8 +70,9 @@ func (b *orderedOutputBuffer) isEmpty() bool {
 }
 
 type orderedChildBuffer struct {
-	units  []orderedUnit
-	cursor int
+	units            []orderedUnit
+	cursor           int
+	benchmarkMetrics *SearchBenchmarkMetrics
 }
 
 func (b *orderedChildBuffer) hasUnit() bool {
@@ -85,6 +86,7 @@ func (b *orderedChildBuffer) front() orderedUnit {
 func (b *orderedChildBuffer) pop() orderedUnit {
 	unit := b.front()
 	b.cursor++
+	b.benchmarkMetrics.RecordApplicationConsume(1)
 	if !b.hasUnit() {
 		b.units = nil
 		b.cursor = 0
@@ -283,9 +285,16 @@ func NewReduceStream(request *internalpb.SearchRequest, childStreams []ReduceStr
 		}
 	}
 
+	childBuffers := make([]orderedChildBuffer, len(childStreams))
+	for i, childStream := range childStreams {
+		if grpcStream, ok := childStream.(*grpcReduceStream); ok {
+			childBuffers[i].benchmarkMetrics = grpcStream.metrics
+		}
+	}
+
 	return &OrderedReduceStream{
 		childStreams:         append([]ReduceStream(nil), childStreams...),
-		childBuffers:         make([]orderedChildBuffer, len(childStreams)),
+		childBuffers:         childBuffers,
 		childRecvTasks:       make([]bool, len(childStreams)),
 		childDrained:         make([]bool, len(childStreams)),
 		childRecvCompletions: make(chan childRecvCompletion, max(1, len(childStreams))),

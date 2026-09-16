@@ -41,6 +41,7 @@ import (
 	"github.com/milvus-io/milvus/internal/util/componentutil"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	kvfactory "github.com/milvus-io/milvus/internal/util/dependency/kv"
+	"github.com/milvus-io/milvus/internal/util/searchutil"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	streamingserviceinterceptor "github.com/milvus-io/milvus/internal/util/streamingutil/service/interceptor"
 	"github.com/milvus-io/milvus/pkg/v3/kv"
@@ -334,7 +335,7 @@ func (s *Server) initGRPCServer() {
 	serverIDGetter := func() int64 {
 		return s.session.ServerID
 	}
-	s.grpcServer = grpc.NewServer(
+	grpcOptions := []grpc.ServerOption{
 		grpc.KeepaliveEnforcementPolicy(kaep),
 		grpc.KeepaliveParams(kasp),
 		grpc.MaxRecvMsgSize(cfg.ServerMaxRecvSize.GetAsInt()),
@@ -352,8 +353,12 @@ func (s *Server) initGRPCServer() {
 			interceptor.ServerIDValidationStreamServerInterceptor(serverIDGetter),
 		)),
 		grpc.StatsHandler(tracer.GetDynamicOtelGrpcServerStatsHandler()),
-		utils.EnableInternalTLS("StreamingNode"),
-	)
+	}
+	if searchutil.SearchBenchmarkMetricsEnabled() {
+		grpcOptions = append(grpcOptions, grpc.StatsHandler(searchutil.NewSearchBenchmarkGRPCStatsHandler(true)))
+	}
+	grpcOptions = append(grpcOptions, utils.EnableInternalTLS("StreamingNode"))
+	s.grpcServer = grpc.NewServer(grpcOptions...)
 	streamingpb.RegisterStreamingNodeStateServiceServer(s.grpcServer, s.componentState)
 }
 
@@ -363,7 +368,7 @@ func (s *Server) startGPRCServer(ctx context.Context) error {
 	go func() {
 		defer close(s.grpcServerChan)
 
-		if err := s.grpcServer.Serve(s.listener); err != nil {
+		if err := s.grpcServer.Serve(searchutil.TrackSearchBenchmarkListener(s.listener)); err != nil {
 			select {
 			case errCh <- err:
 				// failure at initial startup.

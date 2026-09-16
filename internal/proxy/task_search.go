@@ -94,6 +94,7 @@ type searchTask struct {
 	highlighter            Highlighter
 	resultBuf              *typeutil.ConcurrentSet[*internalpb.SearchResults]
 	resultStream           searchutil.ReduceStream
+	searchBenchmarkMetrics *searchutil.SearchBenchmarkMetrics
 
 	partitionIDsSet *typeutil.ConcurrentSet[UniqueID]
 
@@ -1327,10 +1328,16 @@ func (t *searchTask) Execute(ctx context.Context) error {
 }
 
 func (t *searchTask) executeByQueryView(ctx context.Context) error {
+	if t.searchBenchmarkMetrics == nil {
+		t.searchBenchmarkMetrics = searchutil.NewSearchBenchmarkMetrics(typeutil.ProxyRole, "", t.SearchRequest.GetReqID())
+	}
+	ctx = searchutil.WithSearchBenchmarkMetrics(ctx, t.searchBenchmarkMetrics)
 	result, err := t.viewQueryClient.Legacy().Search(ctx, &queryclient.LegacySearchRequest{
 		Req: t.SearchRequest,
 	})
 	if err != nil {
+		t.searchBenchmarkMetrics.Finish(ctx, err)
+		t.searchBenchmarkMetrics = nil
 		return err
 	}
 	if t.resultBuf == nil {
@@ -1489,6 +1496,7 @@ func (t *searchTask) consumeResultStream(
 		if chunk.GetMetricType() != "" {
 			metricType = chunk.GetMetricType()
 		}
+		appendStartedAt := time.Now()
 		appendedSize, appendErr := appendFinalSearchChunk(
 			data,
 			chunk.GetResultData(),
@@ -1497,6 +1505,7 @@ func (t *searchTask) consumeResultStream(
 			limit,
 			metricType,
 		)
+		t.searchBenchmarkMetrics.AddFinalResponseDuration(time.Since(appendStartedAt))
 		if appendErr != nil {
 			return nil, metricType, merr.Combine(appendErr, stream.Close())
 		}
@@ -1569,9 +1578,16 @@ func validateElementFilterVectorSearch(plan *planpb.PlanNode, schema *schemapb.C
 		"element_filter is only supported for element-level search on vector sub-fields of the same struct array; use MATCH_ANY/MATCH_* for row-level vector search")
 }
 
-func (t *searchTask) PostExecute(ctx context.Context) error {
+func (t *searchTask) PostExecute(ctx context.Context) (err error) {
 	ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-Search-PostExecute")
 	defer sp.End()
+	ctx = searchutil.WithSearchBenchmarkMetrics(ctx, t.searchBenchmarkMetrics)
+	defer func() {
+		if err == nil && t.result != nil {
+			t.searchBenchmarkMetrics.RecordFinalResultData(t.result.GetResults())
+		}
+		t.searchBenchmarkMetrics.Finish(ctx, err)
+	}()
 
 	tr := timerecord.NewTimeRecorder("searchTask PostExecute")
 	defer func() {
@@ -1603,7 +1619,6 @@ func (t *searchTask) PostExecute(ctx context.Context) error {
 	var (
 		toReduceResults []*internalpb.SearchResults
 		reducedResult   *milvuspb.SearchResults
-		err             error
 	)
 	if t.resultStream != nil {
 		stream := t.resultStream
