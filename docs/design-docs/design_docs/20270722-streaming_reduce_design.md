@@ -147,9 +147,10 @@ Chunk message and all request or result metadata.
 The byte threshold excludes protobuf framing and request or result metadata.
 Each Unit is appended in full before the threshold is checked. If appending a
 Unit makes the Chunk exceed `B`, the complete Unit remains in that Chunk and
-the Chunk is emitted. The Unit is neither truncated nor deferred. A Unit that
-is itself larger than `B` is therefore emitted alone as the first and only Unit
-in its Chunk. The first protobuf message may be larger still after metadata is
+the Chunk is emitted. The Unit is never truncated. A Unit that is itself larger
+than `B` is a special case: if the output Buffer is nonempty, the current Chunk
+is emitted before consuming that Unit; the next `Recv()` emits the oversized
+Unit alone. The first protobuf message may be larger still after metadata is
 attached.
 
 For example, if `B = 100`, the output Buffer contains 80 bytes, and the next
@@ -207,7 +208,8 @@ Recv():
 `max(0, B - outputBuffer.ByteSize())`. `ProduceNextUnits()` consumes complete
 Units until the implementation finishes one reduction step or reaches this
 remaining-byte threshold. The Unit that reaches or crosses the threshold is
-included in `oneReduceResult`; it is never split or deferred.
+included in `oneReduceResult`. The only deferred Unit is an oversized Unit at
+the front of a child Buffer when the output Buffer is already nonempty.
 
 | `Recv()` returns | Meaning |
 | --- | --- |
@@ -368,6 +370,10 @@ ProduceNextUnits(readyBuffers, remainingBytes):
         if readyBuffers[i].Front() > readyBuffers[winner].Front():
             winner = i
 
+    nextUnit = readyBuffers[winner].Front()
+    if nextUnit.ByteSize() > B and remainingBytes < B:
+        return empty
+
     oneReduceResult = readyBuffers[winner].Pop()
     return oneReduceResult
 ```
@@ -416,6 +422,9 @@ ProduceNextUnits(readyBuffers, remainingBytes):
     for buffer in readyBuffers:
         while buffer.Size() > 0:
             nextUnit = buffer.Front()
+
+            if nextUnit.ByteSize() > B and remainingBytes < B:
+                return oneReduceResult
 
             oneReduceResult.Append(buffer.Pop())
             remainingBytes -= nextUnit.ByteSize()

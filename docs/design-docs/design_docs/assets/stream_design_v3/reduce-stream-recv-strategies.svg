@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1080" viewBox="0 0 1800 1080" role="img" aria-labelledby="title desc">
   <title id="title">ReduceStream Recv shared workflow and two implementations</title>
-  <desc id="desc">The generic Recv workflow expands into byte-threshold OrderedReduceStream and UnOrderedReduceStream behavior. The complete Unit that reaches or crosses the threshold remains in the emitted Chunk.</desc>
+  <desc id="desc">The generic Recv workflow expands into byte-threshold OrderedReduceStream and UnOrderedReduceStream behavior. The complete Unit that reaches or crosses the threshold remains in the emitted Chunk; a Unit larger than the threshold is emitted alone.</desc>
   <defs>
     <pattern id="genericHatch" width="12" height="12" patternUnits="userSpaceOnUse" patternTransform="rotate(12)">
       <rect width="12" height="12" fill="#f8fafc"/>
@@ -58,11 +58,11 @@
   <text x="535" y="220" text-anchor="middle" class="stage">2  GetReadyBuffers</text>
   <text x="535" y="244" text-anchor="middle" class="small">child Buffers</text>
   <text x="758" y="220" text-anchor="middle" class="stage">3  ProduceNextUnits</text>
-  <text x="758" y="244" text-anchor="middle" class="small">nextUnits</text>
+  <text x="758" y="244" text-anchor="middle" class="small">nextUnits or empty</text>
   <text x="972" y="220" text-anchor="middle" class="stage">4  Merge</text>
   <text x="972" y="244" text-anchor="middle" class="small">nextUnits</text>
   <text x="1190" y="223" text-anchor="middle" class="stage">5</text>
-  <text x="1190" y="247" text-anchor="middle" class="small">IsChunkReady?</text>
+  <text x="1190" y="247" text-anchor="middle" class="small">ready or empty?</text>
   <text x="1445" y="220" text-anchor="middle" class="stage">6  CreateOutputChunk</text>
   <text x="1445" y="244" text-anchor="middle" class="small">protobuf message</text>
 
@@ -102,8 +102,8 @@
   <text x="105" y="847" class="stage">3  ProduceNextUnits</text>
   <text x="105" y="875" class="mono code">nextUnits = queue&lt;Unit&gt;</text>
   <text x="105" y="899" class="mono code">winner = first Front() by request ordering</text>
-  <text x="105" y="923" class="mono code">nextUnits.Append(readyBuffers[winner].Pop())</text>
-  <text x="105" y="947" class="mono code">return nextUnits</text>
+  <text x="105" y="923" class="mono code">if Front.ByteSize() &gt; B and output not empty: return</text>
+  <text x="105" y="947" class="mono code">nextUnits.Append(readyBuffers[winner].Pop())</text>
   <text x="105" y="1003" class="stage">5  IsChunkReady</text>
   <text x="360" y="1003" class="mono code">ByteSize() &gt;= B or all children drained</text>
 
@@ -122,8 +122,8 @@
   <text x="995" y="847" class="stage">3  ProduceNextUnits</text>
   <text x="995" y="875" class="mono code">nextUnits = queue&lt;Unit&gt;</text>
   <text x="995" y="899" class="mono code">for Buffer in readyBuffers while Buffer.Size() &gt; 0:</text>
-  <text x="995" y="923" class="mono code">    nextUnits.Append(Buffer.Pop())</text>
-  <text x="995" y="947" class="mono code">    if outputBytes + nextUnits.ByteSize() &gt;= B: return</text>
+  <text x="995" y="923" class="mono code">    if Front.ByteSize() &gt; B and outputBytes &gt; 0: return</text>
+  <text x="995" y="947" class="mono code">    append Front; if bytes &gt;= B: return</text>
   <text x="995" y="1003" class="stage">5  IsChunkReady</text>
   <text x="1250" y="1003" class="mono code">ByteSize() &gt;= B or all children drained</text>
 </svg>
