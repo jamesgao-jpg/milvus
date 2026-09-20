@@ -91,7 +91,9 @@ Across process boundaries, child streams use bidirectional gRPC from the
 initial implementation. The initial implementation uses a configured
 reducible-payload byte threshold for each Chunk and gRPC's natural
 backpressure; application-level credit coordination remains a later
-investigation.
+investigation. The default threshold is `256 KiB`. Search and Query expose it
+as `searchStreamChunkBytes` and `queryStreamChunkBytes`; the internal gRPC
+request carries it as `stream_chunk_bytes`.
 
 ### 4.1 Reduce Stream
 
@@ -137,6 +139,10 @@ Before continuing, we briefly define the blocking-related concepts, so we are on
 | Plain ANN Search | Primary key, score, returned field values, and an element index when present |
 | Plain Query | Primary key and returned field values |
 | Group reduction | Group key and partial aggregate value |
+
+`Unit.ByteSize()` is the encoded protobuf size of only these reducible fields
+after selecting that Unit from its source result. It excludes the enclosing
+Chunk message and all request or result metadata.
 
 The byte threshold excludes protobuf framing and request or result metadata.
 Each Unit is appended in full before the threshold is checked. If appending a
