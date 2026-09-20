@@ -22,7 +22,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
-const defaultSearchStreamChunkSize = 1024
+const defaultStreamChunkBytes = 256 * 1024
 
 // shardViewQueryClient executes two-phase queries at the shard granularity.
 // It owns replica resolution, consistency routing, Phase 1 (GetQueryPlan),
@@ -136,7 +136,7 @@ func (s *shardViewQueryClient) SearchStream(
 	ctx context.Context,
 	vchannel string,
 	req *internalpb.SearchRequest,
-	chunkSize int,
+	chunkBytes int,
 ) (searchutil.ReduceStream, *ShardPlan, error) {
 	if req == nil {
 		return nil, nil, errors.New("SearchStream requires a Search request")
@@ -194,11 +194,11 @@ func (s *shardViewQueryClient) SearchStream(
 		for _, node := range workNodes {
 			rpcCtx, _ := withSearchBenchmarkChild(ctx, node, vchannel, "streaming")
 			childStream, openErr := s.queryServiceClient.SearchOnViewStream(rpcCtx, node, &viewpb.SearchOnViewRequest{
-				LegacyReq:       legacySearchRequestForNode(plan, node),
-				ShardId:         shardID.IntoProto(),
-				Version:         plan.Version,
-				Mvcc:            plan.GetMvcc(),
-				StreamChunkSize: int64(chunkSize),
+				LegacyReq:        legacySearchRequestForNode(plan, node),
+				ShardId:          shardID.IntoProto(),
+				Version:          plan.Version,
+				Mvcc:             plan.GetMvcc(),
+				StreamChunkBytes: int64(chunkBytes),
 			})
 			if openErr != nil {
 				err = openErr
@@ -224,7 +224,7 @@ func (s *shardViewQueryClient) SearchStream(
 			return nil, nil, err
 		}
 
-		reducedStream, err := searchutil.NewReduceStream(req, childStreams, chunkSize)
+		reducedStream, err := searchutil.NewReduceStream(req, childStreams, chunkBytes)
 		if err != nil {
 			for _, childStream := range childStreams {
 				err = errors.Join(err, childStream.Close())
@@ -299,7 +299,7 @@ func (s *shardViewQueryClient) QueryStream(
 	ctx context.Context,
 	vchannel string,
 	req *internalpb.RetrieveRequest,
-	chunkSize int,
+	chunkBytes int,
 ) (queryutil.ReduceStream, *ShardPlan, error) {
 	if req == nil {
 		return nil, nil, merr.WrapErrServiceInternalMsg("QueryStream requires a Query request")
@@ -354,11 +354,11 @@ func (s *shardViewQueryClient) QueryStream(
 		childStreams := make([]queryutil.ReduceStream, 0, len(workNodes))
 		for _, node := range workNodes {
 			childStream, openErr := s.queryServiceClient.QueryOnViewStream(ctx, node, &viewpb.QueryOnViewRequest{
-				LegacyReq:       legacyRetrieveRequestForNode(plan, node),
-				ShardId:         shardID.IntoProto(),
-				Version:         plan.Version,
-				Mvcc:            plan.GetMvcc(),
-				StreamChunkSize: int64(chunkSize),
+				LegacyReq:        legacyRetrieveRequestForNode(plan, node),
+				ShardId:          shardID.IntoProto(),
+				Version:          plan.Version,
+				Mvcc:             plan.GetMvcc(),
+				StreamChunkBytes: int64(chunkBytes),
 			})
 			if openErr != nil {
 				err = openErr
@@ -384,7 +384,7 @@ func (s *shardViewQueryClient) QueryStream(
 			return nil, nil, err
 		}
 
-		reducedStream, err := queryutil.NewReduceStream(req, childStreams, chunkSize)
+		reducedStream, err := queryutil.NewReduceStream(req, childStreams, chunkBytes)
 		if err != nil {
 			for _, childStream := range childStreams {
 				err = errors.Join(err, childStream.Close())

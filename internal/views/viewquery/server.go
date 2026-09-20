@@ -19,7 +19,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 )
 
-const defaultSearchStreamChunkSize = 1024
+const defaultStreamChunkBytes = 256 * 1024
 
 // Server implements ViewQueryService as a thin provider+scheduler adapter.
 type Server struct {
@@ -167,12 +167,12 @@ func (s *Server) SearchOnViewStream(stream viewpb.ViewQueryService_SearchOnViewS
 	if err != nil {
 		return err
 	}
-	chunkSize := int(request.GetStreamChunkSize())
-	if chunkSize <= 0 {
-		chunkSize = defaultSearchStreamChunkSize
+	chunkBytes := int(request.GetStreamChunkBytes())
+	if chunkBytes <= 0 {
+		chunkBytes = defaultStreamChunkBytes
 	}
 	splitStartedAt := time.Now()
-	chunks, err := searchutil.SplitSearchResult(response.GetLegacyResults(), chunkSize)
+	chunks, err := searchutil.SplitSearchResult(response.GetLegacyResults(), chunkBytes)
 	metrics.AddSplitDuration(time.Since(splitStartedAt))
 	if err != nil {
 		return status.Errorf(codes.Internal, "split SearchOnView result: %v", err)
@@ -246,11 +246,11 @@ func (s *Server) QueryOnViewStream(stream viewpb.ViewQueryService_QueryOnViewStr
 	if err != nil {
 		return err
 	}
-	chunkSize := int(request.GetStreamChunkSize())
-	if chunkSize <= 0 {
-		chunkSize = defaultSearchStreamChunkSize
+	chunkBytes := int(request.GetStreamChunkBytes())
+	if chunkBytes <= 0 {
+		chunkBytes = defaultStreamChunkBytes
 	}
-	chunks, err := queryutil.SplitRetrieveResult(response.GetLegacyResults(), chunkSize)
+	chunks, err := queryutil.SplitRetrieveResult(response.GetLegacyResults(), chunkBytes)
 	if err != nil {
 		return status.Errorf(codes.Internal, "split QueryOnView result: %v", err)
 	}

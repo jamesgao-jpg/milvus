@@ -2564,9 +2564,9 @@ type proxyConfig struct {
 	SlowQuerySpanInSeconds       ParamItem `refreshable:"true"`
 	QueryNodePoolingSize         ParamItem `refreshable:"false"`
 	EnableSearchStreaming        ParamItem `refreshable:"false"`
-	SearchStreamChunkSize        ParamItem `refreshable:"false"`
+	SearchStreamChunkBytes       ParamItem `refreshable:"false"`
 	EnableQueryStreaming         ParamItem `refreshable:"false"`
-	QueryStreamChunkSize         ParamItem `refreshable:"false"`
+	QueryStreamChunkBytes        ParamItem `refreshable:"false"`
 	EnableSearchBenchmarkMetrics ParamItem `refreshable:"false"`
 
 	HybridSearchRequeryPolicy ParamItem `refreshable:"true"`
@@ -3365,14 +3365,14 @@ Disabled if the value is less or equal to 0.`,
 	}
 	p.EnableSearchStreaming.Init(base.mgr)
 
-	p.SearchStreamChunkSize = ParamItem{
-		Key:          "proxy.queryView.searchStreamChunkSize",
+	p.SearchStreamChunkBytes = ParamItem{
+		Key:          "proxy.queryView.searchStreamChunkBytes",
 		Version:      "3.0.0",
-		DefaultValue: "1024",
-		Doc:          "maximum number of Units in each Search stream Chunk",
+		DefaultValue: "262144",
+		Doc:          "reducible-payload byte threshold for each Search stream Chunk",
 		Export:       true,
 	}
-	p.SearchStreamChunkSize.Init(base.mgr)
+	p.SearchStreamChunkBytes.Init(base.mgr)
 
 	p.EnableQueryStreaming = ParamItem{
 		Key:          "proxy.queryView.enableQueryStreaming",
@@ -3383,14 +3383,14 @@ Disabled if the value is less or equal to 0.`,
 	}
 	p.EnableQueryStreaming.Init(base.mgr)
 
-	p.QueryStreamChunkSize = ParamItem{
-		Key:          "proxy.queryView.queryStreamChunkSize",
+	p.QueryStreamChunkBytes = ParamItem{
+		Key:          "proxy.queryView.queryStreamChunkBytes",
 		Version:      "3.0.0",
-		DefaultValue: "1024",
-		Doc:          "maximum number of Units in each Query stream Chunk",
+		DefaultValue: "262144",
+		Doc:          "reducible-payload byte threshold for each Query stream Chunk",
 		Export:       true,
 	}
-	p.QueryStreamChunkSize.Init(base.mgr)
+	p.QueryStreamChunkBytes.Init(base.mgr)
 
 	p.EnableSearchBenchmarkMetrics = ParamItem{
 		Key:          "proxy.queryView.enableSearchBenchmarkMetrics",

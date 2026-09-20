@@ -16,11 +16,11 @@ const defaultMaxRetries = 3
 
 // ViewQueryClientConfig holds configuration for the ViewQueryClient.
 type ViewQueryClientConfig struct {
-	MaxRetries            int  // Maximum per-shard retries on retryable errors. 0 uses default (3).
-	EnableSearchStreaming bool // Route supported Search requests through Streaming Reduce.
-	SearchStreamChunkSize int  // Maximum Units per Search stream Chunk. 0 uses the default (1024).
-	EnableQueryStreaming  bool // Route supported Query requests through Streaming Reduce.
-	QueryStreamChunkSize  int  // Maximum Units per Query stream Chunk. 0 uses the default (1024).
+	MaxRetries             int  // Maximum per-shard retries on retryable errors. 0 uses default (3).
+	EnableSearchStreaming  bool // Route supported Search requests through Streaming Reduce.
+	SearchStreamChunkBytes int  // Search Chunk reducible-payload byte threshold. 0 uses 256 KiB.
+	EnableQueryStreaming   bool // Route supported Query requests through Streaming Reduce.
+	QueryStreamChunkBytes  int  // Query Chunk reducible-payload byte threshold. 0 uses 256 KiB.
 }
 
 // viewQueryClientImpl implements ViewQueryClient.
