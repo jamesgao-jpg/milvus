@@ -119,7 +119,7 @@ const bool DEFAULT_ENABLE_DRIVER_PREFETCH = true;
 const bool DEFAULT_JSON_KEY_STATS_ENABLED = true;
 const bool DEFAULT_GROWING_JSON_KEY_STATS_ENABLED = false;
 const bool DEFAULT_CONFIG_PARAM_TYPE_CHECK_ENABLED = true;
-const bool DEFAULT_ENABLE_PARQUET_STATS_SKIP_INDEX = false;
+const bool DEFAULT_ENABLE_PARQUET_STATS_SKIP_INDEX = true;
 
 // skipindex stats related
 const double DEFAULT_BLOOM_FILTER_FALSE_POSITIVE_RATE = 0.01;
@@ -131,6 +131,10 @@ const std::string INSERT_FILES_KEY = "insert_files";
 const std::string PARTITION_KEY_ISOLATION_KEY = "partition_key_isolation";
 const std::string STORAGE_VERSION_KEY = "storage_version";
 const std::string DIM_KEY = "dim";
+const std::string MRL_DIM_KEY = "mrl_dim";
+const std::string WITH_MRL_REFINE_KEY = "with_mrl_refine";
+const std::string MRL_META_FILE = "mrl_meta";
+const std::string MRL_REFINE_STATE_FILE = "mrl_refine_state";
 const std::string DATA_TYPE_KEY = "data_type";
 const std::string ELEMENT_TYPE_KEY = "element_type";
 const std::string INDEX_NUM_ROWS_KEY = "index_num_rows";

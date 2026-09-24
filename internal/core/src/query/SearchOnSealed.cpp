@@ -92,6 +92,12 @@ SearchOnSealedIndex(const Schema& schema,
 
     auto field_id = search_info.field_id_;
     auto& field = schema[field_id];
+    if (field.get_data_type() == DataType::VECTOR_ARRAY &&
+        field.is_element_nullable()) {
+        ThrowInfo(NotImplemented,
+                  "search on element-nullable VECTOR_ARRAY fields is not "
+                  "supported");
+    }
     auto is_sparse = field.get_data_type() == DataType::VECTOR_SPARSE_U32_F32;
     // TODO(SPARSE): see todo in PlanImpl.h::PlaceHolder.
     auto dim = is_sparse ? 0 : field.get_dim();
@@ -204,6 +210,12 @@ SearchOnSealedColumn(const Schema& schema,
 
     auto field_id = search_info.field_id_;
     auto& field = schema[field_id];
+    if (field.get_data_type() == DataType::VECTOR_ARRAY &&
+        field.is_element_nullable()) {
+        ThrowInfo(NotImplemented,
+                  "search on element-nullable VECTOR_ARRAY fields is not "
+                  "supported");
+    }
 
     auto data_type = field.get_data_type();
     auto element_type = field.get_element_type();
@@ -274,7 +286,6 @@ SearchOnSealedColumn(const Schema& schema,
 
     const bool use_vector_iterator =
         milvus::exec::UseVectorIterator(search_info);
-    auto num_chunk = column->num_chunks();
 
     SubSearchResult final_qr(num_queries,
                              search_info.topk_,
@@ -283,6 +294,7 @@ SearchOnSealedColumn(const Schema& schema,
 
     int64_t offset = 0;
     auto vector_chunks = column->GetAllChunks(op_context);
+    auto num_chunk = column->num_chunks();
     for (int i = 0; i < num_chunk; ++i) {
         const auto& pw = vector_chunks[i];
         auto vec_data = pw.get()->Data();

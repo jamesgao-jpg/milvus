@@ -104,6 +104,97 @@ func captureHTTPServerLogs(t *testing.T) *mlog.TestSink {
 	})
 }
 
+func TestRESTV2PathReplaceRejectsNullOperandInCompatibilityMode(t *testing.T) {
+	compatibilityModeKey := paramtable.Get().HTTPCfg.CompatibilityMode.Key
+	paramtable.Get().Save(compatibilityModeKey, "true")
+	defer paramtable.Get().Reset(compatibilityModeKey)
+
+	schema := &schemapb.CollectionSchema{
+		Name: DefaultCollectionName,
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 100, Name: "id", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+			{FieldID: 101, Name: "scores", DataType: schemapb.DataType_Array, ElementType: schemapb.DataType_Bool},
+		},
+	}
+	describeResponse := &milvuspb.DescribeCollectionResponse{
+		CollectionName: DefaultCollectionName,
+		Schema:         schema,
+		Status:         merr.Success(),
+	}
+	describePatch := mockey.Mock((*mockProxyComponent).DescribeCollection).
+		Return(describeResponse, nil).
+		Build()
+	defer describePatch.UnPatch()
+
+	body := []byte(`{
+		"collectionName": "book",
+		"data": [{"id": 1, "scores": [null]}],
+		"fieldOps": [{"fieldName": "scores", "op": "PATH_REPLACE", "path": "[1]"}]
+	}`)
+
+	// mockProxyComponent has no Upsert implementation. Reaching the write
+	// path would call its nil embedded interface and fail the test.
+	testEngine := initHTTPServerV2(&mockProxyComponent{}, false)
+	req := httptest.NewRequest(http.MethodPost, versionalV2(EntityCategory, UpsertAction), bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	testEngine.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	returnBody := &ReturnErrMsg{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), returnBody))
+	assert.Equal(t, merr.Code(merr.ErrInvalidInsertData), returnBody.Code)
+	assert.Contains(t, returnBody.Message, `PATH_REPLACE array field "scores" has a null operand element at index 0`)
+}
+
+func TestRESTV2PathReplaceScalarArrayRequest(t *testing.T) {
+	limiterPatch := mockey.Mock(CheckLimiter).Return(nil, nil).Build()
+	defer limiterPatch.UnPatch()
+	schema := &schemapb.CollectionSchema{
+		Name: DefaultCollectionName,
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 100, Name: "id", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+			{FieldID: 101, Name: "scores", DataType: schemapb.DataType_Array, ElementType: schemapb.DataType_Int64},
+		},
+	}
+	describePatch := mockey.Mock((*mockProxyComponent).DescribeCollection).Return(&milvuspb.DescribeCollectionResponse{
+		CollectionName: DefaultCollectionName, Schema: schema, Status: merr.Success(),
+	}, nil).Build()
+	defer describePatch.UnPatch()
+	var captured *milvuspb.UpsertRequest
+	upsertPatch := mockey.Mock((*mockProxyComponent).Upsert).To(
+		func(_ *mockProxyComponent, _ context.Context, req *milvuspb.UpsertRequest) (*milvuspb.MutationResult, error) {
+			captured = proto.Clone(req).(*milvuspb.UpsertRequest)
+			return &milvuspb.MutationResult{
+				Status: merr.Success(), UpsertCnt: 1,
+				IDs: &schemapb.IDs{IdField: &schemapb.IDs_IntId{IntId: &schemapb.LongArray{Data: []int64{1}}}},
+			}, nil
+		}).Build()
+	defer upsertPatch.UnPatch()
+	engine := initHTTPServerV2(&mockProxyComponent{}, false)
+	body := []byte(`{"collectionName":"book","data":[{"id":1,"scores":[100]}],"fieldOps":[{"fieldName":"scores","op":"PATH_REPLACE","path":"[1]"}]}`)
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, httptest.NewRequest(http.MethodPost, versionalV2(EntityCategory, UpsertAction), bytes.NewReader(body)))
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, int64(0), gjson.Get(w.Body.String(), "code").Int(), w.Body.String())
+	require.NotNil(t, captured)
+	assert.True(t, captured.GetPartialUpdate())
+	assert.EqualValues(t, 1, captured.GetNumRows())
+	require.Len(t, captured.GetFieldOps(), 1)
+	assert.Equal(t, schemapb.FieldPartialUpdateOp_PATH_REPLACE, captured.GetFieldOps()[0].GetOp())
+	assert.Equal(t, "[1]", captured.GetFieldOps()[0].GetPath())
+	var array *schemapb.ArrayArray
+	for _, field := range captured.GetFieldsData() {
+		if field.GetFieldName() == "scores" {
+			array = field.GetScalars().GetArrayData()
+		}
+	}
+	require.NotNil(t, array)
+	// This is the REST shape exercised by the Proxy resolver's omitted-type test.
+	assert.Equal(t, schemapb.DataType_None, array.GetElementType())
+	require.Len(t, array.GetData(), 1)
+	assert.Equal(t, []int64{100}, array.GetData()[0].GetLongData().GetData())
+}
+
 func sendReqAndVerify(t *testing.T, testEngine *gin.Engine, testName, method string, testcase requestBodyTestCase) {
 	t.Run(testName, func(t *testing.T) {
 		req := httptest.NewRequest(method, testcase.path, bytes.NewReader(testcase.requestBody))
@@ -1304,6 +1395,186 @@ func TestHybridSearchWithRerank(t *testing.T) {
 		requestBody: []byte(`{"collectionName": "hello_milvus", "partitionNames": ["part_a"], "search": [{"data": [[0.1, 0.2]], "annsField": "book_intro", "metricType": "L2", "limit": 3}, {"data": [[0.1, 0.2]], "annsField": "book_intro", "metricType": "L2", "limit": 3}], "functionScore": {"functions": [{"name": "testRank", "type": "Rerank", "inputFieldNames": ["FieldWordCount"], "params": {"name": "decay"}}]}}`),
 	}
 	sendReqAndVerify(t, testEngine, queryTestCases.path, http.MethodPost, queryTestCases)
+}
+
+func TestHybridSearchWithFunctionChain(t *testing.T) {
+	paramtable.Init()
+	paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "false")
+	defer paramtable.Get().Reset(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key)
+
+	mp := mocks.NewMockProxy(t)
+	testEngine := initHTTPServerV2(mp, false)
+	mp.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
+		CollectionName: DefaultCollectionName,
+		Schema:         generateCollectionSchema(schemapb.DataType_Int64, true, true),
+		ShardsNum:      ShardNumDefault,
+		Status:         &StatusSuccess,
+	}, nil).Once()
+
+	mp.EXPECT().HybridSearch(mock.Anything, mock.MatchedBy(func(req *milvuspb.HybridSearchRequest) bool {
+		if len(req.GetFunctionChains()) != 1 {
+			return false
+		}
+		if len(req.GetRequests()) != 2 || len(req.GetRequests()[0].GetFunctionChains()) != 2 ||
+			len(req.GetRequests()[1].GetFunctionChains()) != 0 {
+			return false
+		}
+		subL0ChainPB := req.GetRequests()[0].GetFunctionChains()[0]
+		if subL0ChainPB.GetStage() != schemapb.FunctionChainStage_FunctionChainStageL0Rerank ||
+			len(subL0ChainPB.GetOps()) != 1 || subL0ChainPB.GetOps()[0].GetOp() != "map" {
+			return false
+		}
+		subL0Expr := subL0ChainPB.GetOps()[0].GetExpr()
+		if subL0Expr.GetName() != "xgboost" || len(subL0Expr.GetArgs()) != 1 ||
+			subL0Expr.GetArgs()[0].GetColumn().GetName() != "book_id" ||
+			subL0Expr.GetParams()["model_resource"].GetStringValue() != "test-model" {
+			return false
+		}
+		subL1ChainPB := req.GetRequests()[0].GetFunctionChains()[1]
+		if subL1ChainPB.GetStage() != schemapb.FunctionChainStage_FunctionChainStageL1Rerank ||
+			len(subL1ChainPB.GetOps()) != 1 || subL1ChainPB.GetOps()[0].GetOp() != "limit" ||
+			subL1ChainPB.GetOps()[0].GetParams()["limit"].GetInt64Value() != 2 {
+			return false
+		}
+		chainPB := req.GetFunctionChains()[0]
+		if chainPB.GetStage() != schemapb.FunctionChainStage_FunctionChainStageL2Rerank ||
+			len(chainPB.GetOps()) != 1 || chainPB.GetOps()[0].GetOp() != "merge" {
+			return false
+		}
+
+		keys := make(map[string]string, len(req.GetRankParams()))
+		for _, param := range req.GetRankParams() {
+			keys[param.GetKey()] = param.GetValue()
+		}
+		_, hasStrategy := keys[proxy.RankTypeKey]
+		_, hasParams := keys[proxy.ParamsKey]
+		return hasStrategy && hasParams && keys[proxy.RankTypeKey] == "" && keys[proxy.ParamsKey] == "null" &&
+			keys[proxy.LimitKey] == "2" && keys[proxy.OffsetKey] == "1" && keys[ParamRoundDecimal] == "-1"
+	})).Return(&milvuspb.SearchResults{
+		Status:  commonSuccessStatus,
+		Results: &schemapb.SearchResultData{},
+	}, nil).Once()
+
+	testcase := requestBodyTestCase{
+		path: versionalV2(EntityCategory, HybridSearchAction),
+		requestBody: []byte(`{
+			"collectionName": "hello_milvus",
+			"search": [
+				{
+					"data": [[0.1, 0.2]],
+					"annsField": "book_intro",
+					"metricType": "L2",
+					"limit": 3,
+					"functionChains": [
+						{
+							"name": "sub_l0_rerank",
+							"stage": "FunctionChainStageL0Rerank",
+							"ops": [{
+								"op": "map",
+								"outputs": ["$score"],
+								"expr": {
+									"name": "xgboost",
+									"args": [{"column": "book_id"}],
+									"params": {"model_resource": "test-model"}
+								}
+							}]
+						},
+						{
+							"name": "sub_l1_rerank",
+							"stage": "FunctionChainStageL1Rerank",
+							"ops": [{"op": "limit", "params": {"limit": 2}}]
+						}
+					]
+				},
+				{"data": [[0.1, 0.2]], "annsField": "book_intro", "metricType": "L2", "limit": 3}
+			],
+			"limit": 2,
+			"offset": 1,
+			"functionChains": [{
+				"name": "hybrid_rerank",
+				"stage": "FunctionChainStageL2Rerank",
+				"ops": [{"op": "merge", "params": {"strategy": "rrf"}}]
+			}]
+		}`),
+	}
+	sendReqAndVerify(t, testEngine, testcase.path, http.MethodPost, testcase)
+}
+
+func TestHybridSearchRejectsInvalidSubSearchFunctionChain(t *testing.T) {
+	paramtable.Init()
+	paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "false")
+	defer paramtable.Get().Reset(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key)
+
+	mp := mocks.NewMockProxy(t)
+	testEngine := initHTTPServerV2(mp, false)
+	mp.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
+		CollectionName: DefaultCollectionName,
+		Schema:         generateCollectionSchema(schemapb.DataType_Int64, true, true),
+		ShardsNum:      ShardNumDefault,
+		Status:         &StatusSuccess,
+	}, nil).Once()
+
+	testcase := requestBodyTestCase{
+		path: versionalV2(EntityCategory, HybridSearchAction),
+		requestBody: []byte(`{
+			"collectionName": "hello_milvus",
+			"search": [{
+				"data": [[0.1, 0.2]],
+				"annsField": "book_intro",
+				"metricType": "L2",
+				"limit": 3,
+				"functionChains": [{"stage": "BadStage", "ops": [{"op": "limit"}]}]
+			}]
+		}`),
+		errCode: 1100,
+		errMsg:  "unsupported function chain stage",
+	}
+	sendReqAndVerify(t, testEngine, testcase.path, http.MethodPost, testcase)
+}
+
+func TestHybridSearchKeepsFunctionChainWithRerank(t *testing.T) {
+	paramtable.Init()
+	paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "false")
+	defer paramtable.Get().Reset(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key)
+	mp := mocks.NewMockProxy(t)
+	testEngine := initHTTPServerV2(mp, false)
+	mp.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
+		CollectionName: DefaultCollectionName,
+		Schema:         generateCollectionSchema(schemapb.DataType_Int64, true, true),
+		ShardsNum:      ShardNumDefault,
+		Status:         &StatusSuccess,
+	}, nil).Once()
+	mp.EXPECT().HybridSearch(mock.Anything, mock.MatchedBy(func(req *milvuspb.HybridSearchRequest) bool {
+		if len(req.GetFunctionChains()) != 1 {
+			return false
+		}
+		params := make(map[string]string, len(req.GetRankParams()))
+		for _, param := range req.GetRankParams() {
+			params[param.GetKey()] = param.GetValue()
+		}
+		return params[proxy.RankTypeKey] == "rrf" && params[proxy.ParamsKey] == `{"k":60}`
+	})).Return(&milvuspb.SearchResults{
+		Status:  commonSuccessStatus,
+		Results: &schemapb.SearchResultData{},
+	}, nil).Once()
+
+	testcase := requestBodyTestCase{
+		path: versionalV2(EntityCategory, HybridSearchAction),
+		requestBody: []byte(`{
+			"collectionName": "hello_milvus",
+			"search": [
+				{"data": [[0.1, 0.2]], "annsField": "book_intro", "metricType": "L2", "limit": 3}
+			],
+			"limit": 2,
+			"rerank": {"strategy": "rrf", "params": {"k": 60}},
+			"functionChains": [{
+				"name": "hybrid_rerank",
+				"stage": "FunctionChainStageL2Rerank",
+				"ops": [{"op": "merge", "params": {"strategy": "rrf"}}]
+			}]
+		}`),
+	}
+	sendReqAndVerify(t, testEngine, testcase.path, http.MethodPost, testcase)
 }
 
 func TestDocInDocOutSearch(t *testing.T) {

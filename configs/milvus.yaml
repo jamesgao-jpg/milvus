@@ -87,6 +87,8 @@ tikv:
 
 localStorage:
   # Local path to where vector data are stored during a search or a query to avoid repetitve access to MinIO or S3 service.
+  # Must be an absolute filesystem path. Milvus refuses to start if this value is relative or empty.
+  # Migration of data written using a relative path in older versions is not supported.
   # Caution: Changing this parameter after using Milvus for a period of time will affect your access to old data.
   # It is recommended to change this parameter before starting Milvus for the first time.
   path: /var/lib/milvus/data/
@@ -283,6 +285,9 @@ pulsar:
   # Default value applies when Pulsar is running on the same network with Milvus.
   address: localhost
   port: 6650 # Port of Pulsar service.
+  # Web address of the Pulsar admin REST API, used to clean up subscriptions. It must be a full url with scheme, e.g. http://pulsar-web:8080.
+  # Empty by default, in which case http://<host of pulsar.address>:<pulsar.webport> is used. Set it only if the admin API is not reachable there, e.g. behind a proxy or over https.
+  webaddress: 
   webport: 80 # Web port of of Pulsar service. If you connect direcly without proxy, should use 8080.
   # The maximum size of each message in Pulsar. Unit: Byte.
   # By default, Pulsar can transmit at most 2MB of data in a single message. When streaming.splitChunkSN is enabled, the StreamingNode WAL layer splits larger payloads into multiple records that fit this limit.
@@ -307,6 +312,15 @@ pulsar:
   # If these options is zero, no subscription will be created, so pulsar cluster must close the backlog protection, otherwise the milvus can not recovered if backlog exceed.
   # If this option is zero or negative, it will be ignored and the default value (100m) will be used.
   backlogAutoClearBytes: 100m
+  # The access mode of the pulsar producer that a streaming node creates for a wal topic, shared or exclusive.
+  # exclusive: the producer creation fails while another producer is connected to the topic, and the streaming node retries it.
+  # shared: multiple producers can write to the topic at the same time.
+  # exclusive access is enforced by pulsar broker 2.8.0 or later.
+  producerAccessMode: exclusive
+  # The max time that a streaming node retries creating the pulsar producer when it opens a wal, 1m by default.
+  # It's ok to set it into duration string, such as 30s or 1m30s, see time.ParseDuration
+  # When it is exceeded, the wal open fails and the streaming coord retries the assignment later. 0 disables the limit.
+  producerCreateTimeout: 1m
 
 # If you want to enable kafka, needs to comment the pulsar configs
 # kafka:
@@ -442,6 +456,7 @@ proxy:
     maxTagKeyLength: 128 # Maximum RLS principal tag key length in bytes.
     maxTagValueLength: 1024 # Maximum RLS principal tag value length in bytes.
     maxArrayLiteralElements: 1024 # Maximum literal elements for RLS in and array_contains* predicates.
+    metaRefreshInterval: 3600 # Maximum policy-cache age before request-time refresh, and principal-cache age before periodic eviction and refresh on next use, in seconds.
   accessLog:
     enable: false # Whether to enable the access log feature.
     minioEnable: false # Whether to upload local access log files to MinIO. This parameter can be specified when proxy.accessLog.filename is not empty.
@@ -475,6 +490,11 @@ proxy:
   partialResultRequiredDataRatio: 1 # partial result required data ratio, default to 1 which means disable partial result, otherwise, it will be used as the minimum data ratio for partial result
   http:
     enabled: true # Whether to enable the http server
+    # Whether to register /v1/vector/* on the proxy HTTP port and /api/v1/_* on the metrics port.
+    # Disabling requires a restart and leaves the HTTP listeners, /v2/vectordb/*, probes, and metrics available.
+    # The non-underscore /api/v1/* REST API has been removed regardless of this setting.
+    # WebUI data and telemetry commands require these console APIs; disable proxy.http.enableWebUI too to hide the pages.
+    enableV1: true
     debug_mode: false # Whether to enable http server debug mode
     port:  # high-level restful api
     acceptTypeAllowInt64: true # high-level restful api, whether http client can deal with int64
@@ -673,6 +693,7 @@ queryNode:
       # If set to 0, time based eviction is disabled.
       cacheTtl: 0
       storageUsageTrackingEnabled: false # Enable storage usage tracking for Tiered Storage. Defaults to false.
+      lazyColumnGroupEnabled: false # When enabled, Storage V3 manifest fields with warmup=disable and no load-time side effects defer projected ChunkReader, translator, and cache creation until first access.
     knowhereScoreConsistency: false # Enable knowhere strong consistency score computation logic
     mutatePoolSizeFactor: 2 # size factor (CPUNum * factor) of the online-write cgo pool for segment insert/delete; isolated from the load/management pool so segment loading cannot starve online writes
     dynamicPoolSizeFactor: 1 # size factor (CPUNum * factor) of the dynamic cgo pool for segment create/release/statistics/index-info
@@ -809,14 +830,9 @@ dataCoord:
     # The max number of binlog (which is equal to the binlog file num of primary key) for one segment,
     # the segment will be sealed if the number of binlog file reaches to max value.
     maxBinlogFileNumber: 32
-    smallProportion: 0.5 # The segment is considered as "small segment" when its # of rows is smaller than
-    # (smallProportion * segment max # of rows).
-    # A compaction will happen on small segments if the segment after compaction will have
-    compactableProportion: 0.85
-    # over (compactableProportion * segment max # of rows) rows.
-    # MUST BE GREATER THAN OR EQUAL TO <smallProportion>!!!
-    # During compaction, the size of segment # of rows is able to exceed segment max # of rows by (expansionRate-1) * 100%. 
-    expansionRate: 1.25
+    smallProportion: 0.5 # Deprecated: unused since two-tier compaction. Replaced by middleSize (idealSize/4) × fillRate.
+    compactableProportion: 0.85 # Deprecated: fill rate is now a hardcoded constant (0.85) in the two-tier compaction algorithm.
+    expansionRate: 1.25 # Deprecated: no longer used by the mix compaction planner. Still read by v2 trigger and import paths.
   sealPolicy:
     channel:
       # The size threshold in MB, if the total size of growing segments of each shard
@@ -884,6 +900,7 @@ dataCoord:
         maxnum: 200 # The deltalog count of a segment to trigger a compaction, default as 200
       expiredlog:
         maxsize: 10485760 # The expired log size of a segment to trigger a compaction, default as 10MB
+    maxFragmentsPerGroup: 8 # maximum number of fragment segments allowed per channel-partition group before fragment-tier compaction triggers
     clustering:
       enable: true # Enable clustering compaction
       autoEnable: false # Enable auto clustering compaction
@@ -906,6 +923,13 @@ dataCoord:
     # Layout 1 cannot be read by 2.6, so enabling it commits the upgrade and gives up the ability to roll back to 2.6. Existing index files keep the layout they were built with, so this switch only affects index files built from now on.
     # Layout 1 is additionally gated on no QueryNode still reporting an older release line, so setting this to 1 during a 2.6 -> 3.0 upgrade still builds layout 0 until every QueryNode is upgraded. That check reads the version each QueryNode publishes in its session, which is a per-release-line constant, so it separates 2.6.x from 3.0.x but does not differentiate binaries within the same release line.
     storePathVersion: 0
+    # Whether completed StorageV3 index artifacts are published in segment manifests. Off (the default) keeps the legacy path: every SegmentIndex task record stays in etcd and no manifest index entry is produced. On still persists Unissued, InProgress, Failed, fake-finished, and other task states in etcd; only a successful build with artifact files is published to the manifest, and that commit atomically deletes the corresponding Finished etcd row. StorageV1/V2 always use etcd.
+    # The setting may be switched in either direction. Turning it off changes where new completions are written; records already published to manifests remain recoverable through the segment's sticky manifest_has_index marker.
+    # The value must be exactly true or false. A value that does not parse as a boolean, such as yes, is silently read as false, i.e. the legacy etcd behavior.
+    writeSegmentIndexToManifest: false
+    # Concurrency of StorageV3 manifest index reads during startup and snapshot restore. Each read blocks a native thread. Values are clamped to [1, 256], and the process-wide limit is also capped by positive minio.maxConnections values. Zero leaves the storage default in effect. Restore assembly and verification share the same budget.
+    # Startup processes fixed-size batches and retries failed reads per segment. An exhausted read or invalid manifest fails startup without replaying successful reads through the metastore retry loop. Recovery follows the durable manifest_has_index marker independently of the current write-mode switch.
+    segmentIndexManifestLoadConcurrency: 64
   enableGarbageCollection: true # Switch value to control if to enable garbage collection to clear the discarded data in MinIO or S3 service.
   gc:
     interval: 3600 # The interval at which data coord performs garbage collection, unit: second.
@@ -1133,6 +1157,32 @@ grpc:
   gracefulStopTimeout: 3 # second, time to wait graceful stop finish
   client:
     compressionEnabled: false
+    # The compression tier for gRPC messages: fastest, default, better, best.
+    # snappy and s2 have three tiers rather than four, so fastest and default behave identically for them.
+    compressionLevel: default
+    # The gRPC compression algorithm: zstd, snappy, or s2.
+    # Only zstd is understood by every Milvus version. A node that has not been upgraded yet has no snappy or s2 decompressor
+    # and rejects those encodings, failing every RPC sent to it, and there is no automatic fallback.
+    # Change this only after every node in the cluster has been upgraded.
+    compressionAlgorithm: zstd
+    # Whether the zstd encoder embeds a per-frame checksum. Off by default: it costs throughput on every message,
+    # while TCP already checksums the link and zstd's entropy decoding rejects a damaged frame rather than
+    # returning garbage. Turn it on where a verified end-to-end integrity check on the payload is worth the cost.
+    # Frames a peer wrote with a checksum are still verified either way.
+    compressionCRC: false
+    # Size of the zstd encoder state pool, as a multiple of GOMAXPROCS (default 2). It also sizes the free
+    # lists every codec parks its per-message writers and readers in, so it is the one ceiling on how much
+    # memory compression holds.
+    # Compression always runs inline on the gRPC goroutine handling the RPC; this is not a thread count.
+    # For the zstd encoder it is the ceiling on how many RPCs may compress at the same time: once every state is
+    # borrowed, further callers block until one is returned, so too small a pool costs throughput under load.
+    # Decoding does not draw on it -- an inbound message takes a pooled streaming decoder instead.
+    # The encoder pool is allocated on the first message this process compresses -- nothing at startup, then all of
+    # it at once -- and costs this value x GOMAXPROCS x the per-state size: roughly 2.6MB at fastest, 3.6MB at
+    # default, 6.5MB at better and 36MB at best. Most of a state is its history buffer, which is only allocated
+    # once that state sees a message above 128KB, so RSS reaches that figure in two steps.
+    # Raising this at a high compressionLevel is therefore expensive.
+    compressionConcurrency: 2
     dialTimeout: 200
     keepAliveTime: 10000
     keepAliveTimeout: 20000
@@ -1178,7 +1228,7 @@ common:
   gracefulTime: 5000 # milliseconds. it represents the interval (in ms) by which the request arrival time needs to be subtracted in the case of Bounded Consistency.
   gracefulStopTimeout: 1800 # seconds. it will force quit the server if the graceful stop process is not completed during this time.
   parquetStatsSkipIndex:
-    enabled: false # whether to skip parquet stats index when reading; set true to enable skipping.
+    enabled: true # whether to force one row group per cache cell and build the sealed-segment chunk skip index from parquet footer statistics. When enabled, packing is 1:1 even without usable statistics; disabling allows target-size packing. Takes effect only at startup (not refreshable): the flag decides the segment cache cell layout, which must not change while queries are running. Storage v2 segments only; manifest-based (v3) segments do not build this index yet.
   storageType: remote # please adjust in embedded Milvus: local, available values are [local, remote], value minio is deprecated, use remote instead
   storage:
     manifestTransactionRetryLimit: 10 # Maximum number of retry attempts for V3 storage manifest transaction commits on optimistic concurrency conflicts
@@ -1235,6 +1285,21 @@ common:
     lowPriorityRatio: -1 # amplification ratio for low priority tasks if disk rate limiter is enabled, value <= 0 means ratio limit is disabled
   security:
     authorizationEnabled: false
+    # Whether the metrics port (default 9091) requires root HTTP Basic authentication
+    # for /management/*, /log/level, /eventlog, /debug/pprof/* and the web console.
+    # Probes and scrapes remain open; the retired /api/v1/health endpoint is no longer served.
+    # Requests without Origin or Fetch Metadata must include X-Milvus-Admin-Request: true.
+    # Use HTTPS for the browser console and preserve Fetch Metadata at the reverse proxy.
+    # Root hashes are cached for 10 seconds; a failed refresh may reuse the last hash for
+    # up to 10 minutes after its last fetch, including a password rotated during an outage.
+    # A Proxy receiving a root credential notification revokes that cached hash and any
+    # in-flight verification results; it returns 503 if the current hash cannot be fetched.
+    # Other nodes and Proxies that have not received the notification retain the TTL policy.
+    # Update graceful-shutdown and profiling clients before enabling. The eventlog gRPC
+    # stream becomes loopback-only. This port remains plaintext: use a trusted network
+    # or TLS proxy and rotate root with UpdateCredential, not defaultRootPassword.
+    # Not settable through /management/config/alter. Watch milvus_admin_auth_total.
+    adminAuthEnabled: false
     # The superusers will ignore some system check processes,
     # like the old password verification when updating the credential
     superUsers: 
@@ -1561,6 +1626,11 @@ streaming:
     # The timeout of wal balancer operation, 30m by default.
     # If the operation exceeds this timeout, it will be canceled.
     operationTimeout: 30m
+    # The wait time before assigning the pchannels of a streaming node that has left the session view to another streaming node, 5s by default.
+    # It's ok to set it into duration string, such as 30s or 1m30s, see time.ParseDuration
+    # It gives the old streaming node time to exit before another streaming node writes to the same wal.
+    # It lowers the chance of two writers on one wal but does not rule it out. 0 disables the wait.
+    nodeLostGracePeriod: 5s
     balancePolicy:
       name: vchannelFair # The multiplier of balance task trigger backoff, 2 by default
       # Whether to allow rebalance, true by default.

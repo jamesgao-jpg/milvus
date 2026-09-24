@@ -1837,7 +1837,7 @@ func (h *HandlersV2) upsert(ctx context.Context, c *gin.Context, anyReq any, dbN
 		PartialUpdate:  httpReq.PartialUpdate,
 		// PartitionName:  "_default",
 	}
-	fieldOps, err := buildFieldPartialUpdateOps(httpReq.FieldOps)
+	fieldOps, err := buildFieldPartialUpdateOpsV2(httpReq.FieldOps)
 	if err != nil {
 		HTTPAbortReturn(c, http.StatusOK, gin.H{
 			HTTPReturnCode:    merr.Code(err),
@@ -1846,6 +1846,9 @@ func (h *HandlersV2) upsert(ctx context.Context, c *gin.Context, anyReq any, dbN
 		return nil, err
 	}
 	req.FieldOps = fieldOps
+	if hasNonReplaceFieldPartialUpdateOp(fieldOps) {
+		req.PartialUpdate = true
+	}
 	c.Set(ContextRequest, req)
 
 	collSchema, err := h.GetCollectionSchema(ctx, c, dbName, httpReq.CollectionName)
@@ -1853,8 +1856,17 @@ func (h *HandlersV2) upsert(ctx context.Context, c *gin.Context, anyReq any, dbN
 		return nil, err
 	}
 	body, _ := c.Get(gin.BodyBytesKey)
+	requestSchema, err := schemaForPathReplaceOperands(body.([]byte), collSchema, fieldOps)
+	if err != nil {
+		mlog.Warn(ctx, "high level restful api, fail to resolve PATH_REPLACE operand", mlog.Err(err))
+		HTTPAbortReturn(c, http.StatusOK, gin.H{
+			HTTPReturnCode:    merr.Code(merr.ErrInvalidInsertData),
+			HTTPReturnMessage: merr.ErrInvalidInsertData.Error() + ", error: " + err.Error(),
+		})
+		return nil, err
+	}
 	var validDataMap map[string][]bool
-	httpReq.Data, validDataMap, err = checkAndSetData(body.([]byte), collSchema, httpReq.PartialUpdate)
+	httpReq.Data, validDataMap, err = checkAndSetData(body.([]byte), requestSchema, req.GetPartialUpdate(), fieldOps...)
 	if err != nil {
 		mlog.Warn(ctx, "high level restful api, fail to deal with upsert data", mlog.Any("body", body), mlog.Err(err))
 		HTTPAbortReturn(c, http.StatusOK, gin.H{
@@ -1865,7 +1877,7 @@ func (h *HandlersV2) upsert(ctx context.Context, c *gin.Context, anyReq any, dbN
 	}
 
 	req.NumRows = uint32(len(httpReq.Data))
-	req.FieldsData, err = anyToColumns(httpReq.Data, validDataMap, collSchema, false, httpReq.PartialUpdate)
+	req.FieldsData, err = anyToColumns(httpReq.Data, validDataMap, requestSchema, false, req.GetPartialUpdate())
 	if err != nil {
 		mlog.Warn(ctx, "high level restful api, fail to deal with upsert data", mlog.Any("data", httpReq.Data), mlog.Err(err))
 		HTTPAbortReturn(c, http.StatusOK, gin.H{
@@ -2415,11 +2427,6 @@ func (h *HandlersV2) advancedSearch(ctx context.Context, c *gin.Context, anyReq 
 		HTTPAbortReturn(c, http.StatusOK, gin.H{HTTPReturnCode: merr.Code(err), HTTPReturnMessage: err.Error()})
 		return nil, err
 	}
-	if len(httpReq.FunctionChains) != 0 {
-		err := merr.WrapErrParameterInvalidMsg("functionChains is not supported for hybrid search yet")
-		HTTPAbortReturn(c, http.StatusOK, gin.H{HTTPReturnCode: merr.Code(err), HTTPReturnMessage: err.Error()})
-		return nil, err
-	}
 	for _, subReq := range httpReq.Search {
 		if subReq.SearchAggregation != nil {
 			err := merr.WrapErrParameterInvalidMsg("searchAggregation is not supported for hybrid search")
@@ -2469,6 +2476,15 @@ func (h *HandlersV2) advancedSearch(ctx context.Context, c *gin.Context, anyReq 
 			PartitionNames: httpReq.PartitionNames,
 			SearchParams:   searchParams,
 		}
+		if len(subReq.FunctionChains) > 0 {
+			if searchReq.FunctionChains, err = genFunctionChains(subReq.FunctionChains); err != nil {
+				HTTPAbortReturn(c, http.StatusOK, gin.H{
+					HTTPReturnCode:    merr.Code(merr.ErrParameterInvalid),
+					HTTPReturnMessage: err.Error(),
+				})
+				return nil, err
+			}
+		}
 		subTemplateValues, err := generateExpressionTemplate(subReq.ExprParams)
 		if err != nil {
 			mlog.Warn(ctx, "high level restful api, invalid expression template parameter", mlog.Err(err))
@@ -2483,13 +2499,19 @@ func (h *HandlersV2) advancedSearch(ctx context.Context, c *gin.Context, anyReq 
 	}
 
 	bs, _ := json.Marshal(httpReq.Rerank.Params)
-	// leave the rerank check to proxy side
+	// Leave the rerank check to proxy side.
 	req.RankParams = []*commonpb.KeyValuePair{
 		{Key: proxy.RankTypeKey, Value: httpReq.Rerank.Strategy},
 		{Key: proxy.ParamsKey, Value: string(bs)},
 		{Key: proxy.LimitKey, Value: strconv.FormatInt(int64(httpReq.Limit), 10)},
 		{Key: proxy.OffsetKey, Value: strconv.FormatInt(int64(httpReq.Offset), 10)},
 		{Key: ParamRoundDecimal, Value: "-1"},
+	}
+	if len(httpReq.FunctionChains) > 0 {
+		if req.FunctionChains, err = genFunctionChains(httpReq.FunctionChains); err != nil {
+			HTTPAbortReturn(c, http.StatusOK, gin.H{HTTPReturnCode: merr.Code(merr.ErrParameterInvalid), HTTPReturnMessage: err.Error()})
+			return nil, err
+		}
 	}
 	req.RankParams, err = appendGroupParams(req.RankParams, httpReq.GroupByField, httpReq.GroupSize, httpReq.StrictGroupSize)
 	if err != nil {

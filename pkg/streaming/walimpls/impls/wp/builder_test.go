@@ -1,14 +1,101 @@
 package wp
 
 import (
+	"strings"
 	"testing"
 
+	"github.com/bytedance/mockey"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/zilliztech/woodpecker/common/config"
 
+	pkgconfig "github.com/milvus-io/milvus/pkg/v3/config"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 )
+
+func TestQuorumBufferPoolValidationLogsRedactConfig(t *testing.T) {
+	for _, phase := range []string{"startup", "refresh"} {
+		t.Run(phase, func(t *testing.T) {
+			base := paramtable.NewBaseTable(paramtable.SkipRemote(true), paramtable.SkipEnv(true))
+			t.Cleanup(base.Manager().Close)
+			var cfg paramtable.WoodpeckerConfig
+			cfg.Init(base)
+			wpConfig, err := config.NewConfiguration()
+			assert.NoError(t, err)
+			raw := `[{"name":"private-pool-canary","seeds":["private-seed-canary.invalid:1234"],"bad":!}]`
+			sink := mlog.CaptureGlobalLogs(t, &mlog.Config{Level: "debug"})
+			if phase == "startup" {
+				require.NoError(t, base.Save(cfg.QuorumBufferPools.Key, raw))
+				setQuorumConfig(wpConfig, &cfg)
+				assert.Contains(t, sink.String(), "invalid quorum JSON config at startup")
+			} else {
+				setQuorumConfig(wpConfig, &cfg)
+				require.NoError(t, base.Save(cfg.QuorumBufferPools.Key, raw))
+				base.Manager().Dispatcher.Dispatch(&pkgconfig.Event{
+					Key:       strings.ToLower(cfg.QuorumBufferPools.Key),
+					EventType: pkgconfig.UpdateType,
+					Value:     raw,
+				})
+				assert.Contains(t, sink.String(), "param change callback failed")
+			}
+			assert.Equal(t, raw, cfg.QuorumBufferPools.GetValue(), "validation still leaves the configured value intact")
+			assert.NotContains(t, sink.String(), "private-pool-canary")
+			assert.NotContains(t, sink.String(), "private-seed-canary")
+		})
+	}
+}
+
+func TestQuorumCustomPlacementRefreshLogsOmitPayload(t *testing.T) {
+	for _, source := range []string{"EtcdSource", "FileSource"} {
+		for _, valid := range []bool{true, false} {
+			name := source + "/invalid"
+			if valid {
+				name = source + "/valid"
+			}
+			t.Run(name, func(t *testing.T) {
+				base := paramtable.NewBaseTable(paramtable.SkipRemote(true), paramtable.SkipEnv(true))
+				t.Cleanup(base.Manager().Close)
+				oldValue := `[{"name":"old-name-canary"}]`
+				key := "woodpecker.client.quorum.quorumSelectStrategy.customPlacement"
+				require.NoError(t, base.Save(key, oldValue))
+				var cfg paramtable.WoodpeckerConfig
+				cfg.Init(base)
+				require.Equal(t, key, cfg.QuorumCustomPlacement.Key)
+				require.False(t, base.Manager().IsSensitive(key))
+				wpConfig, err := config.NewConfiguration()
+				require.NoError(t, err)
+				setQuorumConfig(wpConfig, &cfg)
+				value := `[{"name":"new-name-canary","ignored":"value-canary"}]`
+				if !valid {
+					value = `[{"name":"new-name-canary","ignored":"value-canary","bad":!}]`
+				}
+				sink := mlog.CaptureGlobalLogs(t, &mlog.Config{Level: "debug"})
+				base.Manager().SetConfig(key, value)
+				base.Manager().Dispatcher.Dispatch(&pkgconfig.Event{
+					Key:         strings.ToLower(key),
+					EventType:   pkgconfig.UpdateType,
+					EventSource: source,
+					Value:       value,
+				})
+				assert.Equal(t, value, cfg.QuorumCustomPlacement.GetValue())
+				if valid {
+					assert.Contains(t, sink.String(), "param value changed")
+				} else {
+					assert.Contains(t, sink.String(), "param change callback failed")
+				}
+				for _, canary := range []string{"old-name-canary", "new-name-canary", "value-canary"} {
+					if source == "EtcdSource" {
+						assert.NotContains(t, sink.String(), canary)
+					} else {
+						assert.Contains(t, sink.String(), canary, "file-backed public diagnostics remain available")
+					}
+				}
+			})
+		}
+	}
+}
 
 func TestSetCustomWpConfigBatchParams(t *testing.T) {
 	params := paramtable.Get()
@@ -132,4 +219,52 @@ func TestSetCustomWpConfigDirectReadParams(t *testing.T) {
 			assert.Equal(t, 6, wpConfig.Woodpecker.Client.DirectRead.MaxFetchThreads)
 		})
 	}
+}
+
+// TestSetCustomWpConfigStorageType guards the value the WAL switch depends on: the
+// configured storage type has to reach the woodpecker configuration, because it is what
+// selects the service client over the embedded one.
+func TestSetCustomWpConfigStorageType(t *testing.T) {
+	params := paramtable.Get()
+	key := params.WoodpeckerCfg.StorageType.Key
+	t.Cleanup(func() { params.Reset(key) })
+
+	for _, tc := range []struct {
+		storageType string
+		isService   bool
+	}{
+		{storageType: "service", isService: true},
+		{storageType: "minio", isService: false},
+		{storageType: "local", isService: false},
+	} {
+		t.Run(tc.storageType, func(t *testing.T) {
+			require.NoError(t, params.Save(key, tc.storageType))
+			wpConfig, err := config.NewConfiguration()
+			require.NoError(t, err)
+			require.NoError(t, setCustomWpConfig(wpConfig, &params.WoodpeckerCfg))
+			assert.Equal(t, tc.storageType, wpConfig.Woodpecker.Storage.Type)
+			assert.Equal(t, tc.isService, wpConfig.Woodpecker.Storage.IsStorageService())
+		})
+	}
+}
+
+// TestGetWpConfigFailsClosedWhenRefreshFails pins that a failed linearizable refresh aborts
+// the build instead of falling back to the last polled snapshot: that snapshot may be the
+// stale one the refresh exists to replace, and a build from it could select the embedded
+// client for the life of the process. The opener is only cached on success, so the failure
+// is retried on the next WAL open.
+func TestGetWpConfigFailsClosedWhenRefreshFails(t *testing.T) {
+	refreshErr := errors.New("etcd leader changed")
+	mocker := mockey.Mock((*paramtable.BaseTable).RefreshRemoteConfigsLinearizable).Return(false, refreshErr).Build()
+	defer mocker.UnPatch()
+
+	_, err := (&builderImpl{}).getWpConfig()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, refreshErr)
+
+	// Once the refresh succeeds again the same build goes through: the failure is
+	// retryable rather than a permanent verdict.
+	mocker.UnPatch()
+	_, err = (&builderImpl{}).getWpConfig()
+	require.NoError(t, err)
 }

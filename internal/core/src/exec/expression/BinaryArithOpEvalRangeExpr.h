@@ -710,7 +710,7 @@ class PhyBinaryArithOpEvalRangeExpr : public SegmentExpr {
 
  public:
     PhyBinaryArithOpEvalRangeExpr(
-        const std::vector<std::shared_ptr<Expr>>& input,
+        std::vector<std::shared_ptr<Expr>> input,
         const std::shared_ptr<const milvus::expr::BinaryArithOpEvalRangeExpr>&
             expr,
         const std::string& name,
@@ -806,13 +806,6 @@ class PhyBinaryArithOpEvalRangeExpr : public SegmentExpr {
     IsElementLevelExpression() const override {
         return expr_->column_.element_level_;
     }
-
-    void
-    PrefetchRawData() override;
-
-    template <typename T>
-    void
-    PrefetchRawData();
 
  private:
     template <typename T>

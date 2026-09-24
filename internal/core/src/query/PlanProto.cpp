@@ -494,11 +494,9 @@ BuildProjectAndAggregationNodes(
     // filtered rows, so AggregationNode always receives input where
     // size() == number of existing rows (needed for count(*)).
     {
-        auto project_field_id_list = std::vector<FieldId>(
-            project_id_list.begin(), project_id_list.end());
         plannode = std::make_shared<plan::ProjectNode>(
             milvus::plan::GetNextPlanNodeId(),
-            std::move(project_field_id_list),
+            std::move(project_id_list),
             std::move(project_name_list),
             std::move(project_type_list),
             sources);
@@ -512,7 +510,7 @@ BuildProjectAndAggregationNodes(
         std::move(groupingKeys),
         std::move(agg_names),
         std::move(aggregates),
-        agg_sources);
+        std::move(agg_sources));
 }
 // Helper function to build ProjectNode for ORDER BY queries.
 // Returns {ProjectNode, deferred_field_ids, pipeline_field_ids}.
@@ -1327,7 +1325,7 @@ ProtoParser::ParseUnaryRangeExprs(const proto::plan::UnaryRangeExpr& expr_pb) {
         expr::ColumnInfo(column_info),
         expr_pb.op(),
         expr_pb.value(),
-        extra_values);
+        std::move(extra_values));
 }
 
 expr::TypedExprPtr
@@ -1549,7 +1547,7 @@ ProtoParser::ParseTermExprs(const proto::plan::TermExpr& expr_pb) {
         values.emplace_back(expr_pb.values(i));
     }
     return std::make_shared<expr::TermFilterExpr>(
-        columnInfo, values, expr_pb.is_in_field());
+        columnInfo, std::move(values), expr_pb.is_in_field());
 }
 
 expr::TypedExprPtr
@@ -1762,7 +1760,7 @@ ProtoParser::ParseExprs(const proto::plan::Expr& expr_pb,
             break;
         }
         case ppe::kElementFilterExpr: {
-            ThrowInfo(ExprInvalid,
+            ThrowInfo(UnexpectedError,
                       "ElementFilterExpr should be handled at PlanNode level, "
                       "not in ParseExprs");
         }
@@ -1784,8 +1782,10 @@ ProtoParser::ParseExprs(const proto::plan::Expr& expr_pb,
             // node carries a client blob up to 128 MiB of user values — which
             // then travels back to the client and into logs. An old QueryNode
             // that does not know a newer node type lands here, so this is
-            // exactly the path a rolling upgrade exercises.
-            ThrowInfo(ExprInvalid,
+            // exactly the path a rolling upgrade exercises -- a version skew,
+            // not caller input, so it must not be blamed on the request
+            // (ExprInvalid is an InputError and would stop replica failover).
+            ThrowInfo(UnexpectedError,
                       "unsupported or unset expr proto node (expr_case: {})",
                       static_cast<int>(expr_pb.expr_case()));
         }
@@ -1793,8 +1793,9 @@ ProtoParser::ParseExprs(const proto::plan::Expr& expr_pb,
     if (type_check(result->type())) {
         return result;
     }
-    ThrowInfo(
-        ExprInvalid, "expr type check failed, actual type: {}", result->type());
+    ThrowInfo(UnexpectedError,
+              "expr type check failed, actual type: {}",
+              result->type());
 }
 
 std::shared_ptr<rescores::Scorer>
@@ -1842,7 +1843,7 @@ ProtoParser::ExtractFilterOnlyPlan(
             return nullptr;
         }
         if (std::dynamic_pointer_cast<plan::VectorSearchNode>(node)) {
-            auto sources = node->sources();
+            const auto& sources = node->sources();
             if (sources.empty()) {
                 return nullptr;
             }

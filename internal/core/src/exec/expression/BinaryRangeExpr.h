@@ -228,7 +228,7 @@ struct BinaryRangeElementFuncForArray {
                 valid_res[i] = false;
                 continue;
             }
-            auto value = src[offset].get_data<GetType>(index);
+            auto value = src[offset].get_data_unchecked<GetType>(index);
             if constexpr (lower_inclusive && upper_inclusive) {
                 res[i] = val1 <= value && value <= val2;
             } else if constexpr (lower_inclusive && !upper_inclusive) {
@@ -266,7 +266,7 @@ struct BinaryRangeIndexFunc {
 class PhyBinaryRangeFilterExpr : public SegmentExpr {
  public:
     PhyBinaryRangeFilterExpr(
-        const std::vector<std::shared_ptr<Expr>>& input,
+        std::vector<std::shared_ptr<Expr>> input,
         const std::shared_ptr<const milvus::expr::BinaryRangeFilterExpr>& expr,
         const std::string& name,
         milvus::OpContext* op_ctx,

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/zilliztech/woodpecker/common/config"
 	wpMetrics "github.com/zilliztech/woodpecker/common/metrics"
@@ -13,6 +14,7 @@ import (
 	"github.com/zilliztech/woodpecker/woodpecker"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
+	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
@@ -39,7 +41,11 @@ func (b *builderImpl) Name() message.WALName {
 }
 
 // Build build a wal instance.
+//
+// The registry caches the opener per walName, so this runs at most once per process and
+// the storage mode picked here is never revisited.
 func (b *builderImpl) Build() (walimpls.OpenerImpls, error) {
+	mlog.Info(context.TODO(), "start building wp opener")
 	cfg, err := b.getWpConfig()
 	if err != nil {
 		return nil, err
@@ -59,6 +65,8 @@ func (b *builderImpl) Build() (walimpls.OpenerImpls, error) {
 	}
 	mlog.Info(context.TODO(), "create etcd client finish while building wp opener")
 	var wpClient woodpecker.Client
+	mlog.Info(context.TODO(), "create woodpecker client",
+		mlog.String("storageType", cfg.Woodpecker.Storage.Type))
 	if cfg.Woodpecker.Storage.IsStorageService() {
 		wpClient, err = woodpecker.NewClient(context.Background(), cfg, etcdCli, true)
 	} else {
@@ -75,6 +83,24 @@ func (b *builderImpl) Build() (walimpls.OpenerImpls, error) {
 }
 
 func (b *builderImpl) getWpConfig() (*config.Configuration, error) {
+	// The etcd config source is only refreshed by a periodic poll, while a WAL switch
+	// reaches this node through the WAL broadcast within milliseconds. Read etcd
+	// linearizably first so a woodpecker configuration written just before the switch is
+	// already visible here; the opener is built once, so a stale read would be permanent.
+	if bt := paramtable.GetBaseTable(); bt != nil {
+		start := time.Now()
+		refreshed, err := bt.RefreshRemoteConfigsLinearizable()
+		if err != nil {
+			// Fail closed: the last polled snapshot may be exactly the stale one this refresh
+			// is meant to replace. The opener is only cached on success, so the WAL open is
+			// retried instead of settling on the wrong mode for the life of the process.
+			return nil, merr.Wrap(err, "failed to refresh remote configs before building wp opener")
+		}
+		if refreshed {
+			mlog.Info(context.TODO(), "refreshed remote configs linearizably before building wp opener",
+				mlog.Duration("cost", time.Since(start)))
+		}
+	}
 	wpConfig, err := config.NewConfiguration()
 	if err != nil {
 		return nil, err
@@ -173,7 +199,7 @@ func setCustomWpConfig(wpConfig *config.Configuration, cfg *paramtable.Woodpecke
 	// Set RootPath based on configuration
 	if cfg.RootPath.GetValue() == "default" {
 		// Use LocalStorage.Path as prefix with "wp" subdirectory for default
-		wpConfig.Woodpecker.Storage.RootPath = fmt.Sprintf("%s/wp", paramtable.Get().LocalStorageCfg.Path.GetValue())
+		wpConfig.Woodpecker.Storage.RootPath = fmt.Sprintf("%s/%s", paramtable.Get().LocalStorageCfg.Path.GetValue(), common.WoodpeckerRootPath)
 	} else {
 		// Use custom directory as-is
 		wpConfig.Woodpecker.Storage.RootPath = cfg.RootPath.GetValue()
@@ -181,7 +207,7 @@ func setCustomWpConfig(wpConfig *config.Configuration, cfg *paramtable.Woodpecke
 
 	// set bucketName
 	wpConfig.Minio.BucketName = paramtable.Get().MinioCfg.BucketName.GetValue()
-	wpConfig.Minio.RootPath = fmt.Sprintf("%s/wp", paramtable.Get().MinioCfg.RootPath.GetValue())
+	wpConfig.Minio.RootPath = fmt.Sprintf("%s/%s", paramtable.Get().MinioCfg.RootPath.GetValue(), common.WoodpeckerRootPath)
 	wpConfig.Minio.UseSSL = paramtable.Get().MinioCfg.UseSSL.GetAsBool()
 	wpConfig.Minio.UseIAM = paramtable.Get().MinioCfg.UseIAM.GetAsBool()
 	addr := paramtable.Get().MinioCfg.Address.GetValue()
@@ -307,10 +333,10 @@ func validateQuorumJSON(label, raw string, parse func([]byte) error) {
 		return
 	}
 	if err := parse([]byte(raw)); err != nil {
+		// Quorum JSON can contain private seed addresses; parser errors may
+		// also include input fragments. Keep only the declared configuration label.
 		mlog.Warn(context.TODO(), "invalid quorum JSON config at startup, will fall back to static default",
-			mlog.String("config", label),
-			mlog.String("json", raw),
-			mlog.Err(err))
+			mlog.String("config", label))
 	}
 }
 

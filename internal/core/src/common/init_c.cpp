@@ -27,13 +27,14 @@
 #include <arrow/util/thread_pool.h>
 #include <openssl/evp.h>
 
+#include "common/CGoCatch.h"
 #include "common/Common.h"
 #include "common/Tracer.h"
 #include "exec/expression/ExprCache.h"
 #include "log/Log.h"
 #include "monitor/Monitor.h"
 #include "segcore/memory_planner.h"
-#include "segcore/storagev2translator/AsyncLoadExecutor.h"
+#include "storage/AsyncLoadExecutor.h"
 #include "segcore/storagev2translator/GroupCTMeta.h"
 #include "segcore/storagev2translator/StorageV2Config.h"
 #include "storage/ThreadPool.h"
@@ -129,7 +130,10 @@ SetEnableLatestDeleteSnapshotOptimization(bool val) {
 
 void
 SetLogLevel(const char* level) {
-    milvus::SetLogLevel(level);
+    try {
+        milvus::SetLogLevel(level);
+    }
+    CGO_CATCH_AND_LOG("SetLogLevel")
 }
 
 void
@@ -186,9 +190,20 @@ SetExprResCacheConfig(const char* mode,
     config.disk_min_eval_duration_us =
         disk_min_eval_duration_us < 0 ? 0 : disk_min_eval_duration_us;
 
-    bool applied =
-        milvus::exec::ExprResCacheManager::Instance().SetConfig(config);
-    milvus::exec::ExprResCacheManager::SetEnabled(applied);
+    try {
+        bool applied =
+            milvus::exec::ExprResCacheManager::Instance().SetConfig(config);
+        milvus::exec::ExprResCacheManager::SetEnabled(applied);
+    } catch (const std::exception& e) {
+        LOG_ERROR("exception swallowed at cgo boundary {}: {}",
+                  "SetExprResCacheConfig",
+                  e.what());
+        milvus::exec::ExprResCacheManager::SetEnabled(false);
+    } catch (...) {
+        LOG_ERROR("unknown exception swallowed at cgo boundary {}",
+                  "SetExprResCacheConfig");
+        milvus::exec::ExprResCacheManager::SetEnabled(false);
+    }
 }
 
 void
@@ -228,16 +243,24 @@ SetStorageV2CellTargetSizeBytes(int64_t bytes) {
     milvus::segcore::storagev2translator::SetCellTargetSizeBytes(bytes);
 }
 
-void
+CStatus
 SetStorageV2AsyncLoadEnabled(const bool enabled) {
-    milvus::segcore::storagev2translator::SetStorageV2AsyncLoadEnabled(enabled);
+    try {
+        milvus::segcore::storagev2translator::SetStorageV2AsyncLoadEnabled(
+            enabled);
+        return milvus::SuccessCStatus();
+    } catch (const std::exception& error) {
+        return milvus::FailureCStatus(&error);
+    } catch (...) {
+        return milvus::FailureCStatus(milvus::UnexpectedError,
+                                      "Failed to configure async load mode");
+    }
 }
 
 CStatus
 SetStorageV2AsyncLoadThreadPoolSize(const int threads) {
     try {
-        milvus::segcore::storagev2translator::SetAsyncLoadThreadPoolSize(
-            threads);
+        milvus::storage::SetAsyncLoadThreadPoolSize(threads);
         return milvus::SuccessCStatus();
     } catch (const std::exception& error) {
         return milvus::FailureCStatus(&error);
@@ -249,7 +272,7 @@ SetStorageV2AsyncLoadThreadPoolSize(const int threads) {
 
 int
 GetStorageV2AsyncLoadThreadPoolSize() {
-    return milvus::segcore::storagev2translator::GetAsyncLoadThreadPoolSize();
+    return milvus::storage::GetAsyncLoadThreadPoolSize();
 }
 
 void
@@ -283,12 +306,15 @@ InitTrace(CTraceConfig* config) {
                                                    config->otlpHeaders,
                                                    config->oltpSecure,
                                                    config->nodeID};
-    std::call_once(
-        traceFlag,
-        [](const milvus::tracer::TraceConfig& c) {
-            milvus::tracer::initTelemetry(c);
-        },
-        traceConfig);
+    try {
+        std::call_once(
+            traceFlag,
+            [](const milvus::tracer::TraceConfig& c) {
+                milvus::tracer::initTelemetry(c);
+            },
+            traceConfig);
+    }
+    CGO_CATCH_AND_LOG("InitTrace")
 }
 
 void
@@ -301,5 +327,8 @@ SetTrace(CTraceConfig* config) {
                                                    config->otlpHeaders,
                                                    config->oltpSecure,
                                                    config->nodeID};
-    milvus::tracer::initTelemetry(traceConfig);
+    try {
+        milvus::tracer::initTelemetry(traceConfig);
+    }
+    CGO_CATCH_AND_LOG("SetTrace")
 }
