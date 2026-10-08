@@ -21,6 +21,7 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -163,6 +164,82 @@ func TestOrderedReduceStreamRejectsDuplicatePK(t *testing.T) {
 	require.Equal(t, 1, childB.closeCount())
 }
 
+func TestOrderedReduceStreamRetainedBufferFailureClearsState(t *testing.T) {
+	recvErr := errors.New("sibling receive failed")
+	retainedChild := &queryTestStream{}
+	failingChild := &queryTestStream{recv: []queryTestRecv{{err: recvErr}}}
+	stream, err := NewReduceStream(
+		&internalpb.RetrieveRequest{IsIterator: true, Limit: 2},
+		[]ReduceStream{retainedChild, failingChild},
+		1,
+	)
+	require.NoError(t, err)
+	reducer := stream.(*OrderedReduceStream)
+
+	err = reducer.childBuffers[0].accept(newQueryTestChunk([]int64{1}, []int64{10}))
+	require.NoError(t, err)
+	require.True(t, reducer.childBuffers[0].hasUnit())
+
+	chunk, err := reducer.Recv()
+	require.Nil(t, chunk)
+	require.ErrorIs(t, err, recvErr)
+	for i := range reducer.childBuffers {
+		require.Nil(t, reducer.childBuffers[i].chunk)
+		require.Zero(t, reducer.childBuffers[i].cursor)
+	}
+	require.Equal(t, 1, retainedChild.closeCount())
+	require.Equal(t, 1, failingChild.closeCount())
+}
+
+func TestOrderedReduceStreamPendingRecvFailureUnblocksOnClose(t *testing.T) {
+	blocked := &closeUnblockingQueryStream{
+		started: make(chan struct{}),
+		done:    make(chan struct{}),
+		closed:  make(chan struct{}),
+	}
+	recvErr := errors.New("sibling receive failed")
+	failing := &errorAfterStartQueryStream{started: blocked.started, err: recvErr}
+	stream, err := NewReduceStream(
+		&internalpb.RetrieveRequest{IsIterator: true, Limit: 1},
+		[]ReduceStream{blocked, failing},
+		1,
+	)
+	require.NoError(t, err)
+
+	chunk, err := stream.Recv()
+	require.Nil(t, chunk)
+	require.ErrorIs(t, err, recvErr)
+	select {
+	case <-blocked.done:
+	case <-time.After(time.Second):
+		t.Fatal("pending Query child Recv did not exit after reducer Close")
+	}
+	require.Equal(t, 1, blocked.closeCount())
+	require.Equal(t, 1, failing.closeCount())
+}
+
+func TestOrderedReduceStreamPrematureEOFWithSiblingReturnsUnprovenTopK(t *testing.T) {
+	earlyChild := &queryTestStream{recv: []queryTestRecv{
+		{chunk: newQueryTestChunk([]int64{1}, []int64{10})},
+	}}
+	sibling := &queryTestStream{recv: []queryTestRecv{
+		{chunk: newQueryTestChunk([]int64{2, 4}, []int64{20, 40})},
+	}}
+	stream, err := NewReduceStream(
+		&internalpb.RetrieveRequest{IsIterator: true, Limit: 3},
+		[]ReduceStream{earlyChild, sibling},
+		queryChunkBytes(t, newQueryTestChunk([]int64{1, 2, 4}, []int64{10, 20, 40}), 3),
+	)
+	require.NoError(t, err)
+
+	chunk, err := stream.Recv()
+	require.NoError(t, err)
+	require.Equal(t, []int64{1, 2, 4}, queryTestIDs(chunk))
+	chunk, err = stream.Recv()
+	require.Nil(t, chunk)
+	require.ErrorIs(t, err, io.EOF)
+}
+
 func newQueryTestChunk(ids, values []int64) *internalpb.RetrieveResults {
 	return &internalpb.RetrieveResults{
 		Status: merr.Success(),
@@ -232,6 +309,71 @@ func (*queryTestStream) Interrupt() (*internalpb.RetrieveResults, error) {
 }
 
 func (s *queryTestStream) closeCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closeCalls
+}
+
+type closeUnblockingQueryStream struct {
+	started    chan struct{}
+	done       chan struct{}
+	closed     chan struct{}
+	startOnce  sync.Once
+	doneOnce   sync.Once
+	closeOnce  sync.Once
+	mu         sync.Mutex
+	closeCalls int
+}
+
+func (s *closeUnblockingQueryStream) Recv() (*internalpb.RetrieveResults, error) {
+	s.startOnce.Do(func() { close(s.started) })
+	<-s.closed
+	s.doneOnce.Do(func() { close(s.done) })
+	return nil, io.ErrClosedPipe
+}
+
+func (s *closeUnblockingQueryStream) Close() error {
+	s.mu.Lock()
+	s.closeCalls++
+	s.mu.Unlock()
+	s.closeOnce.Do(func() { close(s.closed) })
+	return nil
+}
+
+func (*closeUnblockingQueryStream) Interrupt() (*internalpb.RetrieveResults, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (s *closeUnblockingQueryStream) closeCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closeCalls
+}
+
+type errorAfterStartQueryStream struct {
+	started    <-chan struct{}
+	err        error
+	mu         sync.Mutex
+	closeCalls int
+}
+
+func (s *errorAfterStartQueryStream) Recv() (*internalpb.RetrieveResults, error) {
+	<-s.started
+	return nil, s.err
+}
+
+func (s *errorAfterStartQueryStream) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closeCalls++
+	return nil
+}
+
+func (*errorAfterStartQueryStream) Interrupt() (*internalpb.RetrieveResults, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (s *errorAfterStartQueryStream) closeCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.closeCalls

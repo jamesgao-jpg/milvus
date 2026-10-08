@@ -17,12 +17,15 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"io"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/internal/util/queryutil"
 	"github.com/milvus-io/milvus/internal/util/searchutil"
 	"github.com/milvus-io/milvus/internal/views/queryclient"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
@@ -62,6 +65,64 @@ func (*fakeLegacySearchStream) Interrupt() (*internalpb.SearchResults, error) {
 }
 
 var _ searchutil.ReduceStream = (*fakeLegacySearchStream)(nil)
+
+type proxySearchStreamRecv struct {
+	chunk *internalpb.SearchResults
+	err   error
+}
+
+type proxySearchStream struct {
+	recv       []proxySearchStreamRecv
+	closeCalls int
+}
+
+func (s *proxySearchStream) Recv() (*internalpb.SearchResults, error) {
+	if len(s.recv) == 0 {
+		return nil, io.EOF
+	}
+	next := s.recv[0]
+	s.recv = s.recv[1:]
+	return next.chunk, next.err
+}
+
+func (s *proxySearchStream) Close() error {
+	s.closeCalls++
+	return nil
+}
+
+func (*proxySearchStream) Interrupt() (*internalpb.SearchResults, error) {
+	return nil, errors.New("not implemented")
+}
+
+type proxyQueryStreamRecv struct {
+	chunk *internalpb.RetrieveResults
+	err   error
+}
+
+type proxyQueryStream struct {
+	recv       []proxyQueryStreamRecv
+	closeCalls int
+}
+
+func (s *proxyQueryStream) Recv() (*internalpb.RetrieveResults, error) {
+	if len(s.recv) == 0 {
+		return nil, io.EOF
+	}
+	next := s.recv[0]
+	s.recv = s.recv[1:]
+	return next.chunk, next.err
+}
+
+func (s *proxyQueryStream) Close() error {
+	s.closeCalls++
+	return nil
+}
+
+func (*proxyQueryStream) Interrupt() (*internalpb.RetrieveResults, error) {
+	return nil, errors.New("not implemented")
+}
+
+var _ queryutil.ReduceStream = (*proxyQueryStream)(nil)
 
 func (c *fakeLegacyQueryClient) Search(ctx context.Context, req *queryclient.LegacySearchRequest) (*queryclient.LegacySearchResult, error) {
 	c.searchCalled++
@@ -160,4 +221,97 @@ func TestSearchTaskExecuteKeepsReduceStream(t *testing.T) {
 	require.NoError(t, task.Execute(context.Background()))
 	require.Same(t, stream, task.resultStream)
 	require.Empty(t, task.resultBuf.Collect())
+}
+
+func TestSearchTaskConsumeResultStreamFailureDiscardsPartialResult(t *testing.T) {
+	recvErr := errors.New("injected failure after output")
+	stream := &proxySearchStream{recv: []proxySearchStreamRecv{
+		{chunk: proxySearchChunk()},
+		{err: recvErr},
+	}}
+	task := &searchTask{SearchRequest: &internalpb.SearchRequest{
+		Nq:         1,
+		Topk:       2,
+		MetricType: "IP",
+	}}
+
+	result, _, err := task.consumeResultStream(stream, "IP", func(*internalpb.SearchResults) {})
+	require.Nil(t, result)
+	require.ErrorIs(t, err, recvErr)
+	require.Equal(t, 1, stream.closeCalls)
+}
+
+func TestSearchTaskConsumeResultStreamPrematureEOFReturnsPartialResult(t *testing.T) {
+	stream := &proxySearchStream{recv: []proxySearchStreamRecv{{chunk: proxySearchChunk()}}}
+	task := &searchTask{SearchRequest: &internalpb.SearchRequest{
+		Nq:         1,
+		Topk:       2,
+		MetricType: "IP",
+	}}
+
+	result, _, err := task.consumeResultStream(stream, "IP", func(*internalpb.SearchResults) {})
+	require.NoError(t, err)
+	require.Equal(t, []int64{1}, result.GetResults().GetIds().GetIntId().GetData())
+	require.Equal(t, []int64{1}, result.GetResults().GetTopks())
+	require.Equal(t, 1, stream.closeCalls)
+}
+
+func TestQueryTaskConsumeResultStreamFailureDiscardsPartialResult(t *testing.T) {
+	recvErr := errors.New("injected failure after output")
+	stream := &proxyQueryStream{recv: []proxyQueryStreamRecv{
+		{chunk: proxyQueryChunk()},
+		{err: recvErr},
+	}}
+	task := &queryTask{RetrieveRequest: &internalpb.RetrieveRequest{Limit: 2}}
+
+	result, err := task.consumeQueryResultStream(stream)
+	require.Nil(t, result)
+	require.ErrorIs(t, err, recvErr)
+	require.Equal(t, 1, stream.closeCalls)
+}
+
+func TestQueryTaskConsumeResultStreamPrematureEOFReturnsPartialResult(t *testing.T) {
+	stream := &proxyQueryStream{recv: []proxyQueryStreamRecv{{chunk: proxyQueryChunk()}}}
+	task := &queryTask{RetrieveRequest: &internalpb.RetrieveRequest{Limit: 2}}
+
+	result, err := task.consumeQueryResultStream(stream)
+	require.NoError(t, err)
+	require.Equal(t, []int64{1}, result.GetIds().GetIntId().GetData())
+	require.Equal(t, 1, stream.closeCalls)
+}
+
+func proxySearchChunk() *internalpb.SearchResults {
+	return &internalpb.SearchResults{
+		Status:     merr.Success(),
+		MetricType: "IP",
+		NumQueries: 1,
+		TopK:       2,
+		ResultData: &schemapb.SearchResultData{
+			NumQueries: 1,
+			TopK:       2,
+			Topks:      []int64{1},
+			Ids: &schemapb.IDs{IdField: &schemapb.IDs_IntId{
+				IntId: &schemapb.LongArray{Data: []int64{1}},
+			}},
+			Scores: []float32{0.9},
+		},
+	}
+}
+
+func proxyQueryChunk() *internalpb.RetrieveResults {
+	return &internalpb.RetrieveResults{
+		Status: merr.Success(),
+		Ids: &schemapb.IDs{IdField: &schemapb.IDs_IntId{
+			IntId: &schemapb.LongArray{Data: []int64{1}},
+		}},
+		FieldsData: []*schemapb.FieldData{
+			{
+				Type:    schemapb.DataType_Int64,
+				FieldId: 101,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{
+					Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: []int64{10}}},
+				}},
+			},
+		},
+	}
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -14,12 +16,18 @@ import (
 	"github.com/milvus-io/milvus/internal/util/queryutil"
 	"github.com/milvus-io/milvus/internal/util/searchutil"
 	"github.com/milvus-io/milvus/internal/views/qviews"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/viewpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 )
 
-const defaultStreamChunkBytes = 256 * 1024
+const (
+	defaultStreamChunkBytes = 256 * 1024
+	streamFaultEnv          = "MILVUS_REDUCE_STREAM_FAULT"
+)
+
+var streamFaultUsed atomic.Bool
 
 // Server implements ViewQueryService as a thin provider+scheduler adapter.
 type Server struct {
@@ -177,7 +185,20 @@ func (s *Server) SearchOnViewStream(stream viewpb.ViewQueryService_SearchOnViewS
 	if err != nil {
 		return status.Errorf(codes.Internal, "split SearchOnView result: %v", err)
 	}
-	for _, chunk := range chunks {
+	configuredFault := os.Getenv(streamFaultEnv)
+	fault := takeStreamFault()
+	if configuredFault != "" {
+		mlog.Info(stream.Context(), "ReduceStream fault request accepted",
+			mlog.String("operation", "Search"),
+			mlog.Int64("requestID", legacyRequest.GetBase().GetMsgID()),
+			mlog.String("fault", configuredFault),
+			mlog.Bool("injected", fault != ""),
+		)
+	}
+	if stop, err := applyStreamFault(stream.Context(), "Search", legacyRequest.GetBase().GetMsgID(), fault, "before_first_chunk"); stop {
+		return err
+	}
+	for index, chunk := range chunks {
 		message := &viewpb.SearchOnViewStreamResponse{
 			Payload: &viewpb.SearchOnViewStreamResponse_Chunk{Chunk: chunk},
 		}
@@ -186,6 +207,11 @@ func (s *Server) SearchOnViewStream(stream viewpb.ViewQueryService_SearchOnViewS
 			return err
 		}
 		metrics.RecordSendComplete(message)
+		if index == 0 {
+			if stop, err := applyStreamFault(stream.Context(), "Search", legacyRequest.GetBase().GetMsgID(), fault, "after_first_chunk"); stop {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -254,14 +280,76 @@ func (s *Server) QueryOnViewStream(stream viewpb.ViewQueryService_QueryOnViewStr
 	if err != nil {
 		return status.Errorf(codes.Internal, "split QueryOnView result: %v", err)
 	}
-	for _, chunk := range chunks {
+	configuredFault := os.Getenv(streamFaultEnv)
+	fault := takeStreamFault()
+	if configuredFault != "" {
+		mlog.Info(stream.Context(), "ReduceStream fault request accepted",
+			mlog.String("operation", "Query"),
+			mlog.Int64("requestID", legacyRequest.GetBase().GetMsgID()),
+			mlog.String("fault", configuredFault),
+			mlog.Bool("injected", fault != ""),
+		)
+	}
+	if stop, err := applyStreamFault(stream.Context(), "Query", legacyRequest.GetBase().GetMsgID(), fault, "before_first_chunk"); stop {
+		return err
+	}
+	for index, chunk := range chunks {
 		if err := stream.Send(&viewpb.QueryOnViewStreamResponse{
 			Payload: &viewpb.QueryOnViewStreamResponse_Chunk{Chunk: chunk},
 		}); err != nil {
 			return err
 		}
+		if index == 0 {
+			if stop, err := applyStreamFault(stream.Context(), "Query", legacyRequest.GetBase().GetMsgID(), fault, "after_first_chunk"); stop {
+				return err
+			}
+		}
 	}
 	return nil
+}
+
+func takeStreamFault() string {
+	fault := os.Getenv(streamFaultEnv)
+	if fault == "" || !streamFaultUsed.CompareAndSwap(false, true) {
+		return ""
+	}
+	return fault
+}
+
+func applyStreamFault(ctx context.Context, operation string, requestID int64, fault, checkpoint string) (bool, error) {
+	switch fault {
+	case "":
+		return false, nil
+	case "error_before_first_chunk", "block_before_first_chunk":
+		if checkpoint != "before_first_chunk" {
+			return false, nil
+		}
+	case "error_after_first_chunk", "eof_after_first_chunk", "block_after_first_chunk":
+		if checkpoint != "after_first_chunk" {
+			return false, nil
+		}
+	default:
+		return true, status.Errorf(codes.FailedPrecondition, "unknown %s value %q", streamFaultEnv, fault)
+	}
+
+	mlog.Info(ctx, "ReduceStream fault checkpoint reached",
+		mlog.String("operation", operation),
+		mlog.Int64("requestID", requestID),
+		mlog.String("fault", fault),
+		mlog.String("checkpoint", checkpoint),
+	)
+
+	switch fault {
+	case "error_before_first_chunk", "error_after_first_chunk":
+		return true, status.Errorf(codes.Unavailable, "injected %s failure at %s", operation, checkpoint)
+	case "eof_after_first_chunk":
+		return true, nil
+	case "block_before_first_chunk", "block_after_first_chunk":
+		<-ctx.Done()
+		return true, ctx.Err()
+	default:
+		return false, nil
+	}
 }
 
 func (s *Server) RequeryOnView(context.Context, *viewpb.RequeryOnViewRequest) (*viewpb.RequeryOnViewResponse, error) {

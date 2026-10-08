@@ -108,6 +108,71 @@ func (s *blockingReduceStream) Interrupt() (*internalpb.SearchResults, error) {
 	return nil, errors.New("not implemented")
 }
 
+type closeUnblockingReduceStream struct {
+	started    chan struct{}
+	done       chan struct{}
+	closed     chan struct{}
+	startOnce  sync.Once
+	doneOnce   sync.Once
+	closeOnce  sync.Once
+	mu         sync.Mutex
+	closeCalls int
+}
+
+func (s *closeUnblockingReduceStream) Recv() (*internalpb.SearchResults, error) {
+	s.startOnce.Do(func() { close(s.started) })
+	<-s.closed
+	s.doneOnce.Do(func() { close(s.done) })
+	return nil, io.ErrClosedPipe
+}
+
+func (s *closeUnblockingReduceStream) Close() error {
+	s.mu.Lock()
+	s.closeCalls++
+	s.mu.Unlock()
+	s.closeOnce.Do(func() { close(s.closed) })
+	return nil
+}
+
+func (*closeUnblockingReduceStream) Interrupt() (*internalpb.SearchResults, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (s *closeUnblockingReduceStream) closeCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closeCalls
+}
+
+type errorAfterStartReduceStream struct {
+	started    <-chan struct{}
+	err        error
+	mu         sync.Mutex
+	closeCalls int
+}
+
+func (s *errorAfterStartReduceStream) Recv() (*internalpb.SearchResults, error) {
+	<-s.started
+	return nil, s.err
+}
+
+func (s *errorAfterStartReduceStream) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closeCalls++
+	return nil
+}
+
+func (*errorAfterStartReduceStream) Interrupt() (*internalpb.SearchResults, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (s *errorAfterStartReduceStream) closeCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closeCalls
+}
+
 type testHit struct {
 	id    int64
 	score float32
@@ -821,6 +886,88 @@ func TestOrderedReduceStreamClosesChildrenOnRecvError(t *testing.T) {
 	_, rightClose := right.calls()
 	require.Equal(t, 1, leftClose)
 	require.Equal(t, 1, rightClose)
+}
+
+func TestOrderedReduceStreamRetainedBufferFailureClearsState(t *testing.T) {
+	recvErr := errors.New("sibling receive failed")
+	retainedChild := &fakeReduceStream{}
+	failingChild := &fakeReduceStream{recv: []fakeStreamRecv{{err: recvErr}}}
+	stream, err := NewReduceStream(
+		&internalpb.SearchRequest{Nq: 1, Topk: 2, MetricType: "IP", IsIterator: true},
+		[]ReduceStream{retainedChild, failingChild},
+		searchChunkBytes(t, testHit{id: 1, score: 0.9}),
+	)
+	require.NoError(t, err)
+	reducer := stream.(*OrderedReduceStream)
+
+	_, err = reducer.childBuffers[0].accept(
+		newSearchChunk(1, 2, []testHit{{id: 1, score: 0.9}}),
+		1,
+		2,
+	)
+	require.NoError(t, err)
+	require.True(t, reducer.childBuffers[0].hasUnit())
+
+	chunk, err := reducer.Recv()
+	require.Nil(t, chunk)
+	require.ErrorIs(t, err, recvErr)
+	for i := range reducer.childBuffers {
+		require.Empty(t, reducer.childBuffers[i].units)
+		require.Zero(t, reducer.childBuffers[i].cursor)
+	}
+	_, retainedClose := retainedChild.calls()
+	_, failingClose := failingChild.calls()
+	require.Equal(t, 1, retainedClose)
+	require.Equal(t, 1, failingClose)
+}
+
+func TestOrderedReduceStreamPendingRecvFailureUnblocksOnClose(t *testing.T) {
+	blocked := &closeUnblockingReduceStream{
+		started: make(chan struct{}),
+		done:    make(chan struct{}),
+		closed:  make(chan struct{}),
+	}
+	recvErr := errors.New("sibling receive failed")
+	failing := &errorAfterStartReduceStream{started: blocked.started, err: recvErr}
+	stream, err := NewReduceStream(
+		&internalpb.SearchRequest{Nq: 1, Topk: 1, MetricType: "IP", IsIterator: true},
+		[]ReduceStream{blocked, failing},
+		1,
+	)
+	require.NoError(t, err)
+
+	chunk, err := stream.Recv()
+	require.Nil(t, chunk)
+	require.ErrorIs(t, err, recvErr)
+	select {
+	case <-blocked.done:
+	case <-time.After(time.Second):
+		t.Fatal("pending Search child Recv did not exit after reducer Close")
+	}
+	require.Equal(t, 1, blocked.closeCount())
+	require.Equal(t, 1, failing.closeCount())
+}
+
+func TestOrderedReduceStreamPrematureEOFWithSiblingReturnsUnprovenTopK(t *testing.T) {
+	earlyChild := &fakeReduceStream{recv: []fakeStreamRecv{{chunk: newSearchChunk(1, 3,
+		[]testHit{{id: 1, score: 0.9}})}}}
+	sibling := &fakeReduceStream{recv: []fakeStreamRecv{{chunk: newSearchChunk(1, 3,
+		[]testHit{{id: 2, score: 0.8}, {id: 3, score: 0.7}})}}}
+	stream, err := NewReduceStream(
+		&internalpb.SearchRequest{Nq: 1, Topk: 3, MetricType: "IP", IsIterator: true},
+		[]ReduceStream{earlyChild, sibling},
+		searchChunkBytes(t,
+			testHit{id: 1, score: 0.9},
+			testHit{id: 2, score: 0.8},
+			testHit{id: 3, score: 0.7},
+		),
+	)
+	require.NoError(t, err)
+
+	assertSearchChunk(t, recvChunk(t, stream), []int64{1, 2, 3}, []float32{0.9, 0.8, 0.7}, []int64{3})
+	chunk, err := stream.Recv()
+	require.Nil(t, chunk)
+	require.ErrorIs(t, err, io.EOF)
 }
 
 func TestOrderedReduceStreamCloseIsIdempotent(t *testing.T) {

@@ -196,6 +196,91 @@ func TestSearchOnViewStreamCloseCancelsServer(t *testing.T) {
 	}
 }
 
+func TestSearchGRPCStreamFailureBoundaries(t *testing.T) {
+	tests := []struct {
+		name      string
+		chunks    []*internalpb.SearchResults
+		serverErr error
+		wantFirst bool
+		wantCode  codes.Code
+		wantEOF   bool
+	}{
+		{
+			name:      "error before first Chunk",
+			serverErr: status.Error(codes.Unavailable, "injected Search failure"),
+			wantCode:  codes.Unavailable,
+		},
+		{
+			name: "error after first Chunk",
+			chunks: []*internalpb.SearchResults{
+				streamFailureSearchChunk(),
+			},
+			serverErr: status.Error(codes.Unavailable, "injected Search failure"),
+			wantFirst: true,
+			wantCode:  codes.Unavailable,
+		},
+		{
+			name: "premature EOF",
+			chunks: []*internalpb.SearchResults{
+				streamFailureSearchChunk(),
+			},
+			wantFirst: true,
+			wantEOF:   true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, cleanup := startSearchStreamTestServer(t, &streamFailureServer{
+				searchChunks: test.chunks,
+				searchErr:    test.serverErr,
+			})
+			defer cleanup()
+
+			stream, err := searchutil.NewGRPCReduceStream(context.Background(), client, streamTestRequest())
+			require.NoError(t, err)
+			defer stream.Close()
+
+			if test.wantFirst {
+				chunk, err := stream.Recv()
+				require.NoError(t, err)
+				require.Equal(t, []int64{1}, chunk.GetResultData().GetIds().GetIntId().GetData())
+			}
+
+			chunk, err := stream.Recv()
+			require.Nil(t, chunk)
+			if test.wantEOF {
+				require.ErrorIs(t, err, io.EOF)
+			} else {
+				require.Equal(t, test.wantCode, status.Code(err))
+			}
+		})
+	}
+}
+
+func TestSearchOnViewStreamFaultAfterFirstChunk(t *testing.T) {
+	t.Setenv(streamFaultEnv, "error_after_first_chunk")
+	streamFaultUsed.Store(false)
+	t.Cleanup(func() { streamFaultUsed.Store(false) })
+
+	server := NewServer(
+		&streamTestProvider{searchTasks: &streamTestSearchTasks{tasks: []SearchSegmentTask{struct{}{}}}},
+		&streamTestScheduler{result: streamTestResult()},
+	)
+	client, cleanup := startSearchStreamTestServer(t, server)
+	defer cleanup()
+	request := streamTestRequest()
+	request.StreamChunkBytes = 20
+	stream, err := searchutil.NewGRPCReduceStream(context.Background(), client, request)
+	require.NoError(t, err)
+	defer stream.Close()
+
+	assertStreamChunk(t, recvSearchStreamChunk(t, stream), []int64{1, 2}, []int64{2, 0})
+	chunk, err := stream.Recv()
+	require.Nil(t, chunk)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+}
+
 func TestQueryOnViewStreamSendsChunksAndEOF(t *testing.T) {
 	tasks := &streamTestQueryTasks{tasks: []QuerySegmentTask{struct{}{}}}
 	provider := &streamTestProvider{queryTasks: tasks}
@@ -289,6 +374,128 @@ func TestQueryOnViewStreamAcceptsBoundedOrdinaryQuery(t *testing.T) {
 	require.Equal(t, 1, tasks.releaseCount)
 }
 
+func TestQueryGRPCStreamFailureBoundaries(t *testing.T) {
+	tests := []struct {
+		name      string
+		chunks    []*internalpb.RetrieveResults
+		serverErr error
+		wantFirst bool
+		wantCode  codes.Code
+		wantEOF   bool
+	}{
+		{
+			name:      "error before first Chunk",
+			serverErr: status.Error(codes.Unavailable, "injected Query failure"),
+			wantCode:  codes.Unavailable,
+		},
+		{
+			name: "error after first Chunk",
+			chunks: []*internalpb.RetrieveResults{
+				streamFailureQueryChunk(),
+			},
+			serverErr: status.Error(codes.Unavailable, "injected Query failure"),
+			wantFirst: true,
+			wantCode:  codes.Unavailable,
+		},
+		{
+			name: "premature EOF",
+			chunks: []*internalpb.RetrieveResults{
+				streamFailureQueryChunk(),
+			},
+			wantFirst: true,
+			wantEOF:   true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, cleanup := startSearchStreamTestServer(t, &streamFailureServer{
+				queryChunks: test.chunks,
+				queryErr:    test.serverErr,
+			})
+			defer cleanup()
+
+			stream, err := queryutil.NewGRPCReduceStream(context.Background(), client, streamTestQueryRequest())
+			require.NoError(t, err)
+			defer stream.Close()
+
+			if test.wantFirst {
+				chunk, err := stream.Recv()
+				require.NoError(t, err)
+				require.Equal(t, []int64{1}, chunk.GetIds().GetIntId().GetData())
+			}
+
+			chunk, err := stream.Recv()
+			require.Nil(t, chunk)
+			if test.wantEOF {
+				require.ErrorIs(t, err, io.EOF)
+			} else {
+				require.Equal(t, test.wantCode, status.Code(err))
+			}
+		})
+	}
+}
+
+func TestQueryOnViewStreamFaultBeforeFirstChunkIsOneShot(t *testing.T) {
+	t.Setenv(streamFaultEnv, "error_before_first_chunk")
+	streamFaultUsed.Store(false)
+	t.Cleanup(func() { streamFaultUsed.Store(false) })
+
+	server := NewServer(
+		&streamTestProvider{queryTasks: &streamTestQueryTasks{tasks: []QuerySegmentTask{struct{}{}}}},
+		&streamTestScheduler{queryResult: streamFailureQueryChunk()},
+	)
+	client, cleanup := startSearchStreamTestServer(t, server)
+	defer cleanup()
+
+	first, err := queryutil.NewGRPCReduceStream(context.Background(), client, streamTestQueryRequest())
+	require.NoError(t, err)
+	chunk, err := first.Recv()
+	require.Nil(t, chunk)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.NoError(t, first.Close())
+
+	second, err := queryutil.NewGRPCReduceStream(context.Background(), client, streamTestQueryRequest())
+	require.NoError(t, err)
+	defer second.Close()
+	chunk, err = second.Recv()
+	require.NoError(t, err)
+	require.Equal(t, []int64{1}, chunk.GetIds().GetIntId().GetData())
+}
+
+func TestApplyStreamFault(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	tests := []struct {
+		name       string
+		ctx        context.Context
+		fault      string
+		checkpoint string
+		wantStop   bool
+		wantCode   codes.Code
+		wantError  error
+	}{
+		{name: "nonmatching checkpoint", ctx: context.Background(), fault: "error_after_first_chunk", checkpoint: "before_first_chunk"},
+		{name: "clean EOF", ctx: context.Background(), fault: "eof_after_first_chunk", checkpoint: "after_first_chunk", wantStop: true},
+		{name: "blocked context canceled", ctx: canceled, fault: "block_before_first_chunk", checkpoint: "before_first_chunk", wantStop: true, wantError: context.Canceled},
+		{name: "unknown fault", ctx: context.Background(), fault: "unknown", checkpoint: "before_first_chunk", wantStop: true, wantCode: codes.FailedPrecondition},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stop, err := applyStreamFault(test.ctx, "Search", 10, test.fault, test.checkpoint)
+			require.Equal(t, test.wantStop, stop)
+			if test.wantError != nil {
+				require.ErrorIs(t, err, test.wantError)
+			} else if test.wantCode != codes.OK {
+				require.Equal(t, test.wantCode, status.Code(err))
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
 func startSearchStreamTestServer(t *testing.T, service viewpb.ViewQueryServiceServer) (viewpb.ViewQueryServiceClient, func()) {
 	t.Helper()
 	listener := bufconn.Listen(1024 * 1024)
@@ -344,6 +551,94 @@ func streamTestRequest() *viewpb.SearchOnViewRequest {
 			QueryVersion: 3,
 		},
 		Mvcc: &viewpb.QueryPlanMVCC{GrowingTimetick: 10, TransformingTimetick: 9},
+	}
+}
+
+func streamTestQueryRequest() *viewpb.QueryOnViewRequest {
+	return &viewpb.QueryOnViewRequest{
+		LegacyReq: &internalpb.RetrieveRequest{
+			CollectionID: 10,
+			IsIterator:   true,
+			Limit:        2,
+		},
+		ShardId: &viewpb.ShardID{ReplicaId: 1, Vchannel: "by-dev-rootcoord-dml_0_100v0"},
+		Version: &viewpb.QueryViewVersion{
+			DataVersion:  &viewpb.DataVersion{StreamingVersion: 1, CompactVersion: 2},
+			QueryVersion: 3,
+		},
+		Mvcc: &viewpb.QueryPlanMVCC{GrowingTimetick: 10},
+	}
+}
+
+type streamFailureServer struct {
+	viewpb.UnimplementedViewQueryServiceServer
+	searchChunks []*internalpb.SearchResults
+	searchErr    error
+	queryChunks  []*internalpb.RetrieveResults
+	queryErr     error
+}
+
+func (s *streamFailureServer) SearchOnViewStream(stream viewpb.ViewQueryService_SearchOnViewStreamServer) error {
+	if _, err := stream.Recv(); err != nil {
+		return err
+	}
+	for _, chunk := range s.searchChunks {
+		if err := stream.Send(&viewpb.SearchOnViewStreamResponse{
+			Payload: &viewpb.SearchOnViewStreamResponse_Chunk{Chunk: chunk},
+		}); err != nil {
+			return err
+		}
+	}
+	return s.searchErr
+}
+
+func (s *streamFailureServer) QueryOnViewStream(stream viewpb.ViewQueryService_QueryOnViewStreamServer) error {
+	if _, err := stream.Recv(); err != nil {
+		return err
+	}
+	for _, chunk := range s.queryChunks {
+		if err := stream.Send(&viewpb.QueryOnViewStreamResponse{
+			Payload: &viewpb.QueryOnViewStreamResponse_Chunk{Chunk: chunk},
+		}); err != nil {
+			return err
+		}
+	}
+	return s.queryErr
+}
+
+func streamFailureSearchChunk() *internalpb.SearchResults {
+	return &internalpb.SearchResults{
+		Status:     merr.Success(),
+		MetricType: "IP",
+		NumQueries: 1,
+		TopK:       2,
+		ResultData: &schemapb.SearchResultData{
+			NumQueries: 1,
+			TopK:       2,
+			Topks:      []int64{1},
+			Ids: &schemapb.IDs{IdField: &schemapb.IDs_IntId{
+				IntId: &schemapb.LongArray{Data: []int64{1}},
+			}},
+			Scores: []float32{0.9},
+		},
+	}
+}
+
+func streamFailureQueryChunk() *internalpb.RetrieveResults {
+	return &internalpb.RetrieveResults{
+		Status: merr.Success(),
+		Ids: &schemapb.IDs{IdField: &schemapb.IDs_IntId{
+			IntId: &schemapb.LongArray{Data: []int64{1}},
+		}},
+		FieldsData: []*schemapb.FieldData{
+			{
+				Type:    schemapb.DataType_Int64,
+				FieldId: 101,
+				Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{
+					Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: []int64{10}}},
+				}},
+			},
+		},
 	}
 }
 
