@@ -24,6 +24,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/internal/proxy/search_agg"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/planpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
@@ -143,5 +144,36 @@ func TestSearchInfoDetermineSearchTypeWithOrderBy(t *testing.T) {
 		orderByFields: []OrderByField{{FieldName: "price"}},
 	}
 
-	assert.Equal(t, internalpb.SearchType_DEFAULT, info.DetermineSearchType(false))
+	assert.Equal(t, internalpb.SearchType_PURE_ANN_SEARCH_NO_FILTER, info.DetermineSearchType(false))
+}
+
+func TestSearchTaskSupportsStreamingReduce(t *testing.T) {
+	plain := func() *searchTask {
+		return &searchTask{SearchRequest: &internalpb.SearchRequest{
+			SearchType: internalpb.SearchType_PURE_ANN_SEARCH_NO_FILTER,
+		}}
+	}
+
+	tests := []struct {
+		name string
+		task *searchTask
+		want bool
+	}{
+		{name: "plain ANN", task: plain(), want: true},
+		{name: "filtered plain ANN", task: &searchTask{SearchRequest: &internalpb.SearchRequest{SearchType: internalpb.SearchType_PURE_ANN_SEARCH_WITH_FILTER}}, want: true},
+		{name: "iterator", task: &searchTask{SearchRequest: &internalpb.SearchRequest{IsIterator: true}}, want: true},
+		{name: "default search type", task: &searchTask{SearchRequest: &internalpb.SearchRequest{}}, want: false},
+		{name: "advanced search", task: &searchTask{SearchRequest: &internalpb.SearchRequest{IsAdvanced: true}}, want: false},
+		{name: "sub requests", task: &searchTask{SearchRequest: &internalpb.SearchRequest{SubReqs: []*internalpb.SubSearchRequest{{}}}}, want: false},
+		{name: "group by", task: &searchTask{SearchRequest: &internalpb.SearchRequest{GroupByFieldId: 100}}, want: false},
+		{name: "multi-field group by", task: &searchTask{SearchRequest: &internalpb.SearchRequest{GroupByFieldIds: []int64{100, 101}}}, want: false},
+		{name: "search aggregation", task: &searchTask{SearchRequest: &internalpb.SearchRequest{SearchType: internalpb.SearchType_PURE_ANN_SEARCH_NO_FILTER}, aggCtx: &search_agg.SearchAggregationContext{}}, want: false},
+		{name: "order by", task: &searchTask{SearchRequest: &internalpb.SearchRequest{SearchType: internalpb.SearchType_PURE_ANN_SEARCH_NO_FILTER}, orderByFields: []OrderByField{{FieldName: "price"}}}, want: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, test.task.supportsStreamingReduce())
+		})
+	}
 }
