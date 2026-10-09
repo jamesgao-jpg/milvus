@@ -24,6 +24,8 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/planpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 )
 
@@ -133,4 +135,13 @@ func TestRankParamsCarryJSONGroupAttributes(t *testing.T) {
 	searchInfo, err := parseSearchInfo(getValidSearchParams(), schema, parsed, false)
 	assert.NoError(t, err)
 	assert.Equal(t, "/brand", searchInfo.planInfo.GetJsonPath())
+}
+
+func TestSearchInfoDetermineSearchTypeWithOrderBy(t *testing.T) {
+	info := &SearchInfo{
+		planInfo:      &planpb.QueryInfo{},
+		orderByFields: []OrderByField{{FieldName: "price"}},
+	}
+
+	assert.Equal(t, internalpb.SearchType_DEFAULT, info.DetermineSearchType(false))
 }
