@@ -1540,6 +1540,7 @@ func (t *SearchTask) executeByQueryView(ctx context.Context) error {
 		Req:              t.SearchRequest,
 		RequiredFieldIDs: fields,
 		BarrierMVCC:      t.MvccTimestamp,
+		AllowStreaming:   t.supportsStreamingReduce(),
 	})
 	if err != nil {
 		return queryViewLoadError(ctx, t.node, t.GetCollectionID(), t.GetPartitionIDs(), err)
@@ -1556,6 +1557,28 @@ func (t *SearchTask) executeByQueryView(ctx context.Context) error {
 		t.resultBuf.Insert(searchResult)
 	}
 	return nil
+}
+
+func (t *SearchTask) supportsStreamingReduce() bool {
+	req := t.SearchRequest
+	if req == nil ||
+		t.aggCtx != nil ||
+		len(t.orderByFields) > 0 ||
+		req.GetIsAdvanced() ||
+		len(req.GetSubReqs()) > 0 ||
+		req.GetGroupByFieldId() > 0 ||
+		len(req.GetGroupByFieldIds()) > 0 {
+		return false
+	}
+
+	// Iterator Search is classified as SearchType_DEFAULT. After rejecting
+	// unsupported request shapes above, IsIterator identifies the supported path.
+	if req.GetIsIterator() {
+		return true
+	}
+
+	return req.GetSearchType() == internalpb.SearchType_PURE_ANN_SEARCH_NO_FILTER ||
+		req.GetSearchType() == internalpb.SearchType_PURE_ANN_SEARCH_WITH_FILTER
 }
 
 // find the last bound based on reduced results and metric type

@@ -88,6 +88,7 @@ func TestLegacyClientSearchReducesIteratorVChannelStreams(t *testing.T) {
 	)
 
 	result, err := client.Legacy().Search(context.Background(), &LegacySearchRequest{
+		AllowStreaming: true,
 		Req: &internalpb.SearchRequest{
 			CollectionID:     collectionID,
 			ConsistencyLevel: commonpb.ConsistencyLevel_Bounded,
@@ -129,7 +130,7 @@ func TestLegacyClientPlainANNUsesStreamingWhenEnabled(t *testing.T) {
 		},
 	)
 
-	result, err := client.Legacy().Search(context.Background(), &LegacySearchRequest{Req: &internalpb.SearchRequest{
+	result, err := client.Legacy().Search(context.Background(), &LegacySearchRequest{AllowStreaming: true, Req: &internalpb.SearchRequest{
 		CollectionID:     100,
 		ConsistencyLevel: commonpb.ConsistencyLevel_Bounded,
 		Nq:               1,
@@ -145,17 +146,6 @@ func TestLegacyClientPlainANNUsesStreamingWhenEnabled(t *testing.T) {
 	_, err = result.Stream.Recv()
 	require.ErrorIs(t, err, io.EOF)
 	require.NoError(t, result.Stream.Close())
-}
-
-func TestSupportsSearchStream(t *testing.T) {
-	require.True(t, supportsSearchStream(&internalpb.SearchRequest{IsIterator: true}))
-	require.True(t, supportsSearchStream(&internalpb.SearchRequest{SearchType: internalpb.SearchType_PURE_ANN_SEARCH_NO_FILTER}))
-	require.True(t, supportsSearchStream(&internalpb.SearchRequest{SearchType: internalpb.SearchType_PURE_ANN_SEARCH_WITH_FILTER}))
-	require.False(t, supportsSearchStream(&internalpb.SearchRequest{SearchType: internalpb.SearchType_DEFAULT}))
-	require.False(t, supportsSearchStream(&internalpb.SearchRequest{
-		SearchType:     internalpb.SearchType_PURE_ANN_SEARCH_NO_FILTER,
-		GroupByFieldId: 1,
-	}))
 }
 
 func TestLegacyClientIteratorSearchUsesBatchWhenStreamingDisabled(t *testing.T) {
@@ -178,7 +168,7 @@ func TestLegacyClientIteratorSearchUsesBatchWhenStreamingDisabled(t *testing.T) 
 		},
 	)
 
-	result, err := client.Legacy().Search(context.Background(), &LegacySearchRequest{Req: &internalpb.SearchRequest{
+	result, err := client.Legacy().Search(context.Background(), &LegacySearchRequest{AllowStreaming: true, Req: &internalpb.SearchRequest{
 		CollectionID:     100,
 		ConsistencyLevel: commonpb.ConsistencyLevel_Bounded,
 		Nq:               1,
@@ -252,7 +242,7 @@ func TestLegacyClientSearchRetriesIteratorBeforeFirstFinalChunk(t *testing.T) {
 		},
 	)
 
-	result, err := client.Legacy().Search(context.Background(), &LegacySearchRequest{Req: &internalpb.SearchRequest{
+	result, err := client.Legacy().Search(context.Background(), &LegacySearchRequest{AllowStreaming: true, Req: &internalpb.SearchRequest{
 		CollectionID:     100,
 		ConsistencyLevel: commonpb.ConsistencyLevel_Bounded,
 		Nq:               1,
@@ -303,7 +293,7 @@ func TestLegacyClientSearchDoesNotRetryIteratorAfterFirstFinalChunk(t *testing.T
 		},
 	)
 
-	result, err := client.Legacy().Search(context.Background(), &LegacySearchRequest{Req: &internalpb.SearchRequest{
+	result, err := client.Legacy().Search(context.Background(), &LegacySearchRequest{AllowStreaming: true, Req: &internalpb.SearchRequest{
 		CollectionID:     100,
 		ConsistencyLevel: commonpb.ConsistencyLevel_Bounded,
 		Nq:               1,

@@ -39,6 +39,8 @@ type LegacySearchRequest struct {
 	// BarrierMVCC fixes a scalar snapshot and actively establishes WAL coverage.
 	// Mutually exclusive with MVCC. Zero preserves ordinary consistency sampling.
 	BarrierMVCC uint64
+	// AllowStreaming enables streaming reduction for supported Search requests.
+	AllowStreaming bool
 }
 
 type LegacySearchResult struct {
@@ -170,25 +172,8 @@ func newLegacyClient(
 	}
 }
 
-func supportsSearchStream(req *internalpb.SearchRequest) bool {
-	if req == nil ||
-		req.GetIsAdvanced() ||
-		len(req.GetSubReqs()) > 0 ||
-		req.GetGroupByFieldId() > 0 ||
-		len(req.GetGroupByFieldIds()) > 0 {
-		return false
-	}
-
-	if req.GetIsIterator() {
-		return true
-	}
-
-	return req.GetSearchType() == internalpb.SearchType_PURE_ANN_SEARCH_NO_FILTER ||
-		req.GetSearchType() == internalpb.SearchType_PURE_ANN_SEARCH_WITH_FILTER
-}
-
 func (c *legacyClient) Search(ctx context.Context, req *LegacySearchRequest) (*LegacySearchResult, error) {
-	if c.enableSearchStreaming && supportsSearchStream(req.Req) {
+	if c.enableSearchStreaming && req.AllowStreaming {
 		return c.searchStream(ctx, req)
 	}
 
