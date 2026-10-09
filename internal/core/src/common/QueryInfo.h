@@ -26,6 +26,8 @@
 
 namespace milvus {
 
+enum class StrictGroupStrategy { Original, PerGroup };
+
 struct SearchIteratorV2Info {
     std::string token = "";
     uint32_t batch_size = 0;
@@ -40,14 +42,18 @@ struct BruteForceIndexParams {
     std::optional<float> bm25_b_;
     std::optional<int64_t> minhash_lsh_band_;
     std::optional<int64_t> minhash_element_bit_width_;
+    int64_t mrl_dim_{-1};
+    bool with_mrl_refine_{false};
 };
 
 struct SearchInfo {
     int64_t topk_{0};
     int64_t group_size_{1};
     bool strict_group_size_{false};
-    double strict_group_acceptance_threshold_{0.1};
-    int64_t strict_group_probe_candidates_{100};
+    StrictGroupStrategy strict_group_strategy_{StrictGroupStrategy::PerGroup};
+    int64_t strict_group_phase1_candidate_weight_{0};
+    bool strict_group_skip_refine_{false};
+
     int64_t round_decimal_{0};
     FieldId field_id_;
     MetricType metric_type_;

@@ -1440,7 +1440,8 @@ getCellDataType(bool is_vector, bool is_index) {
 void
 LoadIndexData(milvus::tracer::TraceContext& ctx,
               milvus::segcore::LoadIndexInfo* load_index_info,
-              milvus::OpContext* op_ctx) {
+              milvus::OpContext* op_ctx,
+              knowhere::ViewDataOp view_data) {
     auto& index_params = load_index_info->index_params;
     auto field_type = load_index_info->field_type;
     auto engine_version = load_index_info->index_engine_version;
@@ -1449,12 +1450,20 @@ LoadIndexData(milvus::tracer::TraceContext& ctx,
     index_info.field_type = load_index_info->field_type;
     index_info.field_name = load_index_info->schema.name();
     index_info.index_engine_version = engine_version;
+    index_info.dim = load_index_info->dim;
 
     auto config = milvus::index::ParseConfigFromIndexParams(
         load_index_info->index_params);
     auto load_priority_str = config[milvus::LOAD_PRIORITY].get<std::string>();
     auto priority_for_load = milvus::PriorityForLoad(load_priority_str);
     config[milvus::LOAD_PRIORITY] = priority_for_load;
+    index_info.mrl_dim =
+        milvus::index::GetValueFromConfig<int64_t>(config, MRL_DIM_KEY)
+            .value_or(-1);
+    index_info.with_mrl_refine =
+        milvus::index::GetValueFromConfig<bool>(config, WITH_MRL_REFINE_KEY)
+            .value_or(false);
+    index_info.view_data = std::move(view_data);
 
     // Config should have value for milvus::index::SCALAR_INDEX_ENGINE_VERSION for production calling chain.
     // Use value_or(1) for unit test without setting this value
@@ -1480,24 +1489,31 @@ LoadIndexData(milvus::tracer::TraceContext& ctx,
         load_index_info->index_id,
         load_index_info->mmap_dir_path);
     // get index type
-    AssertInfo(index_params.find("index_type") != index_params.end(),
-               "index type is empty");
+    if (!(index_params.find("index_type") != index_params.end())) {
+        ThrowInfo(ErrorCode::DataFormatBroken, "index type is empty");
+    }
     index_info.index_type = index_params.at("index_type");
 
     // get metric type
     if (milvus::IsVectorDataType(field_type)) {
-        AssertInfo(index_params.find("metric_type") != index_params.end(),
-                   "metric type is empty for vector index");
+        if (!(index_params.find("metric_type") != index_params.end())) {
+            ThrowInfo(ErrorCode::DataFormatBroken,
+                      "metric type is empty for vector index");
+        }
         index_info.metric_type = index_params.at("metric_type");
     }
 
     if (index_info.index_type == milvus::index::NGRAM_INDEX_TYPE) {
-        AssertInfo(
-            index_params.find(milvus::index::MIN_GRAM) != index_params.end(),
-            "min_gram is empty for ngram index");
-        AssertInfo(
-            index_params.find(milvus::index::MAX_GRAM) != index_params.end(),
-            "max_gram is empty for ngram index");
+        if (!(index_params.find(milvus::index::MIN_GRAM) !=
+              index_params.end())) {
+            ThrowInfo(ErrorCode::DataFormatBroken,
+                      "min_gram is empty for ngram index");
+        }
+        if (!(index_params.find(milvus::index::MAX_GRAM) !=
+              index_params.end())) {
+            ThrowInfo(ErrorCode::DataFormatBroken,
+                      "max_gram is empty for ngram index");
+        }
 
         // get min_gram and max_gram and convert to uintptr_t
         milvus::index::NgramParams ngram_params{};

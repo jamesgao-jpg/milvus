@@ -78,8 +78,18 @@ FilterValidDataDiskFileSlices(const std::vector<std::string>& files) {
 inline std::vector<std::string>
 GetCacheFilesForDiskIndexLoad(const std::vector<std::string>& index_files,
                               bool load_index_with_stream) {
-    return load_index_with_stream ? FilterValidDataDiskFileSlices(index_files)
-                                  : index_files;
+    if (!load_index_with_stream) {
+        return index_files;
+    }
+    auto files = FilterValidDataDiskFileSlices(index_files);
+    for (const auto& file : index_files) {
+        const auto name = file.substr(file.find_last_of('/') + 1);
+        if (name.starts_with(MRL_META_FILE + "_") ||
+            name.starts_with(MRL_REFINE_STATE_FILE + "_")) {
+            files.emplace_back(file);
+        }
+    }
+    return files;
 }
 
 inline bool
@@ -262,12 +272,16 @@ GenIdMapDatasetFromValidData(knowhere::IdMap& id_map,
 
 inline void
 FinalizeRestoredIdMap(knowhere::IndexNode* index_node,
-                      ErrorCode error_code,
                       const std::string& context) {
     AssertInfo(index_node != nullptr, "index node is null");
     auto stat = index_node->FinalizeIdMap();
     if (stat != knowhere::Status::success) {
-        ThrowInfo(error_code,
+        // Route the knowhere status through the shared mapper rather than
+        // taking a fixed code from the caller: every caller passed
+        // UnexpectedError, which discarded the retriability verdict knowhere
+        // had already made (e.g. malloc_error -> retriable MemAllocateFailed)
+        // and left the failure in the "unclassified internal bug" bucket.
+        ThrowInfo(KnowhereStatusToErrorCode(stat),
                   "failed to finalize id map for {}, {}",
                   context,
                   KnowhereStatusString(stat));
