@@ -233,7 +233,7 @@ func assertRetainedInputBound(t *testing.T, stream *OrderedReduceStream) retaine
 		}
 	}
 
-	require.LessOrEqual(t, stats.chunks, len(stream.childStreams))
+	require.LessOrEqual(t, stats.chunks, len(stream.childBuffers))
 	return stats
 }
 

@@ -61,10 +61,8 @@ func (c *legacyOnlyClient) Legacy() LegacyClient {
 type legacyClient struct {
 	shardClient            *shardViewQueryClient
 	shardResolver          resolver.ShardResolver
-	enableSearchStreaming  bool
-	searchStreamChunkBytes int
-	enableQueryStreaming   bool
-	queryStreamChunkBytes  int
+	enableReduceStream     bool
+	reduceStreamChunkBytes int
 }
 
 type prefetchedReduceStream struct {
@@ -139,24 +137,19 @@ func newLegacyClient(
 	if cfg.MaxRetries <= 0 {
 		cfg.MaxRetries = defaultMaxRetries
 	}
-	if cfg.SearchStreamChunkBytes <= 0 {
-		cfg.SearchStreamChunkBytes = defaultStreamChunkBytes
-	}
-	if cfg.QueryStreamChunkBytes <= 0 {
-		cfg.QueryStreamChunkBytes = defaultStreamChunkBytes
+	if cfg.ReduceStreamChunkBytes <= 0 {
+		cfg.ReduceStreamChunkBytes = defaultStreamChunkBytes
 	}
 	return &legacyClient{
 		shardClient:            newShardViewQueryClient(cfg.MaxRetries, queryPlanClient, queryServiceClient),
 		shardResolver:          shardResolver,
-		enableSearchStreaming:  cfg.EnableSearchStreaming,
-		searchStreamChunkBytes: cfg.SearchStreamChunkBytes,
-		enableQueryStreaming:   cfg.EnableQueryStreaming,
-		queryStreamChunkBytes:  cfg.QueryStreamChunkBytes,
+		enableReduceStream:     cfg.EnableReduceStream,
+		reduceStreamChunkBytes: cfg.ReduceStreamChunkBytes,
 	}
 }
 
 func (c *legacyClient) Search(ctx context.Context, req *LegacySearchRequest) (*LegacySearchResult, error) {
-	if c.enableSearchStreaming && req.AllowStreaming {
+	if c.enableReduceStream && req.AllowStreaming {
 		searchutil.SearchBenchmarkMetricsFromContext(ctx).SetMode("streaming")
 		return c.searchStream(ctx, req)
 	}
@@ -208,7 +201,7 @@ func (c *legacyClient) searchStream(ctx context.Context, req *LegacySearchReques
 		for i := range vchannels {
 			i := i
 			g.Go(func() error {
-				stream, plan, err := c.shardClient.SearchStream(ctx, vchannels[i], req.Req, c.searchStreamChunkBytes)
+				stream, plan, err := c.shardClient.SearchStream(ctx, vchannels[i], req.Req, c.reduceStreamChunkBytes)
 				if err != nil {
 					return err
 				}
@@ -231,7 +224,7 @@ func (c *legacyClient) searchStream(ctx context.Context, req *LegacySearchReques
 			continue
 		}
 
-		finalStream, err := searchutil.NewReduceStream(req.Req, vchannelStreams, c.searchStreamChunkBytes)
+		finalStream, err := searchutil.NewReduceStream(req.Req, vchannelStreams, c.reduceStreamChunkBytes)
 		if err != nil {
 			for _, stream := range vchannelStreams {
 				err = errors.Join(err, stream.Close())
@@ -271,7 +264,7 @@ func (c *legacyClient) searchStream(ctx context.Context, req *LegacySearchReques
 }
 
 func (c *legacyClient) Query(ctx context.Context, req *LegacyQueryRequest) (*LegacyQueryResult, error) {
-	if c.enableQueryStreaming && supportsQueryStream(req.Req) {
+	if c.enableReduceStream && supportsQueryStream(req.Req) {
 		return c.queryStream(ctx, req)
 	}
 	vchannels, err := c.shardResolver.ResolveVChannels(ctx, req.Req.CollectionID)
@@ -329,7 +322,7 @@ func (c *legacyClient) queryStream(ctx context.Context, req *LegacyQueryRequest)
 		for i := range vchannels {
 			i := i
 			group.Go(func() error {
-				stream, plan, err := c.shardClient.QueryStream(ctx, vchannels[i], req.Req, c.queryStreamChunkBytes)
+				stream, plan, err := c.shardClient.QueryStream(ctx, vchannels[i], req.Req, c.reduceStreamChunkBytes)
 				if err != nil {
 					return err
 				}
@@ -351,7 +344,7 @@ func (c *legacyClient) queryStream(ctx context.Context, req *LegacyQueryRequest)
 			continue
 		}
 
-		finalStream, err := queryutil.NewReduceStream(req.Req, vchannelStreams, c.queryStreamChunkBytes)
+		finalStream, err := queryutil.NewReduceStream(req.Req, vchannelStreams, c.reduceStreamChunkBytes)
 		if err != nil {
 			for _, stream := range vchannelStreams {
 				err = errors.Join(err, stream.Close())
