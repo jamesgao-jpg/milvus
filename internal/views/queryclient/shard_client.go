@@ -139,110 +139,93 @@ func (s *shardViewQueryClient) SearchStream(
 	chunkBytes int,
 ) (searchutil.ReduceStream, *ShardPlan, error) {
 	if req == nil {
-		return nil, nil, errors.New("SearchStream requires a Search request")
+		return nil, nil, merr.WrapErrServiceInternalMsg("SearchStream requires a Search request")
+	}
+	if ctx.Err() != nil {
+		return nil, nil, ctx.Err()
 	}
 
-	var lastErr error
-	for attempt := 0; attempt < s.maxRetries; attempt++ {
-		if ctx.Err() != nil {
-			return nil, nil, ctx.Err()
-		}
+	targetShardID := qviews.ShardID{ReplicaID: qviews.UnknownReplicaID, VChannel: vchannel}
+	planReq := &viewpb.GetQueryPlanRequest{
+		CollectionId: req.GetCollectionID(),
+		ShardId:      targetShardID.IntoProto(),
+		PartitionIds: req.GetPartitionIDs(),
+		Request: &viewpb.GetQueryPlanRequest_LegacySearchRequest{
+			LegacySearchRequest: req,
+		},
+	}
+	plan, err := s.executeGetQueryPlan(ctx, targetShardID, planReq, &shardExecParams{
+		consistencyLevel: req.GetConsistencyLevel(),
+	})
+	if err != nil {
+		return nil, nil, err
+	}
 
-		targetShardID := qviews.ShardID{ReplicaID: qviews.UnknownReplicaID, VChannel: vchannel}
-
-		planReq := &viewpb.GetQueryPlanRequest{
-			CollectionId: req.GetCollectionID(),
-			ShardId:      targetShardID.IntoProto(),
-			PartitionIds: req.GetPartitionIDs(),
-			Request: &viewpb.GetQueryPlanRequest_LegacySearchRequest{
-				LegacySearchRequest: req,
-			},
+	shardID := qviews.FromProtoShardID(plan.ShardId)
+	workNodes := workNodesFromPlan(plan)
+	if mlog.LevelEnabled(mlog.DebugLevel) {
+		queryNodeIDs := make([]int64, 0, len(workNodes))
+		streamingNodePresent := false
+		for _, workNode := range workNodes {
+			switch node := workNode.(type) {
+			case qviews.QueryNode:
+				queryNodeIDs = append(queryNodeIDs, node.ID)
+			case qviews.StreamingNode:
+				streamingNodePresent = true
+			}
 		}
-		plan, err := s.executeGetQueryPlan(ctx, targetShardID, planReq, &shardExecParams{
-			consistencyLevel: req.GetConsistencyLevel(),
+		mlog.Debug(ctx, "query view work nodes selected",
+			mlog.FieldVChannel(vchannel),
+			mlog.Int64("replicaID", shardID.ReplicaID),
+			mlog.Int64s("queryNodeIDs", queryNodeIDs),
+			mlog.Bool("streamingNodePresent", streamingNodePresent),
+			mlog.Int("workNodeCount", len(workNodes)),
+		)
+	}
+	childStreams := make([]searchutil.ReduceStream, 0, len(workNodes))
+	for _, node := range workNodes {
+		rpcCtx, _ := withSearchBenchmarkChild(ctx, node, vchannel, "streaming")
+		childStream, openErr := s.queryServiceClient.SearchOnViewStream(rpcCtx, node, &viewpb.SearchOnViewRequest{
+			LegacyReq:        legacySearchRequestForNode(plan, node),
+			ShardId:          shardID.IntoProto(),
+			Version:          plan.Version,
+			Mvcc:             plan.GetMvcc(),
+			StreamChunkBytes: int64(chunkBytes),
 		})
-		if err != nil {
-			if ve := viewerror.AsViewError(err); ve != nil && ve.IsRetryable() {
-				lastErr = err
-				continue
-			}
-			return nil, nil, err
+		if openErr != nil {
+			err = openErr
+			break
 		}
-
-		shardID := qviews.FromProtoShardID(plan.ShardId)
-		workNodes := workNodesFromPlan(plan)
-		if mlog.LevelEnabled(mlog.DebugLevel) {
-			queryNodeIDs := make([]int64, 0, len(workNodes))
-			streamingNodePresent := false
-			for _, workNode := range workNodes {
-				switch node := workNode.(type) {
-				case qviews.QueryNode:
-					queryNodeIDs = append(queryNodeIDs, node.ID)
-				case qviews.StreamingNode:
-					streamingNodePresent = true
-				}
-			}
-			mlog.Debug(ctx, "query view work nodes selected",
-				mlog.FieldVChannel(vchannel),
-				mlog.Int64("replicaID", shardID.ReplicaID),
-				mlog.Int64s("queryNodeIDs", queryNodeIDs),
-				mlog.Bool("streamingNodePresent", streamingNodePresent),
-				mlog.Int("workNodeCount", len(workNodes)),
-			)
+		if childStream == nil {
+			err = merr.WrapErrServiceInternalMsg("SearchOnViewStream returned a nil stream for work node %s", node.String())
+			break
 		}
-		childStreams := make([]searchutil.ReduceStream, 0, len(workNodes))
-		for _, node := range workNodes {
-			rpcCtx, _ := withSearchBenchmarkChild(ctx, node, vchannel, "streaming")
-			childStream, openErr := s.queryServiceClient.SearchOnViewStream(rpcCtx, node, &viewpb.SearchOnViewRequest{
-				LegacyReq:        legacySearchRequestForNode(plan, node),
-				ShardId:          shardID.IntoProto(),
-				Version:          plan.Version,
-				Mvcc:             plan.GetMvcc(),
-				StreamChunkBytes: int64(chunkBytes),
-			})
-			if openErr != nil {
-				err = openErr
-				break
-			}
-			if childStream == nil {
-				err = merr.WrapErrServiceInternalMsg("SearchOnViewStream returned a nil stream for work node %s", node.String())
-				break
-			}
-			childStreams = append(childStreams, childStream)
-		}
-		if err != nil {
-			for _, childStream := range childStreams {
-				err = errors.Join(err, childStream.Close())
-			}
-			if ctx.Err() != nil {
-				return nil, nil, ctx.Err()
-			}
-			if ve := viewerror.AsViewError(err); ve != nil && ve.IsRetryable() {
-				lastErr = err
-				continue
-			}
-			return nil, nil, err
-		}
-
-		reducedStream, err := searchutil.NewReduceStream(req, childStreams, chunkBytes)
-		if err != nil {
-			for _, childStream := range childStreams {
-				err = errors.Join(err, childStream.Close())
-			}
-			return nil, nil, err
-		}
-
-		return &vchannelReduceStream{
-				stream:  reducedStream,
-				metrics: searchutil.SearchBenchmarkMetricsFromContext(ctx),
-			}, &ShardPlan{
-				ShardID:   shardID,
-				Version:   plan.Version,
-				Mvcc:      plan.GetMvcc(),
-				WorkNodes: workNodes,
-			}, nil
+		childStreams = append(childStreams, childStream)
 	}
-	return nil, nil, lastErr
+	if err != nil {
+		for _, childStream := range childStreams {
+			err = errors.Join(err, childStream.Close())
+		}
+		return nil, nil, err
+	}
+
+	reducedStream, err := searchutil.NewReduceStream(req, childStreams, chunkBytes)
+	if err != nil {
+		for _, childStream := range childStreams {
+			err = errors.Join(err, childStream.Close())
+		}
+		return nil, nil, err
+	}
+
+	return &vchannelReduceStream{
+			stream:  reducedStream,
+			metrics: searchutil.SearchBenchmarkMetricsFromContext(ctx),
+		}, &ShardPlan{
+			ShardID:   shardID,
+			Version:   plan.Version,
+			Mvcc:      plan.GetMvcc(),
+			WorkNodes: workNodes,
+		}, nil
 }
 
 func withSearchBenchmarkChild(ctx context.Context, node qviews.WorkNode, vchannel, mode string) (context.Context, *searchutil.SearchBenchmarkMetrics) {
@@ -305,100 +288,85 @@ func (s *shardViewQueryClient) QueryStream(
 		return nil, nil, merr.WrapErrServiceInternalMsg("QueryStream requires a Query request")
 	}
 
-	var lastErr error
-	for attempt := 0; attempt < s.maxRetries; attempt++ {
-		if ctx.Err() != nil {
-			return nil, nil, ctx.Err()
-		}
-		targetShardID := qviews.ShardID{ReplicaID: qviews.UnknownReplicaID, VChannel: vchannel}
-		planReq := &viewpb.GetQueryPlanRequest{
-			CollectionId: req.GetCollectionID(),
-			ShardId:      targetShardID.IntoProto(),
-			PartitionIds: req.GetPartitionIDs(),
-			Request: &viewpb.GetQueryPlanRequest_LegacyRetrieveRequest{
-				LegacyRetrieveRequest: req,
-			},
-		}
-		plan, err := s.executeGetQueryPlan(ctx, targetShardID, planReq, &shardExecParams{
-			consistencyLevel: req.GetConsistencyLevel(),
-		})
-		if err != nil {
-			if ve := viewerror.AsViewError(err); ve != nil && ve.IsRetryable() {
-				lastErr = err
-				continue
-			}
-			return nil, nil, err
-		}
-
-		shardID := qviews.FromProtoShardID(plan.ShardId)
-		workNodes := workNodesFromPlan(plan)
-		if mlog.LevelEnabled(mlog.DebugLevel) {
-			queryNodeIDs := make([]int64, 0, len(workNodes))
-			streamingNodePresent := false
-			for _, workNode := range workNodes {
-				switch node := workNode.(type) {
-				case qviews.QueryNode:
-					queryNodeIDs = append(queryNodeIDs, node.ID)
-				case qviews.StreamingNode:
-					streamingNodePresent = true
-				}
-			}
-			mlog.Debug(ctx, "query view work nodes selected",
-				mlog.FieldVChannel(vchannel),
-				mlog.Int64("replicaID", shardID.ReplicaID),
-				mlog.Int64s("queryNodeIDs", queryNodeIDs),
-				mlog.Bool("streamingNodePresent", streamingNodePresent),
-				mlog.Int("workNodeCount", len(workNodes)),
-			)
-		}
-		childStreams := make([]queryutil.ReduceStream, 0, len(workNodes))
-		for _, node := range workNodes {
-			childStream, openErr := s.queryServiceClient.QueryOnViewStream(ctx, node, &viewpb.QueryOnViewRequest{
-				LegacyReq:        legacyRetrieveRequestForNode(plan, node),
-				ShardId:          shardID.IntoProto(),
-				Version:          plan.Version,
-				Mvcc:             plan.GetMvcc(),
-				StreamChunkBytes: int64(chunkBytes),
-			})
-			if openErr != nil {
-				err = openErr
-				break
-			}
-			if childStream == nil {
-				err = merr.WrapErrServiceInternalMsg("QueryOnViewStream returned a nil stream for work node %s", node.String())
-				break
-			}
-			childStreams = append(childStreams, childStream)
-		}
-		if err != nil {
-			for _, childStream := range childStreams {
-				err = errors.Join(err, childStream.Close())
-			}
-			if ctx.Err() != nil {
-				return nil, nil, ctx.Err()
-			}
-			if ve := viewerror.AsViewError(err); ve != nil && ve.IsRetryable() {
-				lastErr = err
-				continue
-			}
-			return nil, nil, err
-		}
-
-		reducedStream, err := queryutil.NewReduceStream(req, childStreams, chunkBytes)
-		if err != nil {
-			for _, childStream := range childStreams {
-				err = errors.Join(err, childStream.Close())
-			}
-			return nil, nil, err
-		}
-		return reducedStream, &ShardPlan{
-			ShardID:   shardID,
-			Version:   plan.Version,
-			Mvcc:      plan.GetMvcc(),
-			WorkNodes: workNodes,
-		}, nil
+	if ctx.Err() != nil {
+		return nil, nil, ctx.Err()
 	}
-	return nil, nil, lastErr
+	targetShardID := qviews.ShardID{ReplicaID: qviews.UnknownReplicaID, VChannel: vchannel}
+	planReq := &viewpb.GetQueryPlanRequest{
+		CollectionId: req.GetCollectionID(),
+		ShardId:      targetShardID.IntoProto(),
+		PartitionIds: req.GetPartitionIDs(),
+		Request: &viewpb.GetQueryPlanRequest_LegacyRetrieveRequest{
+			LegacyRetrieveRequest: req,
+		},
+	}
+	plan, err := s.executeGetQueryPlan(ctx, targetShardID, planReq, &shardExecParams{
+		consistencyLevel: req.GetConsistencyLevel(),
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	shardID := qviews.FromProtoShardID(plan.ShardId)
+	workNodes := workNodesFromPlan(plan)
+	if mlog.LevelEnabled(mlog.DebugLevel) {
+		queryNodeIDs := make([]int64, 0, len(workNodes))
+		streamingNodePresent := false
+		for _, workNode := range workNodes {
+			switch node := workNode.(type) {
+			case qviews.QueryNode:
+				queryNodeIDs = append(queryNodeIDs, node.ID)
+			case qviews.StreamingNode:
+				streamingNodePresent = true
+			}
+		}
+		mlog.Debug(ctx, "query view work nodes selected",
+			mlog.FieldVChannel(vchannel),
+			mlog.Int64("replicaID", shardID.ReplicaID),
+			mlog.Int64s("queryNodeIDs", queryNodeIDs),
+			mlog.Bool("streamingNodePresent", streamingNodePresent),
+			mlog.Int("workNodeCount", len(workNodes)),
+		)
+	}
+	childStreams := make([]queryutil.ReduceStream, 0, len(workNodes))
+	for _, node := range workNodes {
+		childStream, openErr := s.queryServiceClient.QueryOnViewStream(ctx, node, &viewpb.QueryOnViewRequest{
+			LegacyReq:        legacyRetrieveRequestForNode(plan, node),
+			ShardId:          shardID.IntoProto(),
+			Version:          plan.Version,
+			Mvcc:             plan.GetMvcc(),
+			StreamChunkBytes: int64(chunkBytes),
+		})
+		if openErr != nil {
+			err = openErr
+			break
+		}
+		if childStream == nil {
+			err = merr.WrapErrServiceInternalMsg("QueryOnViewStream returned a nil stream for work node %s", node.String())
+			break
+		}
+		childStreams = append(childStreams, childStream)
+	}
+	if err != nil {
+		for _, childStream := range childStreams {
+			err = errors.Join(err, childStream.Close())
+		}
+		return nil, nil, err
+	}
+
+	reducedStream, err := queryutil.NewReduceStream(req, childStreams, chunkBytes)
+	if err != nil {
+		for _, childStream := range childStreams {
+			err = errors.Join(err, childStream.Close())
+		}
+		return nil, nil, err
+	}
+	return reducedStream, &ShardPlan{
+		ShardID:   shardID,
+		Version:   plan.Version,
+		Mvcc:      plan.GetMvcc(),
+		WorkNodes: workNodes,
+	}, nil
 }
 
 // ============================================================================

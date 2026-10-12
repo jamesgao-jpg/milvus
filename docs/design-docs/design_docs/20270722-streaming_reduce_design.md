@@ -289,6 +289,54 @@ on server receives interruptRequest:
 | Metadata protobuf | Aggregated existing Query/Search metadata without additional result rows or hits. |
 | Error | Child interruption, metadata receive, metadata aggregation, or cleanup failed. |
 
+##### Retry Ownership
+
+Each `ReduceStream` represents one complete execution attempt. It does not
+resume itself or create a replacement stream. Proxy `Execute()` owns creation
+and consumption of the final `ReduceStream`, so no internal Chunk is committed
+to the SDK response before the attempt succeeds.
+
+```text
+Execute():
+    for each allowed attempt:
+        output = empty response
+        reducedStream = create a new final ReduceStream
+
+        while Search still needs topK Units
+           or Query has not reached EOF:
+            CHUNK = reducedStream.Recv()
+
+            if CHUNK is EOF:
+                break
+
+            if CHUNK is error:
+                originalError = CHUNK.error
+                closeError = reducedStream.Close()
+
+                if originalError is a retryable ViewError:
+                    discard output and metadata from this attempt
+                    retry from vchannel resolution and QueryPlan creation
+
+                return combine(originalError, closeError)
+
+            output.append(CHUNK)
+
+        reducedStream.Close()
+        return output
+```
+
+Application retry uses the existing `ViewError.IsRetryable()` classification:
+`VIEW_INVALIDATED`, `VIEW_NOT_FOUND`, `ON_SHUTDOWN`, and `NOT_PRIMARY` are
+retryable. Raw gRPC `UNAVAILABLE` without a `ViewError`, cancellation, deadline
+expiration, and all other errors do not trigger QueryView re-planning. The
+original receive error is classified before it is combined with cleanup
+errors.
+
+Rows and metadata from different attempts are never combined. Search succeeds
+when the requested topK is complete or the stream reaches `EOF`; reaching topK
+does not require consuming unused child input. Query succeeds after `EOF`.
+`PostExecute()` receives only output committed by a successful attempt.
+
 ### 4.2 ReduceStream Implementations by Reduction Strategy
 
 The implementation classifications below describe reduction behavior. During

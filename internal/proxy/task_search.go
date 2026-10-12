@@ -34,6 +34,7 @@ import (
 	"github.com/milvus-io/milvus/internal/util/segcore"
 	"github.com/milvus-io/milvus/internal/util/shallowcopy"
 	"github.com/milvus-io/milvus/internal/views/queryclient"
+	"github.com/milvus-io/milvus/internal/views/viewerror"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
@@ -93,7 +94,8 @@ type searchTask struct {
 	userDynamicFields      []string
 	highlighter            Highlighter
 	resultBuf              *typeutil.ConcurrentSet[*internalpb.SearchResults]
-	resultStream           searchutil.ReduceStream
+	reducedResult          *milvuspb.SearchResults
+	reducedMetricType      string
 	searchBenchmarkMetrics *searchutil.SearchBenchmarkMetrics
 
 	partitionIDsSet *typeutil.ConcurrentSet[UniqueID]
@@ -1327,31 +1329,99 @@ func (t *searchTask) Execute(ctx context.Context) error {
 	return nil
 }
 
-func (t *searchTask) executeByQueryView(ctx context.Context) error {
+func (t *searchTask) executeByQueryView(ctx context.Context) (retErr error) {
 	if t.searchBenchmarkMetrics == nil {
 		t.searchBenchmarkMetrics = searchutil.NewSearchBenchmarkMetrics(typeutil.ProxyRole, "", t.SearchRequest.GetReqID())
 	}
 	ctx = searchutil.WithSearchBenchmarkMetrics(ctx, t.searchBenchmarkMetrics)
-	result, err := t.viewQueryClient.Legacy().Search(ctx, &queryclient.LegacySearchRequest{
-		Req:            t.SearchRequest,
-		AllowStreaming: t.supportsStreamingReduce(),
-	})
-	if err != nil {
-		t.searchBenchmarkMetrics.Finish(ctx, err)
-		t.searchBenchmarkMetrics = nil
-		return err
-	}
+	defer func() {
+		if retErr != nil {
+			t.searchBenchmarkMetrics.Finish(ctx, retErr)
+			t.searchBenchmarkMetrics = nil
+		}
+	}()
 	if t.resultBuf == nil {
 		t.resultBuf = typeutil.NewConcurrentSet[*internalpb.SearchResults]()
 	}
-	if result.Stream != nil {
-		t.resultStream = result.Stream
+
+	legacy := t.viewQueryClient.Legacy()
+	allowStreaming := t.supportsStreamingReduce()
+	retryStreaming := allowStreaming && legacy.ReduceStreamEnabled()
+	maxAttempts := 1
+	if retryStreaming {
+		maxAttempts = max(1, legacy.MaxRetries())
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		result, err := legacy.Search(ctx, &queryclient.LegacySearchRequest{
+			Req:            t.SearchRequest,
+			AllowStreaming: allowStreaming,
+		})
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if retryStreaming && viewerror.AsViewError(err).IsRetryable() {
+				lastErr = err
+				continue
+			}
+			return err
+		}
+		if result == nil {
+			return merr.WrapErrServiceInternalMsg("QueryView Search returned a nil result")
+		}
+		if result.Stream == nil {
+			for _, searchResult := range result.Results {
+				t.resultBuf.Insert(searchResult)
+			}
+			return nil
+		}
+
+		queryChannelsTs := make(map[string]uint64)
+		var relatedDataSize int64
+		var isTopkReduce, isRecallEvaluation bool
+		storageCost := segcore.StorageCost{}
+		metricType := t.GetMetricType()
+		collectMetadata := func(r *internalpb.SearchResults) {
+			isTopkReduce = isTopkReduce || r.GetIsTopkReduce()
+			isRecallEvaluation = isRecallEvaluation || r.GetIsRecallEvaluation()
+			relatedDataSize += r.GetCostAggregation().GetTotalRelatedDataSize()
+			for channel, timestamp := range r.GetChannelsMvcc() {
+				queryChannelsTs[channel] = timestamp
+			}
+			storageCost.ScannedRemoteBytes += r.GetScannedRemoteBytes()
+			storageCost.ScannedTotalBytes += r.GetScannedTotalBytes()
+		}
+
+		reducedResult, reducedMetricType, recvErr := t.consumeResultStream(result.Stream, metricType, collectMetadata)
+		retryable := recvErr != nil && viewerror.AsViewError(recvErr).IsRetryable()
+		closeErr := result.Stream.Close()
+		if recvErr != nil {
+			attemptErr := merr.Combine(recvErr, closeErr)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if retryable {
+				lastErr = attemptErr
+				continue
+			}
+			return attemptErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+
+		t.reducedResult = reducedResult
+		t.reducedMetricType = reducedMetricType
+		t.queryChannelsTs = queryChannelsTs
+		t.relatedDataSize = relatedDataSize
+		t.isTopkReduce = isTopkReduce
+		t.isRecallEvaluation = isRecallEvaluation
+		t.storageCost = storageCost
 		return nil
 	}
-	for _, searchResult := range result.Results {
-		t.resultBuf.Insert(searchResult)
-	}
-	return nil
+	return lastErr
 }
 
 func (t *searchTask) supportsStreamingReduce() bool {
@@ -1495,7 +1565,7 @@ func (t *searchTask) consumeResultStream(
 ) (*milvuspb.SearchResults, string, error) {
 	limit := t.GetTopk() - t.GetOffset()
 	if limit <= 0 {
-		return nil, metricType, merr.Combine(fmt.Errorf("invalid final Search limit %d", limit), stream.Close())
+		return nil, metricType, merr.WrapErrServiceInternalMsg("invalid final Search limit %d", limit)
 	}
 
 	data := &schemapb.SearchResultData{
@@ -1508,15 +1578,18 @@ func (t *searchTask) consumeResultStream(
 	seenPerQuery := make([]int64, t.GetNq())
 	var resultSize int64
 	for {
+		recvStartedAt := time.Now()
 		chunk, recvErr := stream.Recv()
+		t.searchBenchmarkMetrics.AddFinalReduceDuration(time.Since(recvStartedAt))
 		if errors.Is(recvErr, io.EOF) {
 			break
 		}
 		if recvErr != nil {
-			return nil, metricType, merr.Combine(recvErr, stream.Close())
+			return nil, metricType, recvErr
 		}
+		t.searchBenchmarkMetrics.RecordFirstFinalChunk()
 		if chunk == nil || chunk.GetResultData() == nil {
-			return nil, metricType, merr.Combine(errors.New("final ReduceStream returned a CHUNK without result data"), stream.Close())
+			return nil, metricType, merr.WrapErrServiceInternalMsg("final ReduceStream returned a CHUNK without result data")
 		}
 
 		collectMetadata(chunk)
@@ -1534,14 +1607,12 @@ func (t *searchTask) consumeResultStream(
 		)
 		t.searchBenchmarkMetrics.AddFinalResponseDuration(time.Since(appendStartedAt))
 		if appendErr != nil {
-			return nil, metricType, merr.Combine(appendErr, stream.Close())
+			return nil, metricType, appendErr
 		}
 		resultSize += appendedSize
 		if resultSize > paramtable.Get().QuotaConfig.MaxOutputSize.GetAsInt64() {
-			return nil, metricType, merr.Combine(
-				merr.WrapErrParameterInvalidMsg("search results exceed the maxOutputSize Limit %d", paramtable.Get().QuotaConfig.MaxOutputSize.GetAsInt64()),
-				stream.Close(),
-			)
+			return nil, metricType, merr.WrapErrParameterInvalidMsg(
+				"search results exceed the maxOutputSize Limit %d", paramtable.Get().QuotaConfig.MaxOutputSize.GetAsInt64())
 		}
 
 		complete := true
@@ -1554,9 +1625,6 @@ func (t *searchTask) consumeResultStream(
 		if complete {
 			break
 		}
-	}
-	if closeErr := stream.Close(); closeErr != nil {
-		return nil, metricType, closeErr
 	}
 	if len(data.GetTopks()) > 0 {
 		data.TopK = data.GetTopks()[len(data.GetTopks())-1]
@@ -1622,12 +1690,13 @@ func (t *searchTask) PostExecute(ctx context.Context) (err error) {
 	}()
 	log := mlog.With(mlog.Int64("nq", t.GetNq()))
 
-	t.queryChannelsTs = make(map[string]uint64)
-	t.relatedDataSize = 0
-	isTopkReduce := false
-	isRecallEvaluation := false
-	storageCost := segcore.StorageCost{}
-	metricType := t.GetMetricType()
+	isTopkReduce := t.isTopkReduce
+	isRecallEvaluation := t.isRecallEvaluation
+	storageCost := t.storageCost
+	metricType := t.reducedMetricType
+	if metricType == "" {
+		metricType = t.GetMetricType()
+	}
 	collectMetadata := func(r *internalpb.SearchResults) {
 		if r.GetIsTopkReduce() {
 			isTopkReduce = true
@@ -1645,16 +1714,15 @@ func (t *searchTask) PostExecute(ctx context.Context) (err error) {
 
 	var (
 		toReduceResults []*internalpb.SearchResults
-		reducedResult   *milvuspb.SearchResults
+		reducedResult   = t.reducedResult
 	)
-	if t.resultStream != nil {
-		stream := t.resultStream
-		t.resultStream = nil
-		reducedResult, metricType, err = t.consumeResultStream(stream, metricType, collectMetadata)
-		if err != nil {
-			return err
-		}
-	} else {
+	t.reducedResult = nil
+	if reducedResult == nil {
+		t.queryChannelsTs = make(map[string]uint64)
+		t.relatedDataSize = 0
+		isTopkReduce = false
+		isRecallEvaluation = false
+		storageCost = segcore.StorageCost{}
 		toReduceResults, err = t.collectSearchResults(ctx)
 		if err != nil {
 			log.Warn(ctx, "failed to collect search results", mlog.Err(err))

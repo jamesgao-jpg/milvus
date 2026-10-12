@@ -29,6 +29,7 @@ import (
 	"github.com/milvus-io/milvus/internal/util/segcore"
 	"github.com/milvus-io/milvus/internal/util/shallowcopy"
 	"github.com/milvus-io/milvus/internal/views/queryclient"
+	"github.com/milvus-io/milvus/internal/views/viewerror"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
@@ -73,8 +74,7 @@ type queryTask struct {
 	userDynamicFields      []string
 	userAggregates         []agg.AggregateBase
 
-	resultBuf    *typeutil.ConcurrentSet[*internalpb.RetrieveResults]
-	resultStream queryutil.ReduceStream
+	resultBuf *typeutil.ConcurrentSet[*internalpb.RetrieveResults]
 
 	plan             *planpb.PlanNode
 	partitionKeyMode bool
@@ -975,20 +975,59 @@ func (t *queryTask) Execute(ctx context.Context) error {
 }
 
 func (t *queryTask) executeByQueryView(ctx context.Context) error {
-	result, err := t.viewQueryClient.Legacy().Query(ctx, &queryclient.LegacyQueryRequest{
-		Req: t.RetrieveRequest,
-	})
-	if err != nil {
-		return err
+	legacy := t.viewQueryClient.Legacy()
+	retryStreaming := legacy.ReduceStreamEnabled() && queryclient.SupportsQueryStream(t.RetrieveRequest)
+	maxAttempts := 1
+	if retryStreaming {
+		maxAttempts = max(1, legacy.MaxRetries())
 	}
-	if result.Stream != nil {
-		t.resultStream = result.Stream
+
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		result, err := legacy.Query(ctx, &queryclient.LegacyQueryRequest{
+			Req: t.RetrieveRequest,
+		})
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if retryStreaming && viewerror.AsViewError(err).IsRetryable() {
+				lastErr = err
+				continue
+			}
+			return err
+		}
+		if result == nil {
+			return merr.WrapErrServiceInternalMsg("QueryView Query returned a nil result")
+		}
+		if result.Stream == nil {
+			for _, retrieveResult := range result.Results {
+				t.resultBuf.Insert(retrieveResult)
+			}
+			return nil
+		}
+
+		reducedResult, recvErr := t.consumeQueryResultStream(result.Stream)
+		retryable := recvErr != nil && viewerror.AsViewError(recvErr).IsRetryable()
+		closeErr := result.Stream.Close()
+		if recvErr != nil {
+			attemptErr := merr.Combine(recvErr, closeErr)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if retryable {
+				lastErr = attemptErr
+				continue
+			}
+			return attemptErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		t.resultBuf.Insert(reducedResult)
 		return nil
 	}
-	for _, retrieveResult := range result.Results {
-		t.resultBuf.Insert(retrieveResult)
-	}
-	return nil
+	return lastErr
 }
 
 func (t *queryTask) PostExecute(ctx context.Context) error {
@@ -1015,26 +1054,16 @@ func (t *queryTask) PostExecute(ctx context.Context) error {
 		t.totalRelatedDataSize += res.GetCostAggregation().GetTotalRelatedDataSize()
 		log.Debug(ctx, "proxy receives one query result", mlog.Int64("sourceID", res.GetBase().GetSourceID()))
 	}
-	if t.resultStream != nil {
-		stream := t.resultStream
-		t.resultStream = nil
-		result, err := t.consumeQueryResultStream(stream)
-		if err != nil {
-			return err
-		}
-		collectResult(result)
-	} else {
-		select {
-		case <-t.TraceCtx().Done():
-			log.Warn(ctx, "proxy", mlog.Int64("Query: wait to finish failed, timeout!, msgID:", t.ID()))
-			return merr.Wrapf(t.TraceCtx().Err(), "Query wait to finish timeout, msgID=%d", t.ID())
-		default:
-			log.Debug(ctx, "all queries are finished or canceled")
-			t.resultBuf.Range(func(res *internalpb.RetrieveResults) bool {
-				collectResult(res)
-				return true
-			})
-		}
+	select {
+	case <-t.TraceCtx().Done():
+		log.Warn(ctx, "proxy", mlog.Int64("Query: wait to finish failed, timeout!, msgID:", t.ID()))
+		return merr.Wrapf(t.TraceCtx().Err(), "Query wait to finish timeout, msgID=%d", t.ID())
+	default:
+		log.Debug(ctx, "all queries are finished or canceled")
+		t.resultBuf.Range(func(res *internalpb.RetrieveResults) bool {
+			collectResult(res)
+			return true
+		})
 	}
 
 	metrics.ProxyDecodeResultLatency.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), t.getQueryLabel()).Observe(0.0)
@@ -1135,26 +1164,26 @@ func (t *queryTask) consumeQueryResultStream(stream queryutil.ReduceStream) (*in
 			break
 		}
 		if err != nil {
-			return nil, merr.Combine(err, stream.Close())
+			return nil, err
 		}
 		if chunk == nil {
-			return nil, merr.Combine(merr.WrapErrServiceInternalMsg("final Query ReduceStream returned a nil Chunk"), stream.Close())
+			return nil, merr.WrapErrServiceInternalMsg("final Query ReduceStream returned a nil Chunk")
 		}
 		if !merr.Ok(chunk.GetStatus()) {
-			return nil, merr.Combine(merr.Error(chunk.GetStatus()), stream.Close())
+			return nil, merr.Error(chunk.GetStatus())
 		}
 
 		rowCount := typeutil.GetSizeOfIDs(chunk.GetIds())
 		if rowCount > 0 {
 			if len(chunk.GetFieldsData()) == 0 {
-				return nil, merr.Combine(merr.WrapErrServiceInternalMsg("final Query Chunk contains IDs without field data"), stream.Close())
+				return nil, merr.WrapErrServiceInternalMsg("final Query Chunk contains IDs without field data")
 			}
 			if len(output.GetFieldsData()) == 0 {
 				output.FieldsData = typeutil.PrepareResultFieldData(chunk.GetFieldsData(), t.GetLimit())
 			}
 			if len(output.GetFieldsData()) != len(chunk.GetFieldsData()) {
-				return nil, merr.Combine(merr.WrapErrServiceInternalMsg(
-					"final Query Chunk field count %d does not match %d", len(chunk.GetFieldsData()), len(output.GetFieldsData())), stream.Close())
+				return nil, merr.WrapErrServiceInternalMsg(
+					"final Query Chunk field count %d does not match %d", len(chunk.GetFieldsData()), len(output.GetFieldsData()))
 			}
 			indexComputer := typeutil.NewFieldDataIdxComputer(chunk.GetFieldsData())
 			for row := 0; row < rowCount; row++ {
@@ -1163,8 +1192,8 @@ func (t *queryTask) consumeQueryResultStream(stream queryutil.ReduceStream) (*in
 				typeutil.AppendPKs(output.Ids, typeutil.GetPK(chunk.GetIds(), int64(row)))
 			}
 			if outputSize > maxOutputSize {
-				return nil, merr.Combine(merr.WrapErrParameterInvalidMsg(
-					"query results exceed the maxOutputSize Limit %d", maxOutputSize), stream.Close())
+				return nil, merr.WrapErrParameterInvalidMsg(
+					"query results exceed the maxOutputSize Limit %d", maxOutputSize)
 			}
 		}
 
@@ -1189,9 +1218,6 @@ func (t *queryTask) consumeQueryResultStream(stream queryutil.ReduceStream) (*in
 			}
 			output.CostAggregation.TotalRelatedDataSize = totalRelatedDataSize
 		}
-	}
-	if err := stream.Close(); err != nil {
-		return nil, err
 	}
 	return output, nil
 }
