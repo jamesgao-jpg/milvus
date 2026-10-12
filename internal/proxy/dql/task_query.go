@@ -1137,15 +1137,16 @@ func (t *QueryTask) Execute(ctx context.Context) error {
 
 func (t *QueryTask) executeByQueryView(ctx context.Context) error {
 	legacy := t.viewQueryClient.Legacy()
+	allowStreaming := queryclient.SupportsQueryStream(t.RetrieveRequest)
 	request := &queryclient.LegacyQueryRequest{
 		Req: t.RetrieveRequest, Plans: t.queryViewPlans, Schema: t.schema.CollectionSchema,
-		BarrierMVCC: t.MvccTimestamp,
+		BarrierMVCC: t.MvccTimestamp, AllowStreaming: allowStreaming,
 	}
 
 	if t.actualChannelsMvcc != nil {
 		request.ReadProofAfter = t.BeginTs()
 	}
-	retryStreaming := len(t.queryViewPlans) == 0 && legacy.ReduceStreamEnabled() && queryclient.SupportsQueryStream(t.RetrieveRequest)
+	retryStreaming := len(t.queryViewPlans) == 0 && allowStreaming && legacy.ReduceStreamEnabled()
 	maxAttempts := 1
 	if retryStreaming {
 		maxAttempts = max(1, legacy.MaxRetries())
