@@ -107,9 +107,6 @@ func newLegacyClient(
 	if cfg.MaxRetries <= 0 {
 		cfg.MaxRetries = defaultMaxRetries
 	}
-	if cfg.ReduceStreamChunkBytes <= 0 {
-		cfg.ReduceStreamChunkBytes = defaultStreamChunkBytes
-	}
 	return &legacyClient{
 		shardClient:            newShardViewQueryClient(cfg.MaxRetries, queryPlanClient, queryServiceClient),
 		shardResolver:          shardResolver,
