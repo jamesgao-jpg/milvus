@@ -22,10 +22,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 )
 
-const (
-	defaultStreamChunkBytes = 256 * 1024
-	streamFaultEnv          = "MILVUS_REDUCE_STREAM_FAULT"
-)
+const streamFaultEnv = "MILVUS_REDUCE_STREAM_FAULT"
 
 var streamFaultUsed atomic.Bool
 
@@ -176,9 +173,6 @@ func (s *Server) SearchOnViewStream(stream viewpb.ViewQueryService_SearchOnViewS
 		return err
 	}
 	chunkBytes := int(request.GetStreamChunkBytes())
-	if chunkBytes <= 0 {
-		chunkBytes = defaultStreamChunkBytes
-	}
 	splitStartedAt := time.Now()
 	chunks, err := searchutil.SplitSearchResult(response.GetLegacyResults(), chunkBytes)
 	metrics.AddSplitDuration(time.Since(splitStartedAt))
@@ -273,9 +267,6 @@ func (s *Server) QueryOnViewStream(stream viewpb.ViewQueryService_QueryOnViewStr
 		return err
 	}
 	chunkBytes := int(request.GetStreamChunkBytes())
-	if chunkBytes <= 0 {
-		chunkBytes = defaultStreamChunkBytes
-	}
 	chunks, err := queryutil.SplitRetrieveResult(response.GetLegacyResults(), chunkBytes)
 	if err != nil {
 		return status.Errorf(codes.Internal, "split QueryOnView result: %v", err)

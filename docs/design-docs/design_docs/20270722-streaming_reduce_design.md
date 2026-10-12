@@ -91,9 +91,10 @@ Across process boundaries, child streams use bidirectional gRPC from the
 initial implementation. The initial implementation uses a configured
 reducible-payload byte threshold for each Chunk and gRPC's natural
 backpressure; application-level credit coordination remains a later
-investigation. The default threshold is `256 KiB`. Search and Query share the
-`reduceStreamChunkBytes` setting; the internal gRPC request carries it as
-`stream_chunk_bytes`.
+investigation. Proxy resolves the `256 KiB` default from the shared Search and
+Query `reduceStreamChunkBytes` setting and carries the positive value in the
+internal gRPC request as `stream_chunk_bytes`. QN/SN does not substitute a
+local default.
 
 ### 4.1 Reduce Stream
 
