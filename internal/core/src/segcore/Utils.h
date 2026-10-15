@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <cstddef>
+#include <functional>
 #include <memory>
 #include <cstdlib>
 #include <optional>
@@ -21,12 +23,14 @@
 #include "common/QueryResult.h"
 #include "common/type_c.h"
 #include "common/Types.h"
-#include "index/Index.h"
 #include "cachinglayer/Utils.h"
 #include "segcore/ConcurrentVector.h"
 #include "segcore/Types.h"
 #include "common/Consts.h"
+#include "index/contracts/query/IIndexReaderBase.h"
+#include "index/Meta.h"
 #include "segcore/SegmentInterface.h"
+#include "storage/artifact/LoadOptions.h"
 
 namespace milvus::segcore {
 
@@ -149,7 +153,7 @@ MergeDataArray(std::vector<MergeBase>& merge_bases,
                const FieldMeta& field_meta);
 
 std::unique_ptr<DataArray>
-ReverseDataFromIndex(const index::IndexBase* index,
+ReverseDataFromIndex(const index::IIndexReaderBase* index,
                      const int64_t* seg_offsets,
                      int64_t count,
                      const FieldMeta& field_meta);
@@ -195,7 +199,8 @@ getCellDataType(bool is_vector, bool is_index);
 void
 LoadIndexData(milvus::tracer::TraceContext& ctx,
               milvus::segcore::LoadIndexInfo* load_index_info,
-              milvus::OpContext* op_ctx = nullptr);
+              milvus::OpContext* op_ctx = nullptr,
+              storage::VectorDataViewScope vector_data_view_scope = {});
 
 /**
  * Convert Milvus timestamp to physical time in milliseconds.
