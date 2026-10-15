@@ -165,11 +165,13 @@ ReduceStream:
     childStreams[]
     childBuffers[]
     childRecvTasks[]
+    outputBuffer
 ```
 
 - `childStreams[i]` is a generated gRPC client stream across process boundaries, or another `ReduceStream` for in-process streaming.
 - `childRecvTasks[i]` is an optional asynchronous task that receives the next Chunk from `childStreams[i]` and writes its Units into `childBuffers[i]`.
 - `childBuffers[i]` is a concurrent-safe, implementation-dependent data structure that stores Units. Each `childBuffers[i]` has a target capacity of `B + y` reducible-payload bytes, where `y` is the byte threshold for retrieving the next Chunk before the Buffer becomes empty. Because an incoming Chunk retains the complete Unit that crosses `B`, a Buffer may exceed this target by that Chunk's final Unit. This allows us to employ a double-buffer approach to provide flexibility between search latency and memory.
+- `outputBuffer` stores the Units being prepared for output. Ordered and plain unordered reduction use a queue for one output Chunk. Group Reduce uses a map from group key to aggregate value and retains it across `Recv()` calls until all finalized groups have been emitted.
 
 ![Unit, Chunk, and Buffer](assets/stream_design_v3/unit-chunk-buffer.svg)
 
@@ -363,7 +365,7 @@ UnOrdered Merge -> UnOrderedReduceStream
 | Implementation | Input is ready when | Retained state | `Recv()` output |
 | --- | --- | --- | --- |
 | `OrderedReduceStream` | Every active child has data or is drained | One child Buffer per active child plus one output Chunk | The next ordered output in a chunk |
-| `UnOrderedReduceStream` | Any child has data | One child Buffer per active child plus one output Chunk | One output chunk from each child sequentially |
+| `UnOrderedReduceStream` | Any child has data | One child Buffer per active child plus the Query Group By output map | Finalized groups after all children drain |
 
 #### OrderedReduceStream
 
@@ -371,7 +373,7 @@ UnOrdered Merge -> UnOrderedReduceStream
 
 - ANN search (Includes variants such as Search Order By)
 - Query Order By
-- Plain Query (if default order by PK, otherwise `UnOrderedReduceStream`)
+- Plain Query
 
 This paradigm, in combination with the chunking design mentioned above, looks roughly like this:
 
@@ -429,65 +431,65 @@ ProduceNextUnits(readyBuffers, remainingBytes):
 
 #### UnOrderedReduceStream
 
-`UnOrderedReduceStream` applies when a per-vchannel stream does not need to establish cross-child ordering before forwarding units to the final collection-level stream. This scenario applies to:
-
-- Plain Query (Without default Order by PK)
-- Query Group By
-- Search Group By (including its variants such as Search Aggregation)
-- Further Scenarios where order is not needed
+`UnOrderedReduceStream` applies to Query Group By. Child input can be consumed
+without establishing cross-child ordering, but a later Unit may update an
+existing group. The stream therefore retains the output map and does not emit
+groups until all children drain. Plain Query remains on `OrderedReduceStream`;
+Search Group By is outside the current implementation scope.
 
 ```text
-Buffer = queue<Unit>
+GetReadyBuffers(childStreams, childBuffers):
+    for idx in childStreams.Size():
+        if childBuffers[idx].IsEmpty()
+           and childRecvTasks[idx].IsEmpty():
+            childRecvTasks[idx] = one task to Recv() one Chunk into childBuffers[idx]
 
+    wait until at least one child Buffer becomes nonempty
+        or all children are drained
+
+    return childBuffers
+```
+
+```text
 AllocBuffer():
-    outputBuffer = queue<Unit>
-    outputBuffer.byteLimit = B
+    if outputBuffer does not exist:
+        outputBuffer = map<group_key, aggregate_value>
+
     return outputBuffer
 
 IsChunkReady(outputBuffer):
-    return outputBuffer.ByteSize() >= B
-        or all children are drained
-
-# for unordered case, since order do not matter, we should
-# consume any buffer that's available each turn until a
-# sufficient chunk has been accumulated, then just send it
-# upstream
-GetReadyBuffers(childStreams, childBuffers):
-    for idx in childStreams.Size():
-        if childBuffers[idx].Size() == 0:
-            childRecvTasks[idx] = one task to Recv() fill childBuffers[idx]
-
-    anyBufferReady = False
-    while not anyBufferReady:
-        for idx in childStreams.Size():
-            if childRecvTasks[i] is done:
-                anyBufferReady = True
-
-     return childBuffers
+    return all children are drained
 
 ProduceNextUnits(readyBuffers, remainingBytes):
     oneReduceResult = queue<Unit>
 
     for buffer in readyBuffers:
         while buffer.Size() > 0:
-            nextUnit = buffer.Front()
-
-            if nextUnit.ByteSize() > B and remainingBytes < B:
-                return oneReduceResult
-
             oneReduceResult.Append(buffer.Pop())
-            remainingBytes -= nextUnit.ByteSize()
-
-            if remainingBytes <= 0:
-                return oneReduceResult
 
     return oneReduceResult
+
+Merge(outputBuffer, oneReduceResult):
+    for unit in oneReduceResult:
+        outputBuffer[unit.groupKey] = ReduceByPolicy(
+            outputBuffer[unit.groupKey],
+            unit.aggregateValue
+        )
+
+    return outputBuffer
+
+CreateOutputChunk(outputBuffer):
+    finalizedUnits = Finalize(outputBuffer)
+    outputChunk = next complete finalized Units
+        until their reducible payload reaches or crosses B
+    remove outputChunk Units from outputBuffer
+    return protobuf Chunk(outputChunk)
 ```
 
 | Reduction strategy | Scenarios |
 | --- | --- |
-| Ordered Merge | - ANN search (Includes variants such as Search Order By)<br>- Query Order By<br>- Plain Query (if default order by PK, otherwise `UnOrderedReduceStream`) |
-| UnOrdered Merge | - Plain Query (Without default Order by PK)<br>- Query Group By<br>- Search Group By (including its variants such as Search Aggregation) |
+| Ordered Merge | - ANN search (Includes variants such as Search Order By)<br>- Plain Query<br>- Query Order By |
+| UnOrdered Merge | - Query Group By, with optional final ordering after group reduction |
 
 ![ReduceStream implementation comparison](assets/stream_design_v3/reduce-stream-recv-strategies.svg)
 

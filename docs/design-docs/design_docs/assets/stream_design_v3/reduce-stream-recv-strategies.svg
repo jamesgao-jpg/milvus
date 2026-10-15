@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1080" viewBox="0 0 1800 1080" role="img" aria-labelledby="title desc">
   <title id="title">ReduceStream Recv shared workflow and two implementations</title>
-  <desc id="desc">The generic Recv workflow expands into byte-threshold OrderedReduceStream and UnOrderedReduceStream behavior. The complete Unit that reaches or crosses the threshold remains in the emitted Chunk; a Unit larger than the threshold is emitted alone.</desc>
+  <desc id="desc">The generic Recv workflow expands into OrderedReduceStream and Query Group By UnOrderedReduceStream behavior. Group Reduce consumes ready input into a map and emits finalized groups only after all children drain.</desc>
   <defs>
     <pattern id="genericHatch" width="12" height="12" patternUnits="userSpaceOnUse" patternTransform="rotate(12)">
       <rect width="12" height="12" fill="#f8fafc"/>
@@ -113,17 +113,16 @@
   <rect x="965" y="970" width="760" height="55" rx="7" class="inner" stroke="#86efac"/>
 
   <text x="995" y="542" class="stage">1  AllocBuffer</text>
-  <text x="995" y="574" class="mono code">outputBuffer = queue&lt;Unit&gt;</text>
+  <text x="995" y="574" class="mono code">outputBuffer = map&lt;group_key, aggregate_value&gt;</text>
   <text x="995" y="647" class="stage">2  GetReadyBuffers</text>
   <text x="995" y="679" class="mono code">clear completed childRecvTasks</text>
   <text x="995" y="708" class="mono code">start one task for each empty child Buffer</text>
   <text x="995" y="737" class="mono code">await any active child Buffer</text>
   <text x="995" y="766" class="mono code">return childBuffers</text>
   <text x="995" y="847" class="stage">3  ProduceNextUnits</text>
-  <text x="995" y="875" class="mono code">nextUnits = queue&lt;Unit&gt;</text>
-  <text x="995" y="899" class="mono code">for Buffer in readyBuffers while Buffer.Size() &gt; 0:</text>
-  <text x="995" y="923" class="mono code">    if Front.ByteSize() &gt; B and outputBytes &gt; 0: return</text>
-  <text x="995" y="947" class="mono code">    append Front; if bytes &gt;= B: return</text>
+  <text x="995" y="875" class="mono code">consume all Units from each ready Buffer</text>
+  <text x="995" y="899" class="mono code">merge each Unit into outputBuffer by group key</text>
+  <text x="995" y="923" class="mono code">continue until all child streams are drained</text>
   <text x="995" y="1003" class="stage">5  IsChunkReady</text>
-  <text x="1250" y="1003" class="mono code">ByteSize() &gt;= B or all children drained</text>
+  <text x="1250" y="1003" class="mono code">all children drained</text>
 </svg>

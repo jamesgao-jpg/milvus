@@ -7,6 +7,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/util/queryutil"
 	"github.com/milvus-io/milvus/internal/util/searchutil"
 	"github.com/milvus-io/milvus/internal/views/queryclient/resolver"
@@ -41,7 +42,8 @@ type LegacySearchResult struct {
 }
 
 type LegacyQueryRequest struct {
-	Req *internalpb.RetrieveRequest
+	Req    *internalpb.RetrieveRequest
+	Schema *schemapb.CollectionSchema
 }
 
 type LegacyQueryResult struct {
@@ -222,11 +224,13 @@ func (c *legacyClient) Query(ctx context.Context, req *LegacyQueryRequest) (*Leg
 }
 
 func SupportsQueryStream(req *internalpb.RetrieveRequest) bool {
-	return req != nil &&
-		req.GetLimit() > 0 &&
-		!req.GetIsCount() &&
-		len(req.GetGroupByFieldIds()) == 0 &&
-		len(req.GetAggregates()) == 0
+	if req == nil || req.GetIsCount() {
+		return false
+	}
+	if len(req.GetGroupByFieldIds()) > 0 {
+		return true
+	}
+	return req.GetLimit() > 0 && len(req.GetAggregates()) == 0
 }
 
 func (c *legacyClient) queryStream(ctx context.Context, req *LegacyQueryRequest) (*LegacyQueryResult, error) {
@@ -241,7 +245,7 @@ func (c *legacyClient) queryStream(ctx context.Context, req *LegacyQueryRequest)
 	for i := range vchannels {
 		i := i
 		group.Go(func() error {
-			stream, plan, err := c.shardClient.QueryStream(ctx, vchannels[i], req.Req, c.reduceStreamChunkBytes)
+			stream, plan, err := c.shardClient.QueryStream(ctx, vchannels[i], req.Req, req.Schema, c.reduceStreamChunkBytes)
 			if err != nil {
 				return err
 			}
@@ -259,7 +263,7 @@ func (c *legacyClient) queryStream(ctx context.Context, req *LegacyQueryRequest)
 		return nil, err
 	}
 
-	finalStream, err := queryutil.NewReduceStream(req.Req, vchannelStreams, c.reduceStreamChunkBytes)
+	finalStream, err := queryutil.NewReduceStream(req.Req, req.Schema, vchannelStreams, c.reduceStreamChunkBytes)
 	if err != nil {
 		for _, stream := range vchannelStreams {
 			err = errors.Join(err, stream.Close())

@@ -18,6 +18,7 @@ package viewquery
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"testing"
@@ -36,6 +37,7 @@ import (
 	"github.com/milvus-io/milvus/internal/views/qviews"
 	"github.com/milvus-io/milvus/internal/views/viewerror"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/planpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/viewpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 )
@@ -371,6 +373,66 @@ func TestQueryOnViewStreamAcceptsBoundedOrdinaryQuery(t *testing.T) {
 	chunk, err := stream.Recv()
 	require.NoError(t, err)
 	require.Equal(t, []int64{1}, chunk.GetIds().GetIntId().GetData())
+	require.NoError(t, stream.Close())
+	require.Equal(t, 1, tasks.releaseCount)
+}
+
+func TestQueryOnViewStreamAcceptsGroupByQuery(t *testing.T) {
+	tasks := &streamTestQueryTasks{tasks: []QuerySegmentTask{struct{}{}}}
+	provider := &streamTestProvider{queryTasks: tasks}
+	server := NewServer(
+		provider,
+		&streamTestScheduler{queryResult: &internalpb.RetrieveResults{
+			Status: merr.Success(),
+			FieldsData: []*schemapb.FieldData{
+				{
+					Type:    schemapb.DataType_Int64,
+					FieldId: 100,
+					Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{
+						Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: []int64{1, 2}}},
+					}},
+				},
+				{
+					Type:    schemapb.DataType_Int64,
+					FieldId: 101,
+					Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{
+						Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: []int64{3, 4}}},
+					}},
+				},
+			},
+		}},
+	)
+	client, cleanup := startSearchStreamTestServer(t, server)
+	defer cleanup()
+
+	stream, err := queryutil.NewGRPCReduceStream(context.Background(), client, &viewpb.QueryOnViewRequest{
+		LegacyReq: &internalpb.RetrieveRequest{
+			CollectionID:    10,
+			GroupByFieldIds: []int64{100},
+			Aggregates: []*planpb.Aggregate{
+				{Op: planpb.AggregateOp_count, FieldId: 101},
+			},
+		},
+		ShardId: &viewpb.ShardID{ReplicaId: 1, Vchannel: "by-dev-rootcoord-dml_0_100v0"},
+		Version: &viewpb.QueryViewVersion{
+			DataVersion:  &viewpb.DataVersion{StreamingVersion: 1, CompactVersion: 2},
+			QueryVersion: 3,
+		},
+		Mvcc:             &viewpb.QueryPlanMVCC{GrowingTimetick: 10},
+		StreamChunkBytes: 32,
+	})
+	require.NoError(t, err)
+
+	var groups []int64
+	for {
+		chunk, recvErr := stream.Recv()
+		if errors.Is(recvErr, io.EOF) {
+			break
+		}
+		require.NoError(t, recvErr)
+		groups = append(groups, chunk.GetFieldsData()[0].GetScalars().GetLongData().GetData()...)
+	}
+	require.Equal(t, []int64{1, 2}, groups)
 	require.NoError(t, stream.Close())
 	require.Equal(t, 1, tasks.releaseCount)
 }
