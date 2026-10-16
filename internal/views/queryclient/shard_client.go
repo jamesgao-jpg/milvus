@@ -8,7 +8,6 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	commonpb "github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/util/queryutil"
 	"github.com/milvus-io/milvus/internal/util/searchutil"
 	"github.com/milvus-io/milvus/internal/views/queryclient/reducer"
@@ -104,10 +103,10 @@ func (s *shardViewQueryClient) Search(ctx context.Context, req *ShardSearchReque
 func (s *shardViewQueryClient) SearchStream(
 	ctx context.Context,
 	vchannel string,
-	req *internalpb.SearchRequest,
+	req *LegacySearchRequest,
 	chunkBytes int,
 ) (searchutil.ReduceStream, *ShardPlan, error) {
-	if req == nil {
+	if req == nil || req.Req == nil {
 		return nil, nil, merr.WrapErrServiceInternalMsg("SearchStream requires a Search request")
 	}
 	if ctx.Err() != nil {
@@ -116,15 +115,18 @@ func (s *shardViewQueryClient) SearchStream(
 
 	targetShardID := qviews.ShardID{ReplicaID: qviews.UnknownReplicaID, VChannel: vchannel}
 	planReq := &viewpb.GetQueryPlanRequest{
-		CollectionId: req.GetCollectionID(),
-		ShardId:      targetShardID.IntoProto(),
-		PartitionIds: req.GetPartitionIDs(),
+		CollectionId:     req.Req.GetCollectionID(),
+		ShardId:          targetShardID.IntoProto(),
+		PartitionIds:     req.Req.GetPartitionIDs(),
+		RequiredFieldIds: req.RequiredFieldIDs,
 		Request: &viewpb.GetQueryPlanRequest_LegacySearchRequest{
-			LegacySearchRequest: req,
+			LegacySearchRequest: req.Req,
 		},
 	}
 	plan, err := s.executeGetQueryPlan(ctx, targetShardID, planReq, &shardExecParams{
-		consistencyLevel: req.GetConsistencyLevel(),
+		consistencyLevel: req.Req.GetConsistencyLevel(),
+		mvcc:             req.MVCC,
+		barrierMVCC:      req.BarrierMVCC,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -158,7 +160,7 @@ func (s *shardViewQueryClient) SearchStream(
 		return nil, nil, err
 	}
 
-	reducedStream, err := searchutil.NewReduceStream(req, childStreams, chunkBytes)
+	reducedStream, err := searchutil.NewReduceStream(req.Req, childStreams, chunkBytes)
 	if err != nil {
 		for _, childStream := range childStreams {
 			err = errors.Join(err, childStream.Close())
@@ -217,11 +219,10 @@ func (s *shardViewQueryClient) Query(ctx context.Context, req *ShardQueryRequest
 func (s *shardViewQueryClient) QueryStream(
 	ctx context.Context,
 	vchannel string,
-	req *internalpb.RetrieveRequest,
-	schema *schemapb.CollectionSchema,
+	req *LegacyQueryRequest,
 	chunkBytes int,
 ) (queryutil.ReduceStream, *ShardPlan, error) {
-	if req == nil {
+	if req == nil || req.Req == nil {
 		return nil, nil, merr.WrapErrServiceInternalMsg("QueryStream requires a Query request")
 	}
 
@@ -230,15 +231,18 @@ func (s *shardViewQueryClient) QueryStream(
 	}
 	targetShardID := qviews.ShardID{ReplicaID: qviews.UnknownReplicaID, VChannel: vchannel}
 	planReq := &viewpb.GetQueryPlanRequest{
-		CollectionId: req.GetCollectionID(),
-		ShardId:      targetShardID.IntoProto(),
-		PartitionIds: req.GetPartitionIDs(),
+		CollectionId:   req.Req.GetCollectionID(),
+		ShardId:        targetShardID.IntoProto(),
+		PartitionIds:   req.Req.GetPartitionIDs(),
+		ReadProofAfter: req.ReadProofAfter,
 		Request: &viewpb.GetQueryPlanRequest_LegacyRetrieveRequest{
-			LegacyRetrieveRequest: req,
+			LegacyRetrieveRequest: req.Req,
 		},
 	}
 	plan, err := s.executeGetQueryPlan(ctx, targetShardID, planReq, &shardExecParams{
-		consistencyLevel: req.GetConsistencyLevel(),
+		consistencyLevel: req.Req.GetConsistencyLevel(),
+		mvcc:             req.MVCC,
+		barrierMVCC:      req.BarrierMVCC,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -272,7 +276,7 @@ func (s *shardViewQueryClient) QueryStream(
 		return nil, nil, err
 	}
 
-	reducedStream, err := queryutil.NewReduceStream(req, schema, childStreams, chunkBytes)
+	reducedStream, err := queryutil.NewReduceStream(req.Req, req.Schema, childStreams, chunkBytes)
 	if err != nil {
 		for _, childStream := range childStreams {
 			err = errors.Join(err, childStream.Close())
