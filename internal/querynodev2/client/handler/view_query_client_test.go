@@ -158,6 +158,7 @@ func (c *fakeViewQueryServiceClient) QueryOnView(ctx context.Context, req *viewp
 func (c *fakeViewQueryServiceClient) QueryOnViewStream(ctx context.Context, _ ...grpc.CallOption) (viewpb.ViewQueryService_QueryOnViewStreamClient, error) {
 	return c.queryOnViewStream(ctx)
 }
+
 type fakeSearchOnViewClientStream struct {
 	ctx        context.Context
 	sent       *viewpb.SearchOnViewStreamRequest
