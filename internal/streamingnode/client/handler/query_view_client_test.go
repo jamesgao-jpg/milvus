@@ -85,7 +85,7 @@ func TestHandlerClientSearchOnViewStreamRoutesByStreamingWorkNode(t *testing.T) 
 			serverID, ok := contextutil.GetPickServerID(ctx)
 			require.True(t, ok)
 			require.Equal(t, int64(101), serverID)
-			pchannel, err := worknodehandler.DecodeQueryViewPChannelFromOutgoingContext(ctx)
+			pchannel, err := decodeOutgoingQueryViewPChannel(ctx)
 			require.NoError(t, err)
 			require.Equal(t, types.PChannelInfo{
 				Name:       "p0",
@@ -117,7 +117,7 @@ func TestHandlerClientQueryOnViewStreamRoutesByStreamingWorkNode(t *testing.T) {
 			serverID, ok := contextutil.GetPickServerID(ctx)
 			require.True(t, ok)
 			require.Equal(t, int64(101), serverID)
-			pchannel, err := worknodehandler.DecodeQueryViewPChannelFromOutgoingContext(ctx)
+			pchannel, err := decodeOutgoingQueryViewPChannel(ctx)
 			require.NoError(t, err)
 			require.Equal(t, types.PChannelInfo{
 				Name:       "p0",
