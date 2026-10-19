@@ -2564,6 +2564,7 @@ type proxyConfig struct {
 	SlowQuerySpanInSeconds       ParamItem `refreshable:"true"`
 	QueryNodePoolingSize         ParamItem `refreshable:"false"`
 	EnableReduceStream           ParamItem `refreshable:"false"`
+	EnableReusableQueryStream    ParamItem `refreshable:"false"`
 	ReduceStreamChunkBytes       ParamItem `refreshable:"false"`
 	EnableSearchBenchmarkMetrics ParamItem `refreshable:"false"`
 
@@ -3362,6 +3363,15 @@ Disabled if the value is less or equal to 0.`,
 		Export:       true,
 	}
 	p.EnableReduceStream.Init(base.mgr)
+
+	p.EnableReusableQueryStream = ParamItem{
+		Key:          "proxy.queryView.enableReusableQueryStream",
+		Version:      "3.0.0",
+		DefaultValue: "false",
+		Doc:          "benchmark-only reuse of completed Plain Query RPCs to QueryNodes",
+		Export:       true,
+	}
+	p.EnableReusableQueryStream.Init(base.mgr)
 
 	p.ReduceStreamChunkBytes = ParamItem{
 		Key:          "proxy.queryView.reduceStreamChunkBytes",

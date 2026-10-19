@@ -2,13 +2,18 @@ package handler
 
 import (
 	"context"
+	"sync"
 
 	"github.com/milvus-io/milvus/internal/util/queryutil"
 	"github.com/milvus-io/milvus/internal/util/searchutil"
+	"github.com/milvus-io/milvus/internal/util/streamingutil/service/attributes"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/service/contextutil"
+	"github.com/milvus-io/milvus/internal/util/streamingutil/service/discoverer"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/service/lazygrpc"
 	"github.com/milvus-io/milvus/internal/views/viewerror"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/viewpb"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
@@ -22,15 +27,47 @@ type QueryViewClient interface {
 }
 
 type queryViewClient struct {
-	owner   *clientImpl
-	service lazygrpc.Service[viewpb.ViewQueryServiceClient]
+	owner           *clientImpl
+	service         lazygrpc.Service[viewpb.ViewQueryServiceClient]
+	reusableQueries *queryutil.ReusableQueryStreamPool
+	stopReusable    context.CancelFunc
+	reusableWatch   sync.WaitGroup
 }
 
 func newQueryViewClient(owner *clientImpl, conn lazygrpc.Conn) *queryViewClient {
-	return &queryViewClient{
+	client := &queryViewClient{
 		owner:   owner,
 		service: lazygrpc.WithServiceCreator(conn, viewpb.NewViewQueryServiceClient),
 	}
+	if paramtable.Get().ProxyCfg.EnableReduceStream.GetAsBool() &&
+		paramtable.Get().ProxyCfg.EnableReusableQueryStream.GetAsBool() {
+		ctx, cancel := context.WithCancel(context.Background())
+		client.stopReusable = cancel
+		client.reusableQueries = queryutil.NewReusableQueryStreamPool(ctx)
+		if owner.rb != nil {
+			client.reusableWatch.Add(1)
+			go func() {
+				defer client.reusableWatch.Done()
+				err := owner.rb.Resolver().Watch(ctx, func(state discoverer.VersionedState) error {
+					nodes := make(map[int64]struct{}, len(state.State.Addresses))
+					for _, address := range state.State.Addresses {
+						if address.Attributes != nil {
+							if id := attributes.GetServerID(address.Attributes); id != nil {
+								nodes[*id] = struct{}{}
+							}
+						}
+					}
+					client.reusableQueries.RetainNodes(nodes)
+					return nil
+				})
+				if err != nil && ctx.Err() == nil {
+					mlog.Warn(ctx, "reusable Query RPC discovery watch stopped", mlog.Err(err))
+				}
+			}()
+		}
+		mlog.Info(ctx, "benchmark-only reusable Query RPCs enabled")
+	}
+	return client
 }
 
 func (qvc *queryViewClient) SearchOnView(ctx context.Context, nodeID int64, req *viewpb.SearchOnViewRequest) (*viewpb.SearchOnViewResponse, error) {
@@ -53,6 +90,12 @@ func (qvc *queryViewClient) QueryOnView(ctx context.Context, nodeID int64, req *
 
 func (qvc *queryViewClient) QueryOnViewStream(ctx context.Context, nodeID int64, req *viewpb.QueryOnViewRequest) (queryutil.ReduceStream, error) {
 	return executeViewQueryRPC(ctx, qvc, nodeID, "ViewQueryService.QueryOnViewStream", func(ctx context.Context, client viewpb.ViewQueryServiceClient) (queryutil.ReduceStream, error) {
+		if qvc.reusableQueries != nil {
+			stream, err := qvc.reusableQueries.NewStream(ctx, client, nodeID, req)
+			if stream != nil || err != nil {
+				return stream, err
+			}
+		}
 		return queryutil.NewGRPCReduceStream(ctx, client, req)
 	})
 }
@@ -86,5 +129,17 @@ func executeViewQueryRPC[T any](
 }
 
 func (qvc *queryViewClient) close() {
+	qvc.stopReusableQueries()
 	qvc.service.Close()
+}
+
+// stopReusableQueries aborts transport before client shutdown waits for open calls.
+func (qvc *queryViewClient) stopReusableQueries() {
+	if qvc.stopReusable != nil {
+		qvc.stopReusable()
+	}
+	if qvc.reusableQueries != nil {
+		qvc.reusableQueries.Close()
+	}
+	qvc.reusableWatch.Wait()
 }

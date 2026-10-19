@@ -320,11 +320,12 @@ var QueryPlanService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	ViewQueryService_SearchOnView_FullMethodName       = "/milvus.proto.view.ViewQueryService/SearchOnView"
-	ViewQueryService_SearchOnViewStream_FullMethodName = "/milvus.proto.view.ViewQueryService/SearchOnViewStream"
-	ViewQueryService_QueryOnView_FullMethodName        = "/milvus.proto.view.ViewQueryService/QueryOnView"
-	ViewQueryService_QueryOnViewStream_FullMethodName  = "/milvus.proto.view.ViewQueryService/QueryOnViewStream"
-	ViewQueryService_RequeryOnView_FullMethodName      = "/milvus.proto.view.ViewQueryService/RequeryOnView"
+	ViewQueryService_SearchOnView_FullMethodName              = "/milvus.proto.view.ViewQueryService/SearchOnView"
+	ViewQueryService_SearchOnViewStream_FullMethodName        = "/milvus.proto.view.ViewQueryService/SearchOnViewStream"
+	ViewQueryService_QueryOnView_FullMethodName               = "/milvus.proto.view.ViewQueryService/QueryOnView"
+	ViewQueryService_QueryOnViewStream_FullMethodName         = "/milvus.proto.view.ViewQueryService/QueryOnViewStream"
+	ViewQueryService_QueryOnViewStreamReusable_FullMethodName = "/milvus.proto.view.ViewQueryService/QueryOnViewStreamReusable"
+	ViewQueryService_RequeryOnView_FullMethodName             = "/milvus.proto.view.ViewQueryService/RequeryOnView"
 )
 
 // ViewQueryServiceClient is the client API for ViewQueryService service.
@@ -341,6 +342,8 @@ type ViewQueryServiceClient interface {
 	QueryOnView(ctx context.Context, in *QueryOnViewRequest, opts ...grpc.CallOption) (*QueryOnViewResponse, error)
 	// QueryOnViewStream executes the same query over a bidirectional stream.
 	QueryOnViewStream(ctx context.Context, opts ...grpc.CallOption) (ViewQueryService_QueryOnViewStreamClient, error)
+	// Benchmark-only: sequential, independently completed Queries on one RPC.
+	QueryOnViewStreamReusable(ctx context.Context, opts ...grpc.CallOption) (ViewQueryService_QueryOnViewStreamReusableClient, error)
 	// RequeryOnView fetches output fields for a set of PKs after Proxy-side reduce.
 	// Uses the same view version as the preceding search/query to ensure consistency.
 	RequeryOnView(ctx context.Context, in *RequeryOnViewRequest, opts ...grpc.CallOption) (*RequeryOnViewResponse, error)
@@ -434,6 +437,37 @@ func (x *viewQueryServiceQueryOnViewStreamClient) Recv() (*QueryOnViewStreamResp
 	return m, nil
 }
 
+func (c *viewQueryServiceClient) QueryOnViewStreamReusable(ctx context.Context, opts ...grpc.CallOption) (ViewQueryService_QueryOnViewStreamReusableClient, error) {
+	stream, err := c.cc.NewStream(ctx, &ViewQueryService_ServiceDesc.Streams[2], ViewQueryService_QueryOnViewStreamReusable_FullMethodName, opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &viewQueryServiceQueryOnViewStreamReusableClient{stream}
+	return x, nil
+}
+
+type ViewQueryService_QueryOnViewStreamReusableClient interface {
+	Send(*QueryOnViewStreamReusableRequest) error
+	Recv() (*QueryOnViewStreamReusableResponse, error)
+	grpc.ClientStream
+}
+
+type viewQueryServiceQueryOnViewStreamReusableClient struct {
+	grpc.ClientStream
+}
+
+func (x *viewQueryServiceQueryOnViewStreamReusableClient) Send(m *QueryOnViewStreamReusableRequest) error {
+	return x.ClientStream.SendMsg(m)
+}
+
+func (x *viewQueryServiceQueryOnViewStreamReusableClient) Recv() (*QueryOnViewStreamReusableResponse, error) {
+	m := new(QueryOnViewStreamReusableResponse)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 func (c *viewQueryServiceClient) RequeryOnView(ctx context.Context, in *RequeryOnViewRequest, opts ...grpc.CallOption) (*RequeryOnViewResponse, error) {
 	out := new(RequeryOnViewResponse)
 	err := c.cc.Invoke(ctx, ViewQueryService_RequeryOnView_FullMethodName, in, out, opts...)
@@ -457,6 +491,8 @@ type ViewQueryServiceServer interface {
 	QueryOnView(context.Context, *QueryOnViewRequest) (*QueryOnViewResponse, error)
 	// QueryOnViewStream executes the same query over a bidirectional stream.
 	QueryOnViewStream(ViewQueryService_QueryOnViewStreamServer) error
+	// Benchmark-only: sequential, independently completed Queries on one RPC.
+	QueryOnViewStreamReusable(ViewQueryService_QueryOnViewStreamReusableServer) error
 	// RequeryOnView fetches output fields for a set of PKs after Proxy-side reduce.
 	// Uses the same view version as the preceding search/query to ensure consistency.
 	RequeryOnView(context.Context, *RequeryOnViewRequest) (*RequeryOnViewResponse, error)
@@ -477,6 +513,9 @@ func (UnimplementedViewQueryServiceServer) QueryOnView(context.Context, *QueryOn
 }
 func (UnimplementedViewQueryServiceServer) QueryOnViewStream(ViewQueryService_QueryOnViewStreamServer) error {
 	return status.Errorf(codes.Unimplemented, "method QueryOnViewStream not implemented")
+}
+func (UnimplementedViewQueryServiceServer) QueryOnViewStreamReusable(ViewQueryService_QueryOnViewStreamReusableServer) error {
+	return status.Errorf(codes.Unimplemented, "method QueryOnViewStreamReusable not implemented")
 }
 func (UnimplementedViewQueryServiceServer) RequeryOnView(context.Context, *RequeryOnViewRequest) (*RequeryOnViewResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RequeryOnView not implemented")
@@ -581,6 +620,32 @@ func (x *viewQueryServiceQueryOnViewStreamServer) Recv() (*QueryOnViewStreamRequ
 	return m, nil
 }
 
+func _ViewQueryService_QueryOnViewStreamReusable_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(ViewQueryServiceServer).QueryOnViewStreamReusable(&viewQueryServiceQueryOnViewStreamReusableServer{stream})
+}
+
+type ViewQueryService_QueryOnViewStreamReusableServer interface {
+	Send(*QueryOnViewStreamReusableResponse) error
+	Recv() (*QueryOnViewStreamReusableRequest, error)
+	grpc.ServerStream
+}
+
+type viewQueryServiceQueryOnViewStreamReusableServer struct {
+	grpc.ServerStream
+}
+
+func (x *viewQueryServiceQueryOnViewStreamReusableServer) Send(m *QueryOnViewStreamReusableResponse) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func (x *viewQueryServiceQueryOnViewStreamReusableServer) Recv() (*QueryOnViewStreamReusableRequest, error) {
+	m := new(QueryOnViewStreamReusableRequest)
+	if err := x.ServerStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 func _ViewQueryService_RequeryOnView_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(RequeryOnViewRequest)
 	if err := dec(in); err != nil {
@@ -629,6 +694,12 @@ var ViewQueryService_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "QueryOnViewStream",
 			Handler:       _ViewQueryService_QueryOnViewStream_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "QueryOnViewStreamReusable",
+			Handler:       _ViewQueryService_QueryOnViewStreamReusable_Handler,
 			ServerStreams: true,
 			ClientStreams: true,
 		},

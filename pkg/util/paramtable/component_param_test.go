@@ -58,18 +58,23 @@ func TestProxyQueryViewStreamingConfig(t *testing.T) {
 	config := proxyConfig{}
 	config.init(base)
 	assert.False(t, config.EnableReduceStream.GetAsBool())
+	assert.False(t, config.EnableReusableQueryStream.GetAsBool())
 	assert.Equal(t, 256*1024, config.ReduceStreamChunkBytes.GetAsInt())
 	assert.NoError(t, base.Save(config.EnableReduceStream.Key, "true"))
+	assert.NoError(t, base.Save(config.EnableReusableQueryStream.Key, "true"))
 	assert.NoError(t, base.Save(config.ReduceStreamChunkBytes.Key, "128"))
 	assert.True(t, config.EnableReduceStream.GetAsBool())
+	assert.True(t, config.EnableReusableQueryStream.GetAsBool())
 	assert.Equal(t, 128, config.ReduceStreamChunkBytes.GetAsInt())
 
 	t.Setenv("PROXY_QUERYVIEW_ENABLEREDUCESTREAM", "true")
+	t.Setenv("PROXY_QUERYVIEW_ENABLEREUSABLEQUERYSTREAM", "true")
 	t.Setenv("PROXY_QUERYVIEW_REDUCESTREAMCHUNKBYTES", "256")
 	envBase := NewBaseTable(SkipRemote(true))
 	envConfig := proxyConfig{}
 	envConfig.init(envBase)
 	assert.True(t, envConfig.EnableReduceStream.GetAsBool())
+	assert.True(t, envConfig.EnableReusableQueryStream.GetAsBool())
 	assert.Equal(t, 256, envConfig.ReduceStreamChunkBytes.GetAsInt())
 }
 

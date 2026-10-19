@@ -5,6 +5,7 @@ option go_package = "github.com/milvus-io/milvus/pkg/v3/proto/viewpb";
 
 import "common.proto";
 import "internal.proto";
+import "google/protobuf/any.proto";
 
 // ViewSyncService is the unified service to sync query views and data views between coord and nodes.
 service ViewSyncService {
@@ -375,6 +376,8 @@ service ViewQueryService {
     rpc QueryOnView(QueryOnViewRequest) returns (QueryOnViewResponse) {}
     // QueryOnViewStream executes the same query over a bidirectional stream.
     rpc QueryOnViewStream(stream QueryOnViewStreamRequest) returns (stream QueryOnViewStreamResponse) {}
+    // Benchmark-only: sequential, independently completed Queries on one RPC.
+    rpc QueryOnViewStreamReusable(stream QueryOnViewStreamReusableRequest) returns (stream QueryOnViewStreamReusableResponse) {}
     // RequeryOnView fetches output fields for a set of PKs after Proxy-side reduce.
     // Uses the same view version as the preceding search/query to ensure consistency.
     rpc RequeryOnView(RequeryOnViewRequest) returns (RequeryOnViewResponse) {}
@@ -453,4 +456,21 @@ message RequeryOnViewRequest {
 message RequeryOnViewResponse {
     // TODO: replace with native view result types once legacy internal protos are removed.
     internal.RetrieveResults legacy_results = 1;
+}
+
+message QueryOnViewStreamReusableRequest {
+    uint64 request_id = 1;
+    QueryOnViewRequest request = 2;
+    // Zero means no logical deadline; transport cancellation still applies.
+    int64 timeout_nanos = 3;
+    map<string, string> trace_context = 4;
+    map<string, string> log_fields = 5;
+}
+
+message QueryOnViewStreamReusableResponse {
+    uint64 request_id = 1;
+    internal.RetrieveResults chunk = 2;
+    // A packed google.rpc.Status; presence marks logical request completion.
+    // OK accompanies the final Chunk, or appears alone for an empty result.
+    google.protobuf.Any completion_status = 3;
 }

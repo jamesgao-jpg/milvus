@@ -166,6 +166,7 @@ func newQueryViewQueryTask(legacy queryclient.LegacyClient, limit int64) *queryT
 			Limit:        limit,
 		},
 		request:         &milvuspb.QueryRequest{DbName: "default"},
+		schema:          &schemaInfo{CollectionSchema: &schemapb.CollectionSchema{}},
 		viewQueryClient: &fakeLegacyViewQueryClient{legacy: legacy},
 	}
 }
@@ -443,6 +444,44 @@ func TestQueryTaskRetriesCompleteStreamAttempt(t *testing.T) {
 			require.Equal(t, []int64{2, 3}, result.GetIds().GetIntId().GetData())
 			require.Equal(t, uint64(2), result.GetMvccTimestamp())
 		})
+	}
+}
+
+// TestQueryTaskRetriesBeforeFirstChunk preserves the same request-level retry boundary.
+func TestQueryTaskRetriesBeforeFirstChunk(t *testing.T) {
+	failed := &fakeLegacyQueryStream{recv: []fakeLegacyQueryRecv{{err: streamViewError(viewpb.ViewCode_VIEW_CODE_VIEW_INVALIDATED, "stale")}}}
+	replacement := &fakeLegacyQueryStream{recv: []fakeLegacyQueryRecv{{chunk: newFinalQueryChunk([]int64{2, 3}, 2)}}}
+	legacy := &fakeLegacyQueryClient{maxRetries: 2, reduceStreamEnabled: true}
+	legacy.query = func(attempt int) (*queryclient.LegacyQueryResult, error) {
+		if attempt == 1 {
+			return &queryclient.LegacyQueryResult{Stream: failed}, nil
+		}
+		return &queryclient.LegacyQueryResult{Stream: replacement}, nil
+	}
+	task := newQueryViewQueryTask(legacy, 2)
+	require.NoError(t, task.Execute(context.Background()))
+	require.Equal(t, 2, legacy.queryCalled)
+	require.Equal(t, 1, failed.closeCalls)
+	require.Equal(t, 1, replacement.closeCalls)
+	require.Equal(t, []int64{2, 3}, task.resultBuf.Collect()[0].GetIds().GetIntId().GetData())
+}
+
+// TestQueryTaskRetryExhaustionReturnsLastFailure verifies bounded retries and discarded output.
+func TestQueryTaskRetryExhaustionReturnsLastFailure(t *testing.T) {
+	var streams []*fakeLegacyQueryStream
+	legacy := &fakeLegacyQueryClient{maxRetries: 3, reduceStreamEnabled: true}
+	legacy.query = func(attempt int) (*queryclient.LegacyQueryResult, error) {
+		stream := &fakeLegacyQueryStream{recv: []fakeLegacyQueryRecv{{err: streamViewError(viewpb.ViewCode_VIEW_CODE_VIEW_NOT_FOUND, "attempt %d", attempt)}}}
+		streams = append(streams, stream)
+		return &queryclient.LegacyQueryResult{Stream: stream}, nil
+	}
+	task := newQueryViewQueryTask(legacy, 2)
+	err := task.Execute(context.Background())
+	require.Equal(t, "attempt 3", viewerror.AsViewError(err).Cause)
+	require.Equal(t, 3, legacy.queryCalled)
+	require.Empty(t, task.resultBuf.Collect())
+	for _, stream := range streams {
+		require.Equal(t, 1, stream.closeCalls)
 	}
 }
 

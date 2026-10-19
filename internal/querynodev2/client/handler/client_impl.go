@@ -19,6 +19,7 @@ func (c *clientImpl) QueryViewClient() QueryViewClient {
 
 func (c *clientImpl) Close() {
 	c.lifetime.SetState(typeutil.LifetimeStateStopped)
+	c.queryViewClient.stopReusableQueries()
 	c.lifetime.Wait()
 	c.queryViewClient.close()
 	if c.rb != nil {

@@ -25,6 +25,18 @@ import (
 )
 
 var (
+	// ProxyReusableQueryStreamEvents counts bounded-cardinality transport lifecycle events.
+	ProxyReusableQueryStreamEvents = prometheus.NewCounterVec(
+		prometheus.CounterOpts{Namespace: milvusNamespace, Subsystem: typeutil.ProxyRole,
+			Name: "reusable_query_stream_events_total", Help: "Benchmark-only reusable Query RPC lifecycle events."},
+		[]string{"event"})
+
+	// ProxyReusableQueryStreams separates idle transport from active logical requests.
+	ProxyReusableQueryStreams = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{Namespace: milvusNamespace, Subsystem: typeutil.ProxyRole,
+			Name: "reusable_query_streams", Help: "Benchmark-only idle or leased Query RPCs."},
+		[]string{"state"})
+
 	ProxyReceivedNQ = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: milvusNamespace,
@@ -486,6 +498,7 @@ var (
 
 // RegisterProxy registers Proxy metrics
 func RegisterProxy(registry *prometheus.Registry) {
+	registry.MustRegister(ProxyReusableQueryStreamEvents, ProxyReusableQueryStreams)
 	registry.MustRegister(ProxyReceivedNQ)
 	registry.MustRegister(ProxySearchVectors)
 	registry.MustRegister(ProxyInsertVectors)
