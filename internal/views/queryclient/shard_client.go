@@ -208,7 +208,7 @@ func (s *shardViewQueryClient) SearchStream(
 		return nil, nil, err
 	}
 
-	reducedStream, err := searchutil.NewReduceStream(req, childStreams, chunkBytes)
+	reducedStream, err := searchutil.NewShardReduceStream(req, childStreams, chunkBytes)
 	if err != nil {
 		for _, childStream := range childStreams {
 			err = errors.Join(err, childStream.Close())
@@ -354,7 +354,7 @@ func (s *shardViewQueryClient) QueryStream(
 		return nil, nil, err
 	}
 
-	reducedStream, err := queryutil.NewReduceStream(req, schema, childStreams, chunkBytes)
+	reducedStream, err := queryutil.NewShardReduceStream(req, schema, childStreams, chunkBytes)
 	if err != nil {
 		for _, childStream := range childStreams {
 			err = errors.Join(err, childStream.Close())

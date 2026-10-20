@@ -155,8 +155,11 @@ func TestShardSearchStreamReturnsPerVChannelReduceStream(t *testing.T) {
 		{Node: &viewpb.QueryPlanWorkNode_QueryNode{QueryNode: &viewpb.QueryWorkNode{NodeId: rightNode.ID}}},
 	}
 
-	leftStream := &fakeSearchStream{recv: []fakeSearchStreamRecv{{chunk: newTestSearchChunk(3, []int64{1, 4}, []float32{0.9, 0.6})}}}
-	rightStream := &fakeSearchStream{recv: []fakeSearchStreamRecv{{chunk: newTestSearchChunk(3, []int64{2, 3}, []float32{0.8, 0.7})}}}
+	leftStream := &fakeSearchStream{recv: []fakeSearchStreamRecv{{chunk: newTestSearchChunk(3, []int64{1, 2}, []float32{0.9, 0.8})}}}
+	rightStream := &fakeSearchStream{recv: []fakeSearchStreamRecv{
+		{chunk: newTestSearchChunk(3, []int64{1}, []float32{0.85})},
+		{chunk: newTestSearchChunk(3, []int64{3}, []float32{0.7})},
+	}}
 	queryService := &fakeViewQueryServiceClient{
 		searchOnViewStream: func(_ context.Context, node qviews.WorkNode, _ *viewpb.SearchOnViewRequest) (searchutil.ReduceStream, error) {
 			switch node.Key() {
@@ -208,8 +211,19 @@ func TestShardQueryStreamReturnsPerVChannelReduceStream(t *testing.T) {
 			{Node: &viewpb.QueryPlanWorkNode_QueryNode{QueryNode: &viewpb.QueryWorkNode{NodeId: rightNode.ID}}},
 		},
 	}
-	leftStream := &fakeQueryStream{recv: []fakeQueryStreamRecv{{chunk: newTestQueryChunk([]int64{1, 3})}}}
-	rightStream := &fakeQueryStream{recv: []fakeQueryStreamRecv{{chunk: newTestQueryChunk([]int64{2, 4})}}}
+	leftChunk := newTestQueryChunk([]int64{1, 3})
+	rightChunk := newTestQueryChunk([]int64{1, 2, 4})
+	for i, chunk := range []*internalpb.RetrieveResults{leftChunk, rightChunk} {
+		timestamps := proto.Clone(chunk.FieldsData[0]).(*schemapb.FieldData)
+		timestamps.FieldId = 1
+		timestamps.FieldName = ""
+		for row := range timestamps.GetScalars().GetLongData().GetData() {
+			timestamps.GetScalars().GetLongData().Data[row] = int64(i+1) * 10
+		}
+		chunk.FieldsData = append(chunk.FieldsData, timestamps)
+	}
+	leftStream := &fakeQueryStream{recv: []fakeQueryStreamRecv{{chunk: leftChunk}}}
+	rightStream := &fakeQueryStream{recv: []fakeQueryStreamRecv{{chunk: rightChunk}}}
 	queryService := &fakeViewQueryServiceClient{
 		queryOnViewStream: func(_ context.Context, node qviews.WorkNode, _ *viewpb.QueryOnViewRequest) (queryutil.ReduceStream, error) {
 			switch node.Key() {
@@ -224,14 +238,15 @@ func TestShardQueryStreamReturnsPerVChannelReduceStream(t *testing.T) {
 	}
 	client := newTestShardClient(1, shardID, plan, queryService)
 
-	stream, shardPlan, err := client.QueryStream(context.Background(), shardID.VChannel, request, nil, 32)
+	stream, shardPlan, err := client.QueryStream(context.Background(), shardID.VChannel, request, nil, 64)
 
 	require.NoError(t, err)
 	require.Equal(t, shardID, shardPlan.ShardID)
-	require.Equal(t, int64(32), queryService.queryReq.GetStreamChunkBytes())
+	require.Equal(t, int64(64), queryService.queryReq.GetStreamChunkBytes())
 	chunk, err := stream.Recv()
 	require.NoError(t, err)
 	require.Equal(t, []int64{1, 2}, chunk.GetIds().GetIntId().GetData())
+	require.Equal(t, []int64{20, 20}, chunk.GetFieldsData()[1].GetScalars().GetLongData().GetData())
 	chunk, err = stream.Recv()
 	require.NoError(t, err)
 	require.Equal(t, []int64{3}, chunk.GetIds().GetIntId().GetData())
