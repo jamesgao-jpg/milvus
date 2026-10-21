@@ -165,8 +165,9 @@ func TestSearchTaskSupportsStreamingReduce(t *testing.T) {
 		{name: "default search type", task: &searchTask{SearchRequest: &internalpb.SearchRequest{}}, want: false},
 		{name: "advanced search", task: &searchTask{SearchRequest: &internalpb.SearchRequest{IsAdvanced: true}}, want: false},
 		{name: "sub requests", task: &searchTask{SearchRequest: &internalpb.SearchRequest{SubReqs: []*internalpb.SubSearchRequest{{}}}}, want: false},
-		{name: "group by", task: &searchTask{SearchRequest: &internalpb.SearchRequest{GroupByFieldId: 100}}, want: false},
-		{name: "multi-field group by", task: &searchTask{SearchRequest: &internalpb.SearchRequest{GroupByFieldIds: []int64{100, 101}}}, want: false},
+		{name: "group by", task: &searchTask{SearchRequest: &internalpb.SearchRequest{GroupByFieldId: 100}}, want: true},
+		{name: "multi-field group by", task: &searchTask{SearchRequest: &internalpb.SearchRequest{GroupByFieldIds: []int64{100, 101}}}, want: true},
+		{name: "group by iterator", task: &searchTask{SearchRequest: &internalpb.SearchRequest{GroupByFieldId: 100, IsIterator: true}}, want: false},
 		{name: "search aggregation", task: &searchTask{SearchRequest: &internalpb.SearchRequest{SearchType: internalpb.SearchType_PURE_ANN_SEARCH_NO_FILTER}, aggCtx: &search_agg.SearchAggregationContext{}}, want: false},
 		{name: "order by", task: &searchTask{SearchRequest: &internalpb.SearchRequest{SearchType: internalpb.SearchType_PURE_ANN_SEARCH_NO_FILTER}, orderByFields: []OrderByField{{FieldName: "price"}}}, want: true},
 	}

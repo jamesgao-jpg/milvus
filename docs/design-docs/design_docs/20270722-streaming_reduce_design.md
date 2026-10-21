@@ -23,6 +23,10 @@ Plain ANN Search reduction semantics. Non-iterator Query and Search requests
 remain on the existing batch path. Scenario lists elsewhere in this document
 describe algorithmic applicability and do not expand the active milestone.
 
+Approved extension: ordinary Search Group By uses `OrderedReduceStream` and
+preserves the existing Batch reduction semantics, including intermediate group
+pruning. Search aggregation and hybrid Search remain on the existing Batch path.
+
 ## 2. Motivation
 
 Current Query and Search fan-ins retain complete results from direct children before invoking component-owned batch reducers. Peak request memory can therefore contain all child results, reduction state, and current-level output at the same time.
@@ -138,6 +142,7 @@ Before continuing, we briefly define the blocking-related concepts, so we are on
 | Reduction input | `Unit.ByteSize()` includes |
 | --- | --- |
 | Plain ANN Search | Primary key, score, returned field values, and an element index when present |
+| Search Group By | Primary key, score, group key fields, returned field values, and an element index when present |
 | Plain Query | Primary key and returned field values |
 | Group reduction | Group key and partial aggregate value |
 
@@ -372,8 +377,24 @@ UnOrdered Merge -> UnOrderedReduceStream
 `OrderedReduceStream` is the most applicable paradigm which covers the following cases:
 
 - ANN search (Includes variants such as Search Order By)
+- Search Group By
 - Query Order By
 - Plain Query
+
+Search Group By selects hits in score order while tracking distinct groups and
+member counts independently for each query vector across Chunks. Each
+per-vchannel stream retains up to `topK` groups and `group_size` hits per group,
+with its existing PK/element deduplication. The final stream applies the same
+group limits and skips `offset` groups. Proxy assembles selected hits into
+contiguous groups for the final response without ranking them again. With
+Search Order By, reduction keeps the full candidate group window; the existing
+final ordering stage sorts and applies group pagination.
+
+This deliberately preserves Batch's intermediate pruning: a lower-level
+reduction can discard members of a group that later wins in the final
+reduction. The stream cannot recover those discarded members. Strengthening
+this behavior and separating the existing semantic branches are not part of
+this extension.
 
 This paradigm, in combination with the chunking design mentioned above, looks roughly like this:
 
@@ -434,8 +455,8 @@ ProduceNextUnits(readyBuffers, remainingBytes):
 `UnOrderedReduceStream` applies to Query Group By. Child input can be consumed
 without establishing cross-child ordering, but a later Unit may update an
 existing group. The stream therefore retains the output map and does not emit
-groups until all children drain. Plain Query remains on `OrderedReduceStream`;
-Search Group By is outside the current implementation scope.
+groups until all children drain. Plain Query and Search Group By remain on
+`OrderedReduceStream`; Search Group By requires score-ordered child heads.
 
 ```text
 GetReadyBuffers(childStreams, childBuffers):
@@ -488,7 +509,7 @@ CreateOutputChunk(outputBuffer):
 
 | Reduction strategy | Scenarios |
 | --- | --- |
-| Ordered Merge | - ANN search (Includes variants such as Search Order By)<br>- Plain Query<br>- Query Order By |
+| Ordered Merge | - ANN search (Includes variants such as Search Order By)<br>- Search Group By<br>- Plain Query<br>- Query Order By |
 | UnOrdered Merge | - Query Group By, with optional final ordering after group reduction |
 
 ![ReduceStream implementation comparison](assets/stream_design_v3/reduce-stream-recv-strategies.svg)
