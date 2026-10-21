@@ -43,7 +43,7 @@ func newQueryViewClient(owner *clientImpl, conn lazygrpc.Conn) *queryViewClient 
 		paramtable.Get().ProxyCfg.EnableReusableQueryStream.GetAsBool() {
 		ctx, cancel := context.WithCancel(context.Background())
 		client.stopReusable = cancel
-		client.reusableQueries = queryutil.NewReusableQueryStreamPool(ctx)
+		client.reusableQueries = queryutil.NewReusableQueryStreamPool(ctx, paramtable.Get().ProxyCfg.ReusableQueryStreamPoolSize.GetAsInt())
 		if owner.rb != nil {
 			client.reusableWatch.Add(1)
 			go func() {

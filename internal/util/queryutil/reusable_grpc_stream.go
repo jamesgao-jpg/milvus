@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"slices"
 	"sync"
 	"time"
 
@@ -26,12 +27,13 @@ import (
 
 const reusableQueryIdleTimeout = time.Minute
 
-// ReusableQueryStreamPool owns at most one idle or leased RPC per QueryNode.
+// ReusableQueryStreamPool bounds opening, idle, and leased RPCs per QueryNode.
 type ReusableQueryStreamPool struct {
 	mu          sync.Mutex
 	ctx         context.Context
 	cancel      context.CancelFunc
-	entries     map[int64]*reusableQueryRPC
+	entries     map[int64][]*reusableQueryRPC
+	size        int
 	idleTimeout time.Duration
 	closed      bool
 	nextRPCID   uint64
@@ -58,10 +60,10 @@ type reusableQueryRPC struct {
 }
 
 // NewReusableQueryStreamPool binds cached RPCs to the client's lifetime, not a Query.
-func NewReusableQueryStreamPool(ctx context.Context) *ReusableQueryStreamPool {
+func NewReusableQueryStreamPool(ctx context.Context, size int) *ReusableQueryStreamPool {
 	ctx, cancel := context.WithCancel(ctx)
 	return &ReusableQueryStreamPool{
-		ctx: ctx, cancel: cancel, entries: make(map[int64]*reusableQueryRPC), idleTimeout: reusableQueryIdleTimeout,
+		ctx: ctx, cancel: cancel, entries: make(map[int64][]*reusableQueryRPC), size: max(1, size), idleTimeout: reusableQueryIdleTimeout,
 		stats: ReusableQueryStreamStats{Evicted: make(map[string]uint64)},
 	}
 }
@@ -100,18 +102,22 @@ func (p *ReusableQueryStreamPool) NewStream(ctx context.Context, client viewpb.V
 	}
 	otel.GetTextMapPropagator().Inject(ctx, traceContext)
 
-	// Reserve the single entry before opening it, so concurrent requests never wait.
+	// Reserve capacity before opening outside the lock; overflow requests never wait.
 	p.mu.Lock()
 	if p.closed || p.ctx.Err() != nil {
 		p.mu.Unlock()
 		return nil, context.Canceled
 	}
-	rpc := p.entries[nodeID]
-	if rpc != nil && rpc.ctx.Err() != nil {
-		p.evictLocked(nodeID, rpc, "transport_error")
-		rpc = nil
+	var rpc *reusableQueryRPC
+	for i := len(p.entries[nodeID]) - 1; i >= 0; i-- {
+		candidate := p.entries[nodeID][i]
+		if candidate.ctx.Err() != nil {
+			p.evictLocked(nodeID, candidate, "transport_error")
+		} else if !candidate.busy {
+			rpc = candidate
+		}
 	}
-	if rpc != nil && rpc.busy {
+	if rpc == nil && len(p.entries[nodeID]) >= p.size {
 		p.stats.BusyFallbacks++
 		metrics.ProxyReusableQueryStreamEvents.WithLabelValues("busy_fallback").Inc()
 		p.mu.Unlock()
@@ -122,7 +128,7 @@ func (p *ReusableQueryStreamPool) NewStream(ctx context.Context, client viewpb.V
 		rpcCtx, cancel := context.WithCancel(contextutil.WithPickServerID(p.ctx, nodeID))
 		p.nextRPCID++
 		rpc = &reusableQueryRPC{id: p.nextRPCID, ctx: rpcCtx, cancel: cancel}
-		p.entries[nodeID] = rpc
+		p.entries[nodeID] = append(p.entries[nodeID], rpc)
 	} else {
 		rpc.timer.Stop()
 		rpc.idleGeneration++
@@ -198,11 +204,13 @@ func (p *ReusableQueryStreamPool) Stats() ReusableQueryStreamStats {
 	for reason, count := range p.stats.Evicted {
 		result.Evicted[reason] = count
 	}
-	for _, rpc := range p.entries {
-		if rpc.busy {
-			result.Leased++
-		} else {
-			result.Idle++
+	for _, rpcs := range p.entries {
+		for _, rpc := range rpcs {
+			if rpc.busy {
+				result.Leased++
+			} else {
+				result.Idle++
+			}
 		}
 	}
 	return result
@@ -212,9 +220,11 @@ func (p *ReusableQueryStreamPool) Stats() ReusableQueryStreamStats {
 func (p *ReusableQueryStreamPool) RetainNodes(nodes map[int64]struct{}) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for nodeID, rpc := range p.entries {
+	for nodeID, rpcs := range p.entries {
 		if _, exists := nodes[nodeID]; !exists {
-			p.evictLocked(nodeID, rpc, "node_removed")
+			for i := len(rpcs) - 1; i >= 0; i-- {
+				p.evictLocked(nodeID, rpcs[i], "node_removed")
+			}
 		}
 	}
 }
@@ -225,18 +235,27 @@ func (p *ReusableQueryStreamPool) Close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.closed = true
-	for nodeID, rpc := range p.entries {
-		p.evictLocked(nodeID, rpc, "shutdown")
+	for nodeID, rpcs := range p.entries {
+		for i := len(rpcs) - 1; i >= 0; i-- {
+			p.evictLocked(nodeID, rpcs[i], "shutdown")
+		}
 	}
 }
 
 // evictLocked removes only this entry, never a replacement opened by a later request.
 func (p *ReusableQueryStreamPool) evictLocked(nodeID int64, rpc *reusableQueryRPC, reason string) {
 	rpc.cancel()
-	if p.entries[nodeID] != rpc {
+	rpcs := p.entries[nodeID]
+	index := slices.Index(rpcs, rpc)
+	if index < 0 {
 		return
 	}
-	delete(p.entries, nodeID)
+	rpcs = slices.Delete(rpcs, index, index+1)
+	if len(rpcs) == 0 {
+		delete(p.entries, nodeID)
+	} else {
+		p.entries[nodeID] = rpcs
+	}
 	if rpc.timer != nil {
 		rpc.timer.Stop()
 	}
@@ -379,7 +398,7 @@ func (s *reusableQueryStream) Close() error {
 		defer s.ioMu.Unlock()
 		s.pool.mu.Lock()
 		defer s.pool.mu.Unlock()
-		if s.pool.entries[s.nodeID] != s.rpc {
+		if !slices.Contains(s.pool.entries[s.nodeID], s.rpc) {
 			return
 		}
 		if !healthy || s.rpc.ctx.Err() != nil || s.pool.closed {
@@ -399,7 +418,7 @@ func (s *reusableQueryStream) Close() error {
 		rpc.timer = time.AfterFunc(pool.idleTimeout, func() {
 			pool.mu.Lock()
 			defer pool.mu.Unlock()
-			if pool.entries[nodeID] == rpc && !rpc.busy && rpc.idleGeneration == generation {
+			if slices.Contains(pool.entries[nodeID], rpc) && !rpc.busy && rpc.idleGeneration == generation {
 				pool.evictLocked(nodeID, rpc, "idle_expired")
 			}
 		})

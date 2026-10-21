@@ -2565,6 +2565,7 @@ type proxyConfig struct {
 	QueryNodePoolingSize         ParamItem `refreshable:"false"`
 	EnableReduceStream           ParamItem `refreshable:"false"`
 	EnableReusableQueryStream    ParamItem `refreshable:"false"`
+	ReusableQueryStreamPoolSize  ParamItem `refreshable:"false"`
 	ReduceStreamChunkBytes       ParamItem `refreshable:"false"`
 	EnableSearchBenchmarkMetrics ParamItem `refreshable:"false"`
 
@@ -3372,6 +3373,16 @@ Disabled if the value is less or equal to 0.`,
 		Export:       true,
 	}
 	p.EnableReusableQueryStream.Init(base.mgr)
+
+	p.ReusableQueryStreamPoolSize = ParamItem{
+		Key:          "proxy.queryView.reusableQueryStreamPoolSize",
+		Version:      "3.0.0",
+		DefaultValue: "1",
+		Formatter:    positiveProxyLimitFormatter("1"),
+		Doc:          "benchmark-only per-QueryNode cap on opening, idle, and leased reusable Query RPCs; overflow uses request-scoped streaming",
+		Export:       true,
+	}
+	p.ReusableQueryStreamPoolSize.Init(base.mgr)
 
 	p.ReduceStreamChunkBytes = ParamItem{
 		Key:          "proxy.queryView.reduceStreamChunkBytes",

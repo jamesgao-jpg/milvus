@@ -2,12 +2,12 @@
 
 ## Status and Scope
 
-Design v0 approved by the user on 2026-10-19, including one reusable RPC per
-Proxy client/QueryNode pair, exclusive use, and request-scoped fallback when
-busy. The user approved full implementation and the line-budget exception.
-The benchmark-only prototype is implemented and has targeted local/ARM test
-coverage, but is not production-ready. End-to-end experiment execution remains
-pending. Keep it disabled by default and confined to
+Design v0 approved by the user on 2026-10-19, including exclusive use and
+request-scoped fallback when busy. On 2026-10-21 the user approved extending
+the single-RPC capacity to a configurable bounded pool per Proxy client/QN
+pair, including the scoped implementation/test line-budget exception.
+The benchmark-only prototype is not production-ready. Keep it disabled by
+default and confined to
 `codex/qv-reducestream-e2e-benchmark-20260915`.
 
 The [Streaming Reduce design](20270722-streaming_reduce_design.md) remains
@@ -58,14 +58,15 @@ Proxy request A                         Proxy request B
   fresh final ReduceStream                fresh final ReduceStream
     fresh per-vchannel ReduceStream         fresh per-vchannel ReduceStream
       fresh child adapter                   fresh child adapter
-              | exclusive use, then cleanup |
+              | exclusive lease             | exclusive lease
+              v                             v
+     reusable Query RPC 1          reusable Query RPC 2
+              |                             |
               +--------------+--------------+
-                             |
-               reusable Query gRPC RPC
-                             |
+                             v
                          QueryNode
-                execute A; release A resources
-                execute B; release B resources
+               execute A and B independently
+               release each request's resources
 ```
 
 Only the RPC and its fixed transport context are retained. Existing channels,
@@ -74,9 +75,10 @@ control remain unchanged. Do not create a new channel for each cached RPC.
 
 ## Selection and Bounded Reuse
 
-Proposed single new benchmark-only switch:
-`proxy.queryView.enableReusableQueryStream=false`. The prototype implements
-this key. The existing `enableReduceStream` gate takes precedence.
+The benchmark-only switch is
+`proxy.queryView.enableReusableQueryStream=false`. The existing
+`enableReduceStream` gate takes precedence. Pool capacity is configured with
+`proxy.queryView.reusableQueryStreamPoolSize=1`; nonpositive values use 1.
 
 | Configuration and request | Selected path |
 | --- | --- |
@@ -89,14 +91,24 @@ Keep selection inside the existing QueryNode client transport implementation;
 the Proxy/legacy caller still obtains a request-scoped `queryutil.ReduceStream`.
 Do not add pooling operations to the caller-facing interface.
 
-For the first prototype, retain at most one reusable RPC, idle or leased, per
-QueryNode ID in the existing QueryNode client. A concurrent request finding it
-leased uses the existing request-scoped RPC immediately: no waiting queue,
-multiplexing, or unbounded pool growth. Record this fallback explicitly.
+For each QueryNode ID, retain at most K reusable RPCs in the existing QueryNode
+client. K includes opening, idle, and leased RPCs; the default K=1 preserves
+the original prototype's capacity. Each RPC is leased exclusively to one
+logical request, without multiplexing concurrent requests inside it.
 
-An idle RPC expires after a proposed fixed 60 seconds. Node removal, client
-shutdown, or any detected transport failure closes and removes it. Client
-shutdown must cancel leased and idle RPCs before closing the underlying service.
+1. Reuse an idle RPC when one exists.
+2. Otherwise, reserve one slot under the pool lock if the count is below K,
+   then open the RPC outside that lock.
+3. At capacity, use the existing request-scoped RPC immediately. Do not wait,
+   open beyond K, or block other nodes while a transport opens.
+
+Record overflow fallback explicitly. A successful exchange returns its RPC
+to idle only after adapter cleanup. Cancellation, early Close, protocol errors,
+and logical/transport errors evict only the affected RPC, not its siblings.
+
+Each idle RPC expires after a fixed 60 seconds. Node removal closes all RPCs
+for that node; client shutdown closes all pooled RPCs. Client shutdown must
+cancel leased and idle RPCs before closing the underlying service.
 Cache entries must not retain unregistered node IDs indefinitely.
 
 Scope reuse by node identity, method, and fixed routing/security metadata. Never
@@ -233,6 +245,25 @@ completions, and live idle/leased counts. Request/RPC IDs belong in retained
 diagnostic records, not high-cardinality Prometheus labels. Connection bytes
 remain connection-scoped; do not present them as exact per-request bytes.
 
+For a concurrency experiment intended to isolate reuse, warm up with concurrent
+requests before measurement. Sequential warm-up can leave only one RPC open.
+Choose K for the maximum simultaneous child requests to each QN, not client
+concurrency divided by the number of QNs: each parent request can contact every
+QN, and multiple vchannels may contact the same QN.
+
+Use measured counter deltas to qualify a pure-reuse interval:
+
+| Counter | Required measured value |
+| --- | --- |
+| Opened RPCs | 0 |
+| Busy fallbacks | 0 |
+| Reused RPC leases | Expected logical child-request count |
+| Evictions | Report separately by reason; do not hide replacement opens |
+
+If reduction stops before child completion, preserve early Close and eviction.
+Do not drain unused tails merely to pass the reuse gate. Label an interval with
+new opens or fallbacks as mixed transport rather than a pure-reuse comparison.
+
 Validation is defined separately in
 `unary_streaming_grpc_benchmark/milvus_result/test_1019_01/TEST_PLAN.md`.
 Correctness, cleanup, error propagation, and unchanged baseline paths gate
@@ -240,11 +271,14 @@ performance testing. Compare Batch, request-scoped streaming, and reusable
 streaming in one optimized binary; profile Proxy and QN separately from timed
 runs and normalize CPU and allocations per completed Query.
 
-Approved design decisions include the new wire method and terminal-status
-contract, single-entry-per-QN/busy-fallback policy, fixed idle expiry, and
-disabled-by-default selection. A larger pool, multiplexing, and SN reuse remain
-outside this version. The context/metadata audit is an implementation gate.
+Approved design decisions include the existing wire method and terminal-status
+contract, bounded per-QN capacity with immediate overflow fallback, fixed idle
+expiry, and disabled-by-default selection. Multiplexing and SN reuse remain
+outside this version. The context/metadata audit remains unchanged.
 Implementation verification is recorded in
 `unary_streaming_grpc_benchmark/milvus_result/test_1019_01/implementation_verification.md`.
-The experiment runner, deployed E2E qualification, and performance results remain
-pending. The feature-only `qv` branch is unchanged.
+The pool extension requires capacity/opening, concurrent reuse, sibling failure
+isolation, expiry, node-removal, and shutdown tests, including race detection
+and real TCP gRPC. These tests do not establish a performance benefit; a new
+concurrent Milvus experiment requires its own plan and runner. The feature-only
+`qv` branch is unchanged.

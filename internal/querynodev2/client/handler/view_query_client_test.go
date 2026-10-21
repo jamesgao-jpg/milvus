@@ -279,6 +279,15 @@ func TestReusableQueryClientSelection(t *testing.T) {
 
 // TestReusableQueryClientBusyFallback proves the actual QN client uses legacy transport when leased.
 func TestReusableQueryClientBusyFallback(t *testing.T) {
+	paramtable.Init()
+	params := paramtable.Get()
+	for _, key := range []string{params.ProxyCfg.EnableReduceStream.Key, params.ProxyCfg.EnableReusableQueryStream.Key, params.ProxyCfg.ReusableQueryStreamPoolSize.Key} {
+		value := params.GetWithDefault(key, "")
+		t.Cleanup(func() { _ = params.Save(key, value) })
+	}
+	require.NoError(t, params.Save(params.ProxyCfg.EnableReduceStream.Key, "true"))
+	require.NoError(t, params.Save(params.ProxyCfg.EnableReusableQueryStream.Key, "true"))
+	require.NoError(t, params.Save(params.ProxyCfg.ReusableQueryStreamPoolSize.Key, "3"))
 	var reusableOpens, ordinaryOpens int
 	service := &fakeViewQueryServiceClient{
 		queryReusable: func(ctx context.Context) (viewpb.ViewQueryService_QueryOnViewStreamReusableClient, error) {
@@ -294,27 +303,36 @@ func TestReusableQueryClientBusyFallback(t *testing.T) {
 		},
 	}
 	owner := &clientImpl{lifetime: typeutil.NewLifetime()}
-	owner.queryViewClient = &queryViewClient{owner: owner, service: fakeLazyService[viewpb.ViewQueryServiceClient]{service: service},
-		reusableQueries: queryutil.NewReusableQueryStreamPool(context.Background())}
+	owner.queryViewClient = newQueryViewClient(owner, fakeLazyService[viewpb.ViewQueryServiceClient]{service: service})
+	owner.queryViewClient.service = fakeLazyService[viewpb.ViewQueryServiceClient]{service: service}
 	defer owner.Close()
 	request := &viewpb.QueryOnViewRequest{LegacyReq: &internalpb.RetrieveRequest{Limit: 2}, StreamChunkBytes: 262144}
-	first, err := owner.QueryViewClient().QueryOnViewStream(context.Background(), 11, request)
-	require.NoError(t, err)
+	streams := make([]queryutil.ReduceStream, 3)
+	for i := range streams {
+		var err error
+		streams[i], err = owner.QueryViewClient().QueryOnViewStream(context.Background(), 11, request)
+		require.NoError(t, err)
+	}
+	require.Equal(t, 3, reusableOpens, "configured cap must reach the QN client pool")
 	second, err := owner.QueryViewClient().QueryOnViewStream(context.Background(), 11, request)
 	require.NoError(t, err)
 	require.Equal(t, 1, ordinaryOpens)
 	_, err = second.Recv()
 	require.ErrorIs(t, err, io.EOF)
 	require.NoError(t, second.Close())
-	_, err = first.Recv()
-	require.ErrorIs(t, err, io.EOF)
-	require.NoError(t, first.Close())
+	for _, stream := range streams {
+		_, err = stream.Recv()
+		require.ErrorIs(t, err, io.EOF)
+		require.NoError(t, stream.Close())
+	}
 	third, err := owner.QueryViewClient().QueryOnViewStream(context.Background(), 11, request)
 	require.NoError(t, err)
 	_, err = third.Recv()
 	require.ErrorIs(t, err, io.EOF)
 	require.NoError(t, third.Close())
-	require.Equal(t, 1, reusableOpens)
+	require.Equal(t, 3, reusableOpens)
+	require.Equal(t, uint64(1), owner.queryViewClient.reusableQueries.Stats().BusyFallbacks)
+	require.Equal(t, uint64(1), owner.queryViewClient.reusableQueries.Stats().Reused)
 }
 
 // fakeReusableQueryClientStream produces an explicit completion for each request ID.

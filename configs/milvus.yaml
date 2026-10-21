@@ -478,6 +478,7 @@ proxy:
   queryView:
     enableReduceStream: false # Route supported requests through Streaming Reduce.
     enableReusableQueryStream: false # Benchmark-only: reuse completed Plain Query RPCs to each QueryNode.
+    reusableQueryStreamPoolSize: 1 # Benchmark-only per-QN cap, including opening, idle, and leased RPCs; overflow uses request-scoped streaming.
     reduceStreamChunkBytes: 262144 # Reducible-payload byte threshold for each stream Chunk.
     enableSearchBenchmarkMetrics: false # Enable diagnostic QueryView Search benchmark metrics.
   partialResultRequiredDataRatio: 1 # partial result required data ratio, default to 1 which means disable partial result, otherwise, it will be used as the minimum data ratio for partial result

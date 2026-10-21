@@ -7,10 +7,12 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
@@ -39,7 +41,7 @@ func TestReusableQueryRequestsAreIsolated(t *testing.T) {
 	t.Cleanup(func() { otel.SetTextMapPropagator(previous) })
 	provider := &reusableQueryProvider{observed: make(chan reusableQueryObservation, 100)}
 	client, opens := startReusableQueryServer(t, NewServer(provider, &reusableQueryScheduler{}))
-	pool := queryutil.NewReusableQueryStreamPool(context.Background())
+	pool := queryutil.NewReusableQueryStreamPool(context.Background(), 1)
 	defer pool.Close()
 
 	// Every request gets new tasks, context, MVCC, result metadata, and a fresh adapter.
@@ -86,6 +88,76 @@ func TestReusableQueryRequestsAreIsolated(t *testing.T) {
 	require.Zero(t, pool.Stats().Idle)
 }
 
+func TestReusableQueryConcurrentPoolOverTCP(t *testing.T) {
+	for _, size := range []int{1, 4, 16} {
+		t.Run(strconv.Itoa(size), func(t *testing.T) {
+			provider := &reusableQueryProvider{}
+			client, opens := startReusableQueryServer(t, NewServer(provider, &reusableQueryScheduler{}))
+			pool := queryutil.NewReusableQueryStreamPool(context.Background(), size)
+			defer pool.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			const waves = 10
+			for wave := 0; wave < waves; wave++ {
+				type lease struct {
+					stream queryutil.ReduceStream
+					id     int64
+					err    error
+				}
+				ready := make(chan lease, size)
+				start := make(chan struct{})
+				for i := 0; i < size; i++ {
+					id := int64(wave*size + i + 1)
+					go func() {
+						<-start
+						stream, err := pool.NewStream(ctx, client, 11, reusableQueryRequest(id))
+						ready <- lease{stream, id, err}
+					}()
+				}
+				close(start)
+				leases := make([]lease, size)
+				for i := range leases {
+					leases[i] = <-ready
+					require.NoError(t, leases[i].err)
+					require.NotNil(t, leases[i].stream, "pool must not fall back within its capacity")
+				}
+				require.Equal(t, size, pool.Stats().Leased)
+				var consumers sync.WaitGroup
+				for _, lease := range leases {
+					consumers.Add(1)
+					go func() {
+						defer consumers.Done()
+						defer lease.stream.Close()
+						chunk, err := lease.stream.Recv()
+						if !assert.NoError(t, err) || !assert.NotNil(t, chunk) {
+							return
+						}
+						assert.Equal(t, []int64{lease.id}, chunk.GetIds().GetIntId().GetData())
+						assert.Equal(t, lease.id, chunk.GetReqID())
+						if assert.Len(t, chunk.GetFieldsData(), 1) {
+							assert.Equal(t, []int64{lease.id * 10}, chunk.GetFieldsData()[0].GetScalars().GetLongData().GetData())
+						}
+						_, err = lease.stream.Recv()
+						assert.ErrorIs(t, err, io.EOF)
+						assert.NoError(t, lease.stream.Close())
+					}()
+				}
+				consumers.Wait()
+				stats := pool.Stats()
+				require.Equal(t, uint64(size), stats.Opened, "no new RPCs after the first concurrent wave")
+				require.Zero(t, stats.BusyFallbacks)
+				require.Equal(t, uint64(wave*size), stats.Reused)
+				require.Equal(t, size, stats.Idle)
+				require.Zero(t, stats.Leased)
+				require.Empty(t, stats.Evicted)
+			}
+			require.Equal(t, int64(size), opens.Load())
+			require.Equal(t, int64(waves*size), provider.released.Load())
+			require.Equal(t, uint64(waves*size), pool.Stats().Completed)
+		})
+	}
+}
+
 // TestReusableQueryLogicalErrors preserves every ViewCode and non-retryable status before/after output.
 func TestReusableQueryLogicalErrors(t *testing.T) {
 	failures := []error{
@@ -121,7 +193,7 @@ func TestReusableQueryLogicalErrors(t *testing.T) {
 					return stream.Send(&viewpb.QueryOnViewStreamReusableResponse{RequestId: request.GetRequestId(), CompletionStatus: terminal})
 				}}
 				client, opens := startReusableQueryServer(t, service)
-				pool := queryutil.NewReusableQueryStreamPool(context.Background())
+				pool := queryutil.NewReusableQueryStreamPool(context.Background(), 1)
 				defer pool.Close()
 				stream, err := pool.NewStream(context.Background(), client, 11, reusableQueryRequest(1))
 				require.NoError(t, err)
@@ -168,7 +240,7 @@ func TestReusableQueryAbortsWithoutDraining(t *testing.T) {
 				return stream.Context().Err()
 			}}
 			client, _ := startReusableQueryServer(t, service)
-			pool := queryutil.NewReusableQueryStreamPool(context.Background())
+			pool := queryutil.NewReusableQueryStreamPool(context.Background(), 1)
 			defer pool.Close()
 			ctx, cancel := context.WithCancel(context.Background())
 			if mode == "deadline" {
@@ -242,7 +314,7 @@ func TestReusableQueryProtocolValidation(t *testing.T) {
 				return nil
 			}}
 			client, _ := startReusableQueryServer(t, service)
-			pool := queryutil.NewReusableQueryStreamPool(context.Background())
+			pool := queryutil.NewReusableQueryStreamPool(context.Background(), 1)
 			defer pool.Close()
 			stream, err := pool.NewStream(context.Background(), client, 11, reusableQueryRequest(1))
 			require.NoError(t, err)
@@ -264,7 +336,7 @@ func TestReusableQueryProtocolValidation(t *testing.T) {
 func TestReusableQueryEmptyAndBusy(t *testing.T) {
 	provider := &reusableQueryProvider{}
 	client, _ := startReusableQueryServer(t, NewServer(provider, &reusableQueryScheduler{}))
-	pool := queryutil.NewReusableQueryStreamPool(context.Background())
+	pool := queryutil.NewReusableQueryStreamPool(context.Background(), 1)
 	defer pool.Close()
 	first, err := pool.NewStream(context.Background(), client, 11, reusableQueryRequest(1))
 	require.NoError(t, err)
@@ -293,7 +365,7 @@ func TestReusableQueryEmptyAndBusy(t *testing.T) {
 // TestReusableQueryLateCancellationCannotKillNextRequest races old cleanup against a new owner.
 func TestReusableQueryLateCancellationCannotKillNextRequest(t *testing.T) {
 	client, opens := startReusableQueryServer(t, NewServer(&reusableQueryProvider{}, &reusableQueryScheduler{}))
-	pool := queryutil.NewReusableQueryStreamPool(context.Background())
+	pool := queryutil.NewReusableQueryStreamPool(context.Background(), 1)
 	defer pool.Close()
 	for i := int64(1); i <= 50; i++ {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -335,7 +407,7 @@ func TestReusableQueryRejectsLateFrames(t *testing.T) {
 		return stream.Context().Err()
 	}}
 	client, _ := startReusableQueryServer(t, service)
-	pool := queryutil.NewReusableQueryStreamPool(context.Background())
+	pool := queryutil.NewReusableQueryStreamPool(context.Background(), 1)
 	defer pool.Close()
 	first, err := pool.NewStream(context.Background(), client, 11, reusableQueryRequest(1))
 	require.NoError(t, err)
@@ -359,7 +431,7 @@ func TestReusableQueryServerPreservesViewErrors(t *testing.T) {
 	} {
 		t.Run(failure.Code.String(), func(t *testing.T) {
 			client, _ := startReusableQueryServer(t, NewServer(&reusableQueryProvider{failure: failure}, &reusableQueryScheduler{}))
-			pool := queryutil.NewReusableQueryStreamPool(context.Background())
+			pool := queryutil.NewReusableQueryStreamPool(context.Background(), 1)
 			defer pool.Close()
 			stream, err := pool.NewStream(context.Background(), client, 11, reusableQueryRequest(1))
 			require.NoError(t, err)
@@ -376,7 +448,7 @@ func TestReusableQueryServerPreservesViewErrors(t *testing.T) {
 // TestReusableQueryMultiChunkCompletion reuses the RPC only after the final complete Chunk.
 func TestReusableQueryMultiChunkCompletion(t *testing.T) {
 	client, opens := startReusableQueryServer(t, NewServer(&reusableQueryProvider{}, &reusableQueryScheduler{rows: 5}))
-	pool := queryutil.NewReusableQueryStreamPool(context.Background())
+	pool := queryutil.NewReusableQueryStreamPool(context.Background(), 1)
 	defer pool.Close()
 	for i := int64(1); i <= 2; i++ {
 		request := reusableQueryRequest(i)
@@ -410,7 +482,7 @@ func TestReusableQueryLegacyStatusSurvivesCompletion(t *testing.T) {
 	client, _ := startReusableQueryServer(t, NewServer(&reusableQueryProvider{}, &reusableQueryScheduler{
 		result: &internalpb.RetrieveResults{Status: merr.Status(original)},
 	}))
-	pool := queryutil.NewReusableQueryStreamPool(context.Background())
+	pool := queryutil.NewReusableQueryStreamPool(context.Background(), 1)
 	defer pool.Close()
 	stream, err := pool.NewStream(context.Background(), client, 11, reusableQueryRequest(1))
 	require.NoError(t, err)
@@ -431,7 +503,7 @@ func TestReusableQueryIdleTransportClosure(t *testing.T) {
 		return sendReusableQuerySuccess(stream, request.GetRequestId(), nil)
 	}}
 	client, _ := startReusableQueryServer(t, service)
-	pool := queryutil.NewReusableQueryStreamPool(context.Background())
+	pool := queryutil.NewReusableQueryStreamPool(context.Background(), 1)
 	defer pool.Close()
 	stream, err := pool.NewStream(context.Background(), client, 11, reusableQueryRequest(1))
 	require.NoError(t, err)
