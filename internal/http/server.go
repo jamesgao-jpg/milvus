@@ -80,6 +80,7 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 }
 
 func registerDefaults() {
+	registerBenchmarkCPUProfile(os.Getenv("MILVUS_BENCHMARK_CPU_PROFILE_DIR"))
 	Register(&Handler{
 		Path: LogLevelRouterPath,
 		HandlerFunc: func(w http.ResponseWriter, req *http.Request) {
