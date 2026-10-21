@@ -103,6 +103,11 @@ func (reducer *GroupAggReducer) EmptyAggResult() (*AggregationResult, error) {
 			ret.fieldDatas = append(ret.fieldDatas, emptyFieldData)
 		}
 	}
+	if len(reducer.groupByFieldIds) > 0 {
+		// Empty GROUP BY has no groups, so aggregate columns must also have zero rows.
+		// Global COUNT without GROUP BY must retain its single zero row.
+		ret.fieldDatas = typeutil.PrepareResultFieldData(ret.fieldDatas, 0)
+	}
 	return ret, nil
 }
 
