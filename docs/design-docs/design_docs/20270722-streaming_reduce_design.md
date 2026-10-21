@@ -23,9 +23,11 @@ Plain ANN Search reduction semantics. Non-iterator Query and Search requests
 remain on the existing batch path. Scenario lists elsewhere in this document
 describe algorithmic applicability and do not expand the active milestone.
 
-Approved extension: ordinary Search Group By uses `OrderedReduceStream` and
-preserves the existing Batch reduction semantics, including intermediate group
-pruning. Search aggregation and hybrid Search remain on the existing Batch path.
+Approved extension: ordinary Search Group By and Search aggregation candidate
+selection use `OrderedReduceStream` and preserve existing Batch reduction
+semantics, including intermediate group pruning. Search aggregation retains its
+existing Proxy-side hierarchical computation after candidate reduction. Hybrid
+Search remains on the existing Batch path.
 
 ## 2. Motivation
 
@@ -142,7 +144,7 @@ Before continuing, we briefly define the blocking-related concepts, so we are on
 | Reduction input | `Unit.ByteSize()` includes |
 | --- | --- |
 | Plain ANN Search | Primary key, score, returned field values, and an element index when present |
-| Search Group By | Primary key, score, group key fields, returned field values, and an element index when present |
+| Search Group By / Search aggregation candidates | Primary key, score, group key fields, returned field values, and an element index when present |
 | Plain Query | Primary key and returned field values |
 | Group reduction | Group key and partial aggregate value |
 
@@ -378,6 +380,7 @@ UnOrdered Merge -> UnOrderedReduceStream
 
 - ANN search (Includes variants such as Search Order By)
 - Search Group By
+- Search aggregation candidate selection
 - Query Order By
 - Plain Query
 
@@ -395,6 +398,17 @@ reduction can discard members of a group that later wins in the final
 reduction. The stream cannot recover those discarded members. Strengthening
 this behavior and separating the existing semantic branches are not part of
 this extension.
+
+Search aggregation derives candidate `topK` from the product of its per-level
+candidate sizes and `group_size` from the largest `top_hits.size`, defaulting to
+one. All hierarchy grouping fields form the composite key used by ordered
+candidate reduction. The final candidate assembly preserves Batch's accepted-hit
+order: composite-key aggregation keeps score-walk order, while single-field
+aggregation retains grouped output. Proxy then runs the existing
+`SearchAggregationComputer` once over the selected candidates to compute nested
+buckets, metrics, bucket ordering, and `top_hits`. This does not make aggregation
+incremental or compute metrics over every matching entity. Existing request
+restrictions, including no aggregation iterator or offset, remain unchanged.
 
 This paradigm, in combination with the chunking design mentioned above, looks roughly like this:
 
@@ -509,7 +523,7 @@ CreateOutputChunk(outputBuffer):
 
 | Reduction strategy | Scenarios |
 | --- | --- |
-| Ordered Merge | - ANN search (Includes variants such as Search Order By)<br>- Search Group By<br>- Plain Query<br>- Query Order By |
+| Ordered Merge | - ANN search (Includes variants such as Search Order By)<br>- Search Group By<br>- Search aggregation candidate selection<br>- Plain Query<br>- Query Order By |
 | UnOrdered Merge | - Query Group By, with optional final ordering after group reduction |
 
 ![ReduceStream implementation comparison](assets/stream_design_v3/reduce-stream-recv-strategies.svg)
