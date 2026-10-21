@@ -145,12 +145,19 @@ Before continuing, we briefly define the blocking-related concepts, so we are on
 | --- | --- |
 | Plain ANN Search | Primary key, score, returned field values, and an element index when present |
 | Search Group By / Search aggregation candidates | Primary key, score, group key fields, returned field values, and an element index when present |
-| Plain Query | Primary key and returned field values |
+| Plain Query | Primary key, returned field values, and matched element indexes when present |
 | Group reduction | Group key and partial aggregate value |
 
 `Unit.ByteSize()` is the encoded protobuf size of only these reducible fields
 after selecting that Unit from its source result. It excludes the enclosing
 Chunk message and all request or result metadata.
+
+For element-level Query (`element_filter`), a Unit remains one complete
+document row with its matched element indexes. The request limit counts
+matched elements rather than document rows. Timestamp-based replacement
+replaces both the row and its indexes and adjusts the matched-element count.
+Chunks retain complete Units, including the row that crosses the result limit;
+final Proxy pagination trims the index list at an element-level page boundary.
 
 The byte threshold excludes protobuf framing and request or result metadata.
 Each Unit is appended in full before the threshold is checked. If appending a
