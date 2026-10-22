@@ -201,7 +201,7 @@ func (s *ChildStreams[T]) Cancel() {
 	s.cancelOnce.Do(func() { close(s.done) })
 }
 
-// Close idempotently closes every child stream and joins pending receives.
+// Close idempotently closes child streams concurrently and joins pending receives.
 // The owner must serialize it with receive scheduling, so no Add races Wait.
 func (s *ChildStreams[T]) Close() error {
 	if s.closed {
@@ -210,12 +210,19 @@ func (s *ChildStreams[T]) Close() error {
 	s.closed = true
 	s.Cancel()
 
-	closeErrors := make([]error, 0, len(s.streams))
+	// Interrupt every child promptly instead of draining earlier siblings first.
+	closeErrors := make([]error, len(s.streams))
+	var closing sync.WaitGroup
 	for i, stream := range s.streams {
-		if err := stream.Close(); err != nil {
-			closeErrors = append(closeErrors, merr.Wrapf(err, "close child stream %d", i))
-		}
+		closing.Add(1)
+		go func() {
+			defer closing.Done()
+			if err := stream.Close(); err != nil {
+				closeErrors[i] = merr.Wrapf(err, "close child stream %d", i)
+			}
+		}()
 	}
+	closing.Wait()
 	s.pending.Wait()
 	// A completion can retain a Chunk that was never accepted after an error.
 	for len(s.completions) > 0 {

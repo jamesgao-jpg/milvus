@@ -18,6 +18,9 @@ package reduce
 
 import (
 	"context"
+	"errors"
+	"io"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -30,6 +33,89 @@ type cancelableChildStream struct {
 	canceled  chan struct{}
 	release   <-chan struct{}
 	closeOnce sync.Once
+}
+
+// blockingCloseChildStream holds cleanup until every sibling can start closing.
+type blockingCloseChildStream struct {
+	index   int
+	started chan<- int
+	release <-chan struct{}
+	err     error
+	calls   int
+}
+
+// Recv makes this cleanup-only fixture immediately drained.
+func (s *blockingCloseChildStream) Recv() (int, error) { return 0, io.EOF }
+
+// Close records each invocation and waits for the shared cleanup release.
+func (s *blockingCloseChildStream) Close() error {
+	s.calls++
+	s.started <- s.index
+	<-s.release
+	return s.err
+}
+
+// TestChildStreamsConcurrentClose checks prompt sibling cleanup and stable errors.
+func TestChildStreamsConcurrentClose(t *testing.T) {
+	for _, count := range []int{0, 1, 4} {
+		t.Run(strconv.Itoa(count), func(t *testing.T) {
+			started, release := make(chan int, count), make(chan struct{})
+			var releaseOnce sync.Once
+			unblock := func() { releaseOnce.Do(func() { close(release) }) }
+			t.Cleanup(unblock)
+			failure := errors.New("child cleanup failed")
+			children := make([]*blockingCloseChildStream, count)
+			for i := range children {
+				children[i] = &blockingCloseChildStream{index: i, started: started, release: release}
+				if i%2 == 0 {
+					children[i].err = failure
+				}
+			}
+			streams := NewChildStreams[int](children)
+			closed := make(chan error, 1)
+			go func() { closed <- streams.Close() }()
+
+			// Every child must enter Close while all earlier children remain blocked.
+			seen := make(map[int]bool)
+			for range count {
+				select {
+				case index := <-started:
+					require.False(t, seen[index])
+					seen[index] = true
+				case <-time.After(5 * time.Second):
+					t.Fatal("not all children started closing before cleanup was released")
+				}
+			}
+			if count > 0 {
+				select {
+				case <-closed:
+					t.Fatal("Close returned before child cleanup finished")
+				default:
+				}
+			}
+			unblock()
+
+			// Preserve every indexed failure and join before exposing the result.
+			select {
+			case err := <-closed:
+				if count == 0 {
+					require.NoError(t, err)
+				} else {
+					require.ErrorIs(t, err, failure)
+					require.Contains(t, err.Error(), "close child stream 0")
+					if count == 4 {
+						require.Contains(t, err.Error(), "close child stream 2")
+					}
+				}
+				require.Equal(t, err, streams.Close())
+			case <-time.After(5 * time.Second):
+				t.Fatal("Close did not join completed child cleanup")
+			}
+			for _, child := range children {
+				require.Equal(t, 1, child.calls)
+			}
+		})
+	}
 }
 
 func (s *cancelableChildStream) Recv() (int, error) {
