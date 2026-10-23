@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -236,9 +237,10 @@ func TestReusableQueryPoolCapacityAndReuse(t *testing.T) {
 }
 
 func TestReusableQueryPoolEvictsOnlyFailedRPC(t *testing.T) {
-	for _, reason := range []string{"early_close", "canceled", "transport_error", "logical_error", "protocol_error"} {
+	for _, reason := range []string{"interrupt_timeout_pending", "canceled", "transport_error", "transport_error_pending", "logical_error", "protocol_error"} {
 		t.Run(reason, func(t *testing.T) {
 			pool := NewReusableQueryStreamPool(context.Background(), 2)
+			pool.interruptTimeout = 10 * time.Millisecond
 			defer pool.Close()
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -248,6 +250,28 @@ func TestReusableQueryPoolEvictsOnlyFailedRPC(t *testing.T) {
 			second, err := pool.NewStream(context.Background(), client, 11, reusableRPCStubRequest())
 			require.NoError(t, err)
 			failed := first.(*reusableQueryStream)
+			if strings.HasSuffix(reason, "_pending") {
+				started, done := make(chan struct{}), make(chan error, 1)
+				release := make(chan struct{})
+				recvErr := status.Error(codes.Canceled, "local close")
+				if reason == "transport_error_pending" {
+					recvErr = status.Error(codes.Unavailable, "read failed")
+					failed.rpc.client.(*reusableRPCStubStream).send = func(*viewpb.QueryOnViewStreamReusableRequest) error { close(release); return nil }
+				}
+				failed.rpc.client.(*reusableRPCStubStream).recv = func() (*viewpb.QueryOnViewStreamReusableResponse, error) {
+					close(started)
+					select {
+					case <-release:
+					case <-failed.rpc.ctx.Done():
+					}
+					return nil, recvErr
+				}
+				go func() { _, err := first.Recv(); done <- err }()
+				<-started
+				require.NoError(t, first.Close())
+				require.ErrorIs(t, <-done, recvErr)
+				reason = strings.TrimSuffix(reason, "_pending")
+			}
 			switch reason {
 			case "canceled":
 				cancel()
@@ -260,12 +284,13 @@ func TestReusableQueryPoolEvictsOnlyFailedRPC(t *testing.T) {
 			case "protocol_error":
 				failed.rpc.client.(*reusableRPCStubStream).response.RequestId++
 			}
-			if reason != "early_close" {
+			if reason != "interrupt_timeout" {
 				_, err = first.Recv()
 				require.Error(t, err)
 			}
 			require.NoError(t, first.Close())
 			require.Equal(t, uint64(1), pool.Stats().Evicted[reason])
+			require.Len(t, pool.Stats().Evicted, 1)
 			require.Equal(t, 1, pool.Stats().Leased)
 			_, err = second.Recv()
 			require.ErrorIs(t, err, io.EOF)
@@ -361,6 +386,7 @@ type reusableRPCStubStream struct {
 	grpc.ClientStream
 	ctx      context.Context
 	send     func(*viewpb.QueryOnViewStreamReusableRequest) error
+	recv     func() (*viewpb.QueryOnViewStreamReusableResponse, error)
 	response *viewpb.QueryOnViewStreamReusableResponse
 }
 
@@ -387,6 +413,9 @@ func (s *reusableRPCStubStream) Send(request *viewpb.QueryOnViewStreamReusableRe
 
 // Recv checks transport cancellation before exposing its prepared response.
 func (s *reusableRPCStubStream) Recv() (*viewpb.QueryOnViewStreamReusableResponse, error) {
+	if s.recv != nil {
+		return s.recv()
+	}
 	if err := s.ctx.Err(); err != nil {
 		return nil, err
 	}

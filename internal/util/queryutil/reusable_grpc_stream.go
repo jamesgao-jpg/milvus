@@ -29,20 +29,22 @@ const reusableQueryIdleTimeout = time.Minute
 
 // ReusableQueryStreamPool bounds opening, idle, and leased RPCs per QueryNode.
 type ReusableQueryStreamPool struct {
-	mu          sync.Mutex
-	ctx         context.Context
-	cancel      context.CancelFunc
-	entries     map[int64][]*reusableQueryRPC
-	size        int
-	idleTimeout time.Duration
-	closed      bool
-	nextRPCID   uint64
-	stats       ReusableQueryStreamStats
+	mu               sync.Mutex
+	ctx              context.Context
+	cancel           context.CancelFunc
+	entries          map[int64][]*reusableQueryRPC
+	size             int
+	idleTimeout      time.Duration
+	interruptTimeout time.Duration
+	closed           bool
+	nextRPCID        uint64
+	stats            ReusableQueryStreamStats
 }
 
 // ReusableQueryStreamStats separates logical requests from transport lifetimes.
 type ReusableQueryStreamStats struct {
 	Opened, Reused, BusyFallbacks, Completed uint64
+	Interrupted, DiscardedChunks             uint64
 	Idle, Leased                             int
 	Evicted                                  map[string]uint64
 }
@@ -63,7 +65,8 @@ type reusableQueryRPC struct {
 func NewReusableQueryStreamPool(ctx context.Context, size int) *ReusableQueryStreamPool {
 	ctx, cancel := context.WithCancel(ctx)
 	return &ReusableQueryStreamPool{
-		ctx: ctx, cancel: cancel, entries: make(map[int64][]*reusableQueryRPC), size: max(1, size), idleTimeout: reusableQueryIdleTimeout,
+		ctx: ctx, cancel: cancel, entries: make(map[int64][]*reusableQueryRPC), size: max(1, size),
+		idleTimeout: reusableQueryIdleTimeout, interruptTimeout: time.Second,
 		stats: ReusableQueryStreamStats{Evicted: make(map[string]uint64)},
 	}
 }
@@ -308,13 +311,9 @@ func (s *reusableQueryStream) Recv() (*internalpb.RetrieveResults, error) {
 		return nil, io.EOF
 	}
 
-	// Each response belongs to this request, and completion is authoritative.
-	response, err := s.rpc.client.Recv()
-	if err != nil {
-		if errors.Is(err, io.EOF) {
-			err = merr.WrapErrServiceInternalMsg("reusable Query RPC ended before request completion")
-		}
-		return nil, s.fail(err, "transport_error")
+	chunk, err := s.recv()
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
 	}
 	s.mu.Lock()
 	closed = s.closed
@@ -322,12 +321,30 @@ func (s *reusableQueryStream) Recv() (*internalpb.RetrieveResults, error) {
 	if closed {
 		return nil, io.ErrClosedPipe
 	}
+	return chunk, err
+}
+
+// recv is serialized by ioMu, including completion cleanup after Close begins.
+func (s *reusableQueryStream) recv() (*internalpb.RetrieveResults, error) {
+	response, err := s.rpc.client.Recv()
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			err = merr.WrapErrServiceInternalMsg("reusable Query RPC ended before request completion")
+		}
+		return nil, s.fail(err, "transport_error")
+	}
 	if err := s.ctx.Err(); err != nil {
 		return nil, s.fail(err, "canceled")
 	}
 	if response == nil || response.GetRequestId() != s.requestID ||
 		(response.GetChunk() == nil && response.GetCompletionStatus() == nil) {
 		return nil, s.fail(merr.WrapErrServiceInternalMsg("invalid reusable Query response for request %d", s.requestID), "protocol_error")
+	}
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if response.GetInterrupted() && (!closed || response.GetChunk() != nil || response.GetCompletionStatus() == nil) {
+		return nil, s.fail(merr.WrapErrServiceInternalMsg("invalid reusable Query interruption completion"), "protocol_error")
 	}
 	if chunk := response.GetChunk(); chunk != nil && chunk.GetStatus() == nil {
 		return nil, s.fail(merr.WrapErrServiceInternalMsg("reusable Query Chunk is missing its status"), "protocol_error")
@@ -342,6 +359,9 @@ func (s *reusableQueryStream) Recv() (*internalpb.RetrieveResults, error) {
 		}
 		if completion.GetCode() < int32(codes.OK) || completion.GetCode() > int32(codes.Unauthenticated) {
 			return nil, s.fail(merr.WrapErrServiceInternalMsg("invalid reusable Query status code"), "protocol_error")
+		}
+		if response.GetInterrupted() && completion.GetCode() != int32(codes.OK) {
+			return nil, s.fail(merr.WrapErrServiceInternalMsg("interrupted reusable Query completion is not OK"), "protocol_error")
 		}
 		if err := status.FromProto(completion).Err(); err != nil {
 			if response.GetChunk() != nil {
@@ -358,11 +378,22 @@ func (s *reusableQueryStream) Recv() (*internalpb.RetrieveResults, error) {
 		s.completed = true
 		s.mu.Unlock()
 		s.pool.mu.Lock()
-		s.pool.stats.Completed++
-		metrics.ProxyReusableQueryStreamEvents.WithLabelValues("completed").Inc()
+		if response.GetInterrupted() {
+			s.pool.stats.Interrupted++
+			metrics.ProxyReusableQueryStreamEvents.WithLabelValues("interrupted").Inc()
+		} else {
+			s.pool.stats.Completed++
+			metrics.ProxyReusableQueryStreamEvents.WithLabelValues("completed").Inc()
+		}
 		s.pool.mu.Unlock()
 	}
 	if chunk := response.GetChunk(); chunk != nil {
+		if closed {
+			s.pool.mu.Lock()
+			s.pool.stats.DiscardedChunks++
+			metrics.ProxyReusableQueryStreamEvents.WithLabelValues("discarded_chunk").Inc()
+			s.pool.mu.Unlock()
+		}
 		return chunk, nil
 	}
 	return nil, io.EOF
@@ -374,6 +405,10 @@ func (s *reusableQueryStream) fail(err error, reason string) error {
 		err, reason = contextErr, "canceled"
 	}
 	s.mu.Lock()
+	// Close cancels a pending receive without making it a transport failure.
+	if s.closed && reason == "transport_error" && (errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled) {
+		reason = "early_close"
+	}
 	s.err = err
 	s.mu.Unlock()
 	s.pool.mu.Lock()
@@ -382,14 +417,54 @@ func (s *reusableQueryStream) fail(err error, reason string) error {
 	return err
 }
 
-// Close aborts unfinished requests; only cleaned-up, successful exchanges return to idle.
+// Close interrupts unfinished requests and returns only verified clean RPCs to idle.
 func (s *reusableQueryStream) Close() error {
 	s.closeOnce.Do(func() {
 		s.mu.Lock()
 		s.closed = true
 		healthy := s.completed && s.err == nil
+		canInterrupt := !s.completed && s.err == nil
 		s.mu.Unlock()
 		s.stopCancellation()
+		if canInterrupt && s.ctx.Err() == nil && s.rpc.ctx.Err() == nil {
+			ctx, cancel := context.WithTimeout(s.ctx, s.pool.interruptTimeout)
+			stopped := make(chan struct{})
+			stop := context.AfterFunc(ctx, func() {
+				s.pool.mu.Lock()
+				reason := "interrupt_timeout"
+				if s.ctx.Err() != nil {
+					reason = "canceled"
+				}
+				s.pool.evictLocked(s.nodeID, s.rpc, reason)
+				s.pool.mu.Unlock()
+				close(stopped)
+			})
+			err := s.rpc.client.Send(&viewpb.QueryOnViewStreamReusableRequest{RequestId: s.requestID, Interrupt: true})
+			if err != nil {
+				s.fail(err, "transport_error")
+			} else {
+				s.ioMu.Lock()
+				for {
+					s.mu.Lock()
+					finished := s.completed || s.err != nil
+					s.mu.Unlock()
+					if finished {
+						break
+					}
+					if _, err := s.recv(); err != nil {
+						break
+					}
+				}
+				s.ioMu.Unlock()
+			}
+			if !stop() {
+				<-stopped
+			}
+			cancel()
+			s.mu.Lock()
+			healthy = s.completed && s.err == nil
+			s.mu.Unlock()
+		}
 		if !healthy || s.ctx.Err() != nil {
 			s.rpc.cancel()
 		}

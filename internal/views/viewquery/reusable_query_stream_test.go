@@ -292,15 +292,16 @@ func TestReusableQueryProtocolValidation(t *testing.T) {
 	invalidStatus, err := anypb.New(status.New(codes.Code(99), "invalid").Proto())
 	require.NoError(t, err)
 	cases := map[string]*viewpb.QueryOnViewStreamReusableResponse{
-		"wrong ID":             {RequestId: 2, Chunk: reusableQueryResult(1)},
-		"missing payload":      {RequestId: 1},
-		"wrong status type":    {RequestId: 1, CompletionStatus: wrongStatus},
-		"invalid status code":  {RequestId: 1, CompletionStatus: invalidStatus},
-		"error with rows":      {RequestId: 1, Chunk: reusableQueryResult(1), CompletionStatus: failedStatus},
-		"missing Chunk status": {RequestId: 1, Chunk: &internalpb.RetrieveResults{}},
-		"EOF after Chunk":      {RequestId: 1, Chunk: reusableQueryResult(1)},
-		"failed Chunk":         {RequestId: 1, Chunk: &internalpb.RetrieveResults{Status: merr.Status(merr.WrapErrServiceInternalMsg("bad"))}},
-		"clean EOF":            nil,
+		"unsolicited interruption": {RequestId: 1, CompletionStatus: invalidStatus, Interrupted: true},
+		"wrong ID":                 {RequestId: 2, Chunk: reusableQueryResult(1)},
+		"missing payload":          {RequestId: 1},
+		"wrong status type":        {RequestId: 1, CompletionStatus: wrongStatus},
+		"invalid status code":      {RequestId: 1, CompletionStatus: invalidStatus},
+		"error with rows":          {RequestId: 1, Chunk: reusableQueryResult(1), CompletionStatus: failedStatus},
+		"missing Chunk status":     {RequestId: 1, Chunk: &internalpb.RetrieveResults{}},
+		"EOF after Chunk":          {RequestId: 1, Chunk: reusableQueryResult(1)},
+		"failed Chunk":             {RequestId: 1, Chunk: &internalpb.RetrieveResults{Status: merr.Status(merr.WrapErrServiceInternalMsg("bad"))}},
+		"clean EOF":                nil,
 	}
 	for name, response := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -581,10 +582,14 @@ func (t *reusableQueryTasks) Release() { t.owner.released.Add(1) }
 type reusableQueryScheduler struct {
 	rows   int
 	result *internalpb.RetrieveResults
+	query  func(context.Context, QuerySegmentTasks) (*internalpb.RetrieveResults, error)
 }
 
 // Query returns a distinct row and metadata for each logical request.
-func (s *reusableQueryScheduler) Query(_ context.Context, tasks QuerySegmentTasks) (*internalpb.RetrieveResults, error) {
+func (s *reusableQueryScheduler) Query(ctx context.Context, tasks QuerySegmentTasks) (*internalpb.RetrieveResults, error) {
+	if s.query != nil {
+		return s.query(ctx, tasks)
+	}
 	if s.result != nil {
 		return s.result, nil
 	}

@@ -238,11 +238,12 @@ func TestShardQueryStreamReturnsPerVChannelReduceStream(t *testing.T) {
 	}
 	client := newTestShardClient(1, shardID, plan, queryService)
 
-	stream, shardPlan, err := client.QueryStream(context.Background(), shardID.VChannel, request, nil, 64)
+	// Each row carries an eight-byte PK, scalar value and timestamp.
+	stream, shardPlan, err := client.QueryStream(context.Background(), shardID.VChannel, request, nil, 48)
 
 	require.NoError(t, err)
 	require.Equal(t, shardID, shardPlan.ShardID)
-	require.Equal(t, int64(64), queryService.queryReq.GetStreamChunkBytes())
+	require.Equal(t, int64(48), queryService.queryReq.GetStreamChunkBytes())
 	chunk, err := stream.Recv()
 	require.NoError(t, err)
 	require.Equal(t, []int64{1, 2}, chunk.GetIds().GetIntId().GetData())

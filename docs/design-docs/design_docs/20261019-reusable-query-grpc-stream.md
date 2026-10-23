@@ -6,6 +6,9 @@ Design v0 approved by the user on 2026-10-19, including exclusive use and
 request-scoped fallback when busy. On 2026-10-21 the user approved extending
 the single-RPC capacity to a configurable bounded pool per Proxy client/QN
 pair, including the scoped implementation/test line-budget exception.
+On 2026-10-22 the user approved request-ID-scoped interruption so early
+termination can preserve a healthy reusable RPC, including implementation,
+regression tests and a focused N4 validation runner.
 The benchmark-only prototype is not production-ready. Keep it disabled by
 default and confined to
 `codex/qv-reducestream-e2e-benchmark-20260915`.
@@ -103,8 +106,10 @@ logical request, without multiplexing concurrent requests inside it.
    open beyond K, or block other nodes while a transport opens.
 
 Record overflow fallback explicitly. A successful exchange returns its RPC
-to idle only after adapter cleanup. Cancellation, early Close, protocol errors,
-and logical/transport errors evict only the affected RPC, not its siblings.
+to idle only after adapter cleanup. Early Close interrupts the logical request
+and waits for its completion before returning a healthy RPC. Cancellation,
+interruption timeout, protocol errors, and logical/transport errors evict only
+the affected RPC, not its siblings.
 
 Each idle RPC expires after a fixed 60 seconds. Node removal closes all RPCs
 for that node; client shutdown closes all pooled RPCs. Client shutdown must
@@ -125,8 +130,10 @@ The following describes required fields; it is not a generated-protobuf patch.
 | Direction | Required contents |
 | --- | --- |
 | Request | Monotonically increasing request ID within this RPC; complete existing `QueryOnViewRequest`; remaining timeout; per-request trace/log context |
+| Interruption | Existing request ID and `interrupt=true`, without a new Query request or request metadata |
 | Response | Matching request ID; optional existing `RetrieveResults` Chunk; optional completion status |
 | Completion | Explicit success or error using `google.rpc.Status`, including existing typed `ViewError` details |
+| Interrupted completion | Matching request ID, OK completion status and `interrupted=true`, without a data Chunk |
 
 The implemented `completion_status` field packs `google.rpc.Status` into
 `google.protobuf.Any`. Failed legacy result statuses retain their existing
@@ -144,6 +151,13 @@ completion accompanies the final Chunk when there is one; empty success can be
 a completion-only response. Error completion must not contain result rows.
 The server releases request execution resources before sending completion.
 The transport-level RPC remains open after successful logical completion.
+
+The server receives interruption messages concurrently with Query execution and
+Chunk transmission. An interruption cancels only that logical request, stops
+producing further Chunks, releases its execution resources, and sends one
+interrupted completion. If normal completion wins the race, its existing
+completion is sufficient and a late interruption for that same request is
+ignored; no duplicate completion may leak into the next request.
 
 A native RPC may close while idle without that closure being observed until
 the next Send/Recv. Do not add a background reader or treat native EOF as that
@@ -179,7 +193,8 @@ The new adapter implements the existing `Recv()`, `Close()`, and stub
 | OK completion without Chunk | Return logical EOF | Remains leased until Close |
 | Recv after successful completion | Return logical EOF without another gRPC read | Remains leased until Close |
 | Close after verified success | Release request resources | Return healthy RPC to idle cache |
-| Close before verified completion | Abort immediately; do not drain unused Chunks | Cancel and evict RPC |
+| Close before verified completion, with a live request and transport | Send interruption; discard queued old-request Chunks until matching completion | Return to idle only after completion and cleanup |
+| Interruption cleanup exceeds one second | Abort bounded cleanup | Cancel and evict RPC |
 | Logical error or transport error | Return original classified error | Cancel and evict RPC |
 | Cancellation, deadline, protocol error | Return corresponding error | Cancel and evict RPC |
 
@@ -188,10 +203,19 @@ cache by itself. Before reuse, remove and join request cancellation callbacks,
 finish any in-flight Send/Recv, and release the adapter's request state. A late
 cancel or deferred Close from request A must never affect request B.
 
-This preserves early termination: reaching the parent's limit must not cause
-background reads that transfer the remaining child result just to recover the
-RPC. Some workloads may consequently evict most RPCs. Report that outcome
-rather than extending request latency or changing reduction semantics.
+This preserves early termination by stopping the sender rather than deliberately
+transferring its complete unused tail. Chunks already queued in gRPC may still
+need to be received and discarded to reach the matching completion. The RPC
+remains leased throughout this bounded cleanup; request B cannot read data from
+request A. There is at most one receiver and one sender per RPC direction.
+Cleanup also ends on the original request deadline/cancellation or client
+shutdown. Failure evicts the RPC; it never silently makes an uncertain boundary
+available for reuse. Close remains idempotent and does not introduce request
+replay. Its cleanup failures affect reuse eligibility, not a completed topK
+result's success. Errors received during ordinary Recv still propagate.
+
+This transport interruption does not implement ReduceStream.Interrupt()'s
+recursive metadata aggregation contract; that public method remains a stub.
 
 The server clears request context, materialized result, Chunks, metadata, and
 task references before accepting another request. Only idle transport state is
@@ -241,7 +265,8 @@ result bytes, metadata, and status to the current logical request; do not retain
 the first request's benchmark object in the transport context.
 
 Record RPC opens, reuse hits, busy fallbacks, eviction reasons, logical
-completions, and live idle/leased counts. Request/RPC IDs belong in retained
+completions, interrupted completions, discarded Chunks received after Close,
+and live idle/leased counts. Request/RPC IDs belong in retained
 diagnostic records, not high-cardinality Prometheus labels. Connection bytes
 remain connection-scoped; do not present them as exact per-request bytes.
 
@@ -260,9 +285,12 @@ Use measured counter deltas to qualify a pure-reuse interval:
 | Reused RPC leases | Expected logical child-request count |
 | Evictions | Report separately by reason; do not hide replacement opens |
 
-If reduction stops before child completion, preserve early Close and eviction.
-Do not drain unused tails merely to pass the reuse gate. Label an interval with
-new opens or fallbacks as mixed transport rather than a pure-reuse comparison.
+If reduction stops before child completion, preserve early Close and perform
+the interruption handshake. Natural plus interrupted completions must reconcile
+with logical child requests. Do not drain complete unused tails merely to pass
+the reuse gate. Label intervals with new opens, evictions or fallbacks as mixed
+transport rather than a pure-reuse comparison. An interrupted request may
+instead finish naturally if completion wins the race.
 
 Validation is defined separately in
 `unary_streaming_grpc_benchmark/milvus_result/test_1019_01/TEST_PLAN.md`.

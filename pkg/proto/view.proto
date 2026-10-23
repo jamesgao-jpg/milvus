@@ -465,6 +465,9 @@ message QueryOnViewStreamReusableRequest {
     int64 timeout_nanos = 3;
     map<string, string> trace_context = 4;
     map<string, string> log_fields = 5;
+    // Interrupt only this logical request, preserving the enclosing RPC.
+    // Request, timeout and propagated metadata must be absent.
+    bool interrupt = 6;
 }
 
 message QueryOnViewStreamReusableResponse {
@@ -473,4 +476,6 @@ message QueryOnViewStreamReusableResponse {
     // A packed google.rpc.Status; presence marks logical request completion.
     // OK accompanies the final Chunk, or appears alone for an empty result.
     google.protobuf.Any completion_status = 3;
+    // Successful interruption has no Chunk and acknowledges request cleanup.
+    bool interrupted = 4;
 }
