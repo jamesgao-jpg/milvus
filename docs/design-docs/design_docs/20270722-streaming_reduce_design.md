@@ -148,9 +148,20 @@ Before continuing, we briefly define the blocking-related concepts, so we are on
 | Plain Query | Primary key, returned field values, and matched element indexes when present |
 | Group reduction | Group key and partial aggregate value |
 
-`Unit.ByteSize()` is the encoded protobuf size of only these reducible fields
-after selecting that Unit from its source result. It excludes the enclosing
-Chunk message and all request or result metadata.
+For Query, `Unit.ByteSize()` reuses the existing row payload-size calculator
+directly on the source field data. It adds the separate primary-key payload
+(eight bytes for an Int64 key or the byte length of a string key) and four
+bytes per matched element index. The calculator is initialized once per
+materialized result when splitting and once per received Chunk when merging,
+including nullable-vector row mapping, and reused for all its Units;
+no temporary one-row result is constructed merely to count bytes. Its existing
+field-size rules apply, including sizing existing nested array values.
+
+This is a reducible-payload estimate, not an exact protobuf wire-size limit.
+It excludes field names, protobuf tags and wrappers, the enclosing Chunk, and
+request or result metadata. The gRPC message-size limit remains independent.
+Search's current encoded-field accounting is unchanged by this Query sizing
+change.
 
 For element-level Query (`element_filter`), a Unit remains one complete
 document row with its matched element indexes. The request limit counts
@@ -617,3 +628,61 @@ from earlier versions of this document.
 | --- | --- | --- | --- | --- |
 | M1A | Iterator Streaming Foundation | Implement `ReduceStream` for iterator requests using Plain Query and Plain ANN Search semantics. Establish QN/SN-to-Proxy bidirectional streaming. | Iterator requests only. Non-iterator requests remain on the batch path. Emit each Chunk after its reducible payload reaches or crosses `B` bytes without splitting its final Unit. | End-to-end streaming execution succeeds. With deliberately large topK, peak retained memory approaches Chunk bytes times child count rather than complete-result bytes times child count. |
 | M1B | Stateful ANN Iterator | Integrate Cardinal ANN iterators with the M1A ANN `ReduceStream` and define the session lifecycle contract. | ANN Iterator only. Session ownership, persistence, cancellation, expiration, and cleanup require design agreement with Zhen Ye before implementation. | `Next()` preserves results, ordering, fields, metadata, and execution state. The agreed lifecycle behavior is preserved. |
+
+## 6. TBD
+
+- **Hybrid Search streaming: deferred while other Search paths are evaluated.**
+  Evaluate one `OrderedReduceStream` reduction tree per sub-search, retaining
+  per-vchannel and final candidate reduction with that sub-search's metric,
+  candidate limit, and offset. Feed the resulting candidate lists into the
+  existing Proxy fusion/reranking and field assembly/requery stages. The current
+  Batch path already separates sub-search reduction from reranking
+  ([sub-search reduction](https://github.com/jamesgao-jpg/milvus/blob/c4e1d0173d6e925208d49bb8ee9aff7f300b533f/internal/proxy/dql/search_pipeline.go#L252),
+  [hybrid pipeline](https://github.com/jamesgao-jpg/milvus/blob/c4e1d0173d6e925208d49bb8ee9aff7f300b533f/internal/proxy/dql/search_pipeline.go#L3306)).
+  Do not replace fusion with a k-way merge across sub-searches or stop merely
+  because the final hybrid limit has been reached. Before implementation,
+  settle sub-search routing, Chunk identification, shared QueryPlan/MVCC and
+  metadata handling, and the pipeline handoff for multiple reduced lists and
+  metrics. Hybrid Search remains on Batch; implementation requires separate
+  approval.
+
+- **Ordinary range Search streaming: deferred while other Search paths are evaluated.**
+  Evaluate reusing `OrderedReduceStream` without changing its merge algorithm.
+  Native range results already undergo metric-ordered TopK selection
+  ([RangeSearchHelper.cpp](https://github.com/jamesgao-jpg/milvus/blob/c4e1d0173d6e925208d49bb8ee9aff7f300b533f/internal/core/src/common/RangeSearchHelper.cpp#L119)).
+  The main eligibility gap is that range Search uses `SearchType_DEFAULT`, which
+  the ordinary streaming gate excludes
+  ([classification](https://github.com/jamesgao-jpg/milvus/blob/c4e1d0173d6e925208d49bb8ee9aff7f300b533f/internal/proxy/dql/search_util.go#L175),
+  [eligibility](https://github.com/jamesgao-jpg/milvus/blob/c4e1d0173d6e925208d49bb8ee9aff7f300b533f/internal/proxy/dql/task_search.go#L1636)).
+  Explicitly allow supported range requests, not every DEFAULT request. Verify
+  Batch/Streaming parity for metric boundaries, empty/fewer-than-K results, NQ,
+  offsets, scalar filters, and Chunk boundaries while preserving existing
+  combination restrictions. Iterator eligibility alone does not prove range
+  iterator correctness. Implementation requires separate approval.
+
+- **Iterative-filter Search streaming: deferred while other Search paths are evaluated.**
+  Evaluate reusing `OrderedReduceStream` for the already-filtered QN/SN results.
+  Segment-local filtering pulls vector candidates until enough pass or the
+  iterator exhausts, retaining metric-sorted results
+  ([filter loop](https://github.com/jamesgao-jpg/milvus/blob/c4e1d0173d6e925208d49bb8ee9aff7f300b533f/internal/core/src/exec/operator/IterativeFilterNode.cpp#L172),
+  [sorted insertion](https://github.com/jamesgao-jpg/milvus/blob/c4e1d0173d6e925208d49bb8ee9aff7f300b533f/internal/core/src/exec/operator/Utils.h#L53)).
+  Address the same `SearchType_DEFAULT` eligibility gap described above through
+  a narrow allowance, preserving the filter plan and iterative-filter hints.
+  Verify Batch/Streaming parity for selective and nullable predicates, exhausted
+  or empty children, NQ, metrics, offsets, and Chunk boundaries. The internal
+  vector iterator is not an SDK iterator or persistent gRPC session; keep
+  segment execution and QN/SN result materialization unchanged. Implementation
+  requires separate approval.
+
+- **Global Query aggregation streaming (SUM/AVG/MIN/MAX): deferred.**
+  Evaluate reusing the unordered receive lifecycle with one output aggregate
+  row rather than a map of grouping keys. Extend incremental accumulation to
+  accept no grouping keys; the current `GroupAggReducer.Merge()` rejects this
+  case, while its Batch `Reduce()` has a separate global-aggregation branch
+  ([Batch reduction](https://github.com/jamesgao-jpg/milvus/blob/c4e1d0173d6e925208d49bb8ee9aff7f300b533f/internal/agg/aggregate_reducer.go#L286),
+  [incremental merge](https://github.com/jamesgao-jpg/milvus/blob/c4e1d0173d6e925208d49bb8ee9aff7f300b533f/internal/agg/aggregate_reducer.go#L353)).
+  Reuse aggregate operations, retain AVG as partial sum and count until final
+  Proxy division, and consume all child partials before emitting the answer.
+  Verify Batch/Streaming parity for empty and null inputs, unequal child counts
+  for AVG, nested reduction, and metadata. Evaluate benefit against the already
+  small per-child aggregate payload. Implementation requires separate approval.
