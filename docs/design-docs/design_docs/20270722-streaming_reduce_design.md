@@ -148,20 +148,26 @@ Before continuing, we briefly define the blocking-related concepts, so we are on
 | Plain Query | Primary key, returned field values, and matched element indexes when present |
 | Group reduction | Group key and partial aggregate value |
 
-For Query, `Unit.ByteSize()` reuses the existing row payload-size calculator
-directly on the source field data. It adds the separate primary-key payload
-(eight bytes for an Int64 key or the byte length of a string key) and four
-bytes per matched element index. The calculator is initialized once per
-materialized result when splitting and once per received Chunk when merging,
-including nullable-vector row mapping, and reused for all its Units;
-no temporary one-row result is constructed merely to count bytes. Its existing
-field-size rules apply, including sizing existing nested array values.
+Query and Search use the same measurement: the protobuf-encoded size of a
+one-Unit result containing only the reducible fields listed above. This includes
+their tags, length prefixes, nested wrappers, validity data, and retained field
+descriptors (field ID, name, type, and dynamic-field flag). Request/result
+metadata, status, billing information, and transport framing are excluded.
+`Buffer.ByteSize()` is the sum of its Units' sizes. Shared protobuf wrappers
+are counted independently for each Unit, so this sum is not the exact encoded
+size of a multi-Unit Chunk or a measurement of heap usage. The gRPC message-size
+limit remains independent.
 
-This is a reducible-payload estimate, not an exact protobuf wire-size limit.
-It excludes field names, protobuf tags and wrappers, the enclosing Chunk, and
-request or result metadata. The gRPC message-size limit remains independent.
-Search's current encoded-field accounting is unchanged by this Query sizing
-change.
+Both implementations calculate sizes directly from the existing field data;
+they do not copy or serialize a row or construct a one-row result solely for
+sizing. Nullable-vector row mappings are prepared once per input Chunk and
+reused. Fixed-width values and dense vectors use arithmetic; strings, JSON,
+and byte-backed vectors use their existing byte lengths. Integer arrays and
+element indexes require their values' varint widths; string arrays and nested
+messages require traversal of their elements. These costs are accepted:
+averages, upper bounds, and silent payload-size fallbacks are not used.
+Tests compare direct calculations against `proto.Size()` on reference one-Unit
+results, including nullable, grouped, and nested data.
 
 For element-level Query (`element_filter`), a Unit remains one complete
 document row with its matched element indexes. The request limit counts
@@ -170,7 +176,8 @@ replaces both the row and its indexes and adjusts the matched-element count.
 Chunks retain complete Units, including the row that crosses the result limit;
 final Proxy pagination trims the index list at an element-level page boundary.
 
-The byte threshold excludes protobuf framing and request or result metadata.
+The byte threshold excludes transport framing and request or result metadata,
+but includes the reducible fields' protobuf encoding as defined above.
 Each Unit is appended in full before the threshold is checked. If appending a
 Unit makes the Chunk exceed `B`, the complete Unit remains in that Chunk and
 the Chunk is emitted. The Unit is never truncated. A Unit that is itself larger
@@ -181,7 +188,7 @@ attached.
 
 For example, if `B = 100`, the output Buffer contains 80 bytes, and the next
 Unit is 30 bytes, the complete Unit is appended and the emitted Chunk contains
-110 reducible-payload bytes.
+110 accounted reducible bytes; its complete encoded message size can differ.
 
 Each `ReduceStream` owns the following request-scoped fields:
 

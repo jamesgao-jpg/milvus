@@ -238,12 +238,18 @@ func TestShardQueryStreamReturnsPerVChannelReduceStream(t *testing.T) {
 	}
 	client := newTestShardClient(1, shardID, plan, queryService)
 
-	// Each row carries an eight-byte PK, scalar value and timestamp.
-	stream, shardPlan, err := client.QueryStream(context.Background(), shardID.VChannel, request, nil, 48)
+	// Size two complete protobuf Units, excluding result metadata.
+	oneUnit := newTestQueryChunk([]int64{1})
+	timestamp := proto.Clone(rightChunk.FieldsData[1]).(*schemapb.FieldData)
+	timestamp.GetScalars().GetLongData().Data = timestamp.GetScalars().GetLongData().Data[:1]
+	oneUnit.FieldsData = append(oneUnit.FieldsData, timestamp)
+	chunkBytes := 2 * proto.Size(&internalpb.RetrieveResults{Ids: oneUnit.Ids, FieldsData: oneUnit.FieldsData})
+
+	stream, shardPlan, err := client.QueryStream(context.Background(), shardID.VChannel, request, nil, chunkBytes)
 
 	require.NoError(t, err)
 	require.Equal(t, shardID, shardPlan.ShardID)
-	require.Equal(t, int64(48), queryService.queryReq.GetStreamChunkBytes())
+	require.Equal(t, int64(chunkBytes), queryService.queryReq.GetStreamChunkBytes())
 	chunk, err := stream.Recv()
 	require.NoError(t, err)
 	require.Equal(t, []int64{1, 2}, chunk.GetIds().GetIntId().GetData())
