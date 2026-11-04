@@ -55,19 +55,6 @@ func (c *Core) broadcastAlterCollectionForAlterCollection(ctx context.Context, r
 	if err := common.ValidateNamespaceShardingEnabledNotAltered(req.GetProperties(), req.GetDeleteKeys()); err != nil {
 		return err
 	}
-	if err := common.ValidateRLSProperties(req.GetProperties()...); err != nil {
-		return err
-	}
-	if err := common.ValidateRLSEnabledNotAltered(req.GetProperties(), req.GetDeleteKeys()); err != nil {
-		return err
-	}
-	for _, key := range req.GetDeleteKeys() {
-		for _, expected := range []string{common.RLSEnabledKey, common.RLSForceKey} {
-			if strings.EqualFold(key, expected) && key != expected {
-				return merr.WrapErrParameterInvalidMsg("invalid property key %q, did you mean %q?", key, expected)
-			}
-		}
-	}
 
 	if err := validateNamespaceModeImmutable(req.GetProperties(), req.GetDeleteKeys()); err != nil {
 		return err
@@ -213,15 +200,12 @@ func (c *Core) broadcastAlterCollectionForAlterCollection(ctx context.Context, r
 	// fill the put load config if rg or replica number is changed.
 	udpates.AlterLoadConfig = c.getAlterLoadConfigOfAlterCollection(coll.Properties, udpates.Properties)
 
-	channels := make([]string, 0, len(coll.VirtualChannelNames)+1)
-	channels = append(channels, streaming.WAL().ControlChannel())
-	channels = append(channels, coll.VirtualChannelNames...)
 	msg := message.NewAlterCollectionMessageBuilderV2().
 		WithHeader(header).
 		WithBody(&messagespb.AlterCollectionMessageBody{
 			Updates: udpates,
 		}).
-		WithBroadcast(channels).
+		WithBroadcast(coll.VirtualChannelNames).
 		MustBuildBroadcast()
 	if _, err := broadcaster.Broadcast(ctx, msg); err != nil {
 		return err
@@ -326,9 +310,6 @@ func (c *Core) broadcastAlterCollectionForAlterDynamicField(ctx context.Context,
 		return err
 	}
 
-	channels := make([]string, 0, len(coll.VirtualChannelNames)+1)
-	channels = append(channels, streaming.WAL().ControlChannel())
-	channels = append(channels, coll.VirtualChannelNames...)
 	cacheExpirations, err := c.getCacheExpireForCollection(ctx, req.GetDbName(), req.GetCollectionName())
 	if err != nil {
 		return err
@@ -349,7 +330,7 @@ func (c *Core) broadcastAlterCollectionForAlterDynamicField(ctx context.Context,
 				Properties: properties,
 			},
 		}).
-		WithBroadcast(channels).
+		WithBroadcast(coll.VirtualChannelNames).
 		MustBuildBroadcast()
 	if _, err := broadcaster.Broadcast(ctx, msg); err != nil {
 		return err
@@ -385,9 +366,6 @@ func (c *Core) broadcastDisableDynamicField(ctx context.Context, req *milvuspb.A
 		return err
 	}
 
-	channels := make([]string, 0, len(coll.VirtualChannelNames)+1)
-	channels = append(channels, streaming.WAL().ControlChannel())
-	channels = append(channels, coll.VirtualChannelNames...)
 	cacheExpirations, err := c.getCacheExpireForCollection(ctx, req.GetDbName(), req.GetCollectionName())
 	if err != nil {
 		return err
@@ -411,7 +389,7 @@ func (c *Core) broadcastDisableDynamicField(ctx context.Context, req *milvuspb.A
 				Properties: properties,
 			},
 		}).
-		WithBroadcast(channels).
+		WithBroadcast(coll.VirtualChannelNames).
 		MustBuildBroadcast()
 	if _, err := bc.Broadcast(ctx, msg); err != nil {
 		return err
@@ -498,11 +476,11 @@ func (c *DDLCallback) alterCollectionV2AckCallback(ctx context.Context, result m
 			return merr.Wrap(err, "failed to update load config")
 		}
 		if err := merr.CheckRPCCall(resp, err); err != nil {
-			if errors.Is(err, merr.ErrResourceGroupNotFound) {
-				mlog.Warn(ctx, "failed to update load config due to missing resource group, stop retrying", mlog.Err(err))
-				return nil
+			if !errors.Is(err, merr.ErrResourceGroupNotFound) {
+				return merr.Wrap(err, "failed to update load config")
 			}
-			return merr.Wrap(err, "failed to update load config")
+			// Properties are already persisted; still invalidate Proxy caches.
+			mlog.Warn(ctx, "failed to update load config due to missing resource group, stop retrying", mlog.Err(err))
 		}
 	}
 	if err := c.cascadeDropFieldIndexesInline(ctx, result); err != nil {

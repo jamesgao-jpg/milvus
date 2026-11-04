@@ -17,9 +17,11 @@
 
 #include <atomic>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <variant>
 #include <vector>
 
 #include "cachinglayer/CacheSlot.h"
@@ -30,18 +32,30 @@
 #include "common/SealedOffsetMapping.h"
 #include "common/bson_view.h"
 #include "mmap/ChunkedColumnScanCommon.h"
+#include "index/FieldChunkMetricsProvider.h"
 namespace milvus {
+
+namespace index {
+class FieldChunkMetrics;
+}  // namespace index
 
 using namespace milvus::cachinglayer;
 
-class ChunkedColumnInterface {
+class ChunkedColumnInterface : public FieldChunkMetricsProvider {
  public:
+    enum class LocalFormat {
+        Raw,
+        Vortex,
+    };
+
     using TargetType = milvus::TargetType;
     using ValueView = milvus::ValueView;
     using ScanBatch = milvus::ScanBatch;
     using ScanReadMode = milvus::ScanReadMode;
     using ScanCursor = milvus::ScanCursor;
     using ScanPinPolicy = milvus::ScanPinPolicy;
+    using ScanOutput = milvus::ScanOutput;
+    using ScanPredicate = milvus::ScanPredicate;
     using ScanOptions = milvus::ScanOptions;
     using ScanResult = milvus::ScanResult;
     using OffsetView = milvus::OffsetView;
@@ -50,15 +64,49 @@ class ChunkedColumnInterface {
     using TakeItem = milvus::TakeItem<T>;
     using TakeItemState = milvus::TakeItemState;
     using TakeOptions = milvus::TakeOptions;
+    using TakePinPolicy = milvus::TakePinPolicy;
     using TakeResult = milvus::TakeResult;
     using TakeResultPtr = milvus::TakeResultPtr;
 
-    virtual ~ChunkedColumnInterface() = default;
+    ~ChunkedColumnInterface() override = default;
+
+    // Materialize a lazy column's chunk directory with the caller's context
+    // before using context-free layout accessors. This does not pin raw data.
+    virtual void
+    Prepare(milvus::OpContext* op_ctx) const {
+    }
+
+    // Optional per-cell skip metrics owned by this column's generation.
+    // Storage V2 proxy columns override both accessors; an ordinary V1 column
+    // has no metrics and must fail open (never skip).
+    const index::FieldChunkMetrics*
+    GetSkipMetrics(int64_t) const override {
+        return nullptr;
+    }
+
+    // Declare list support with no list: a FieldSkipMetricsView resolved on a
+    // V1 column then never prunes and never calls GetSkipMetrics per cell.
+    // Without this override the base class answers "no list support" and the
+    // view would fall back to one virtual call per cell just to learn nullptr.
+    std::optional<const SkipMetricsList*>
+    GetSkipMetricsList() const override {
+        return static_cast<const SkipMetricsList*>(nullptr);
+    }
 
     // Check if this column is part of a multi-field column group.
     // Used to guard DropFieldData from breaking shared storage.
     virtual bool
     IsInMultiFieldColumnGroup() const {
+        return false;
+    }
+
+    virtual LocalFormat
+    GetLocalFormat() const {
+        return LocalFormat::Raw;
+    }
+
+    virtual bool
+    SupportsScanPushdown(const ScanOptions&) const {
         return false;
     }
 
@@ -260,6 +308,77 @@ class ChunkedColumnInterface {
         return valid_array_offsets_per_chunk_[chunk_id];
     }
 
+    // Element-nullable VECTOR_ARRAY stores only valid vectors. Record the
+    // segment-wide logical element id of every stored vector so brute-force
+    // search over the compact payload filters and reports logical element
+    // ids. Null rows contribute no logical elements, matching
+    // StructElementOffsets. Built once; later calls are no-ops.
+    void
+    BuildElementPhysicalToLogicalIds(milvus::OpContext* op_ctx) {
+        if (element_p2l_ids_built_.load(std::memory_order_acquire)) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(element_p2l_ids_build_mutex_);
+        if (element_p2l_ids_built_.load(std::memory_order_relaxed)) {
+            return;
+        }
+        auto chunk_pws = GetAllChunks(op_ctx);
+        element_p2l_ids_.clear();
+        physical_elements_until_chunk_.assign(1, 0);
+        physical_elements_until_chunk_.reserve(chunk_pws.size() + 1);
+        int64_t logical_begin = 0;
+        for (size_t i = 0; i < chunk_pws.size(); ++i) {
+            auto chunk = static_cast<VectorArrayChunk*>(chunk_pws[i].get());
+            AssertInfo(chunk->IsElementNullable(),
+                       "chunk {} of an element-nullable VECTOR_ARRAY column "
+                       "is not element-nullable",
+                       i);
+            const auto* validity = chunk->ElementValidity();
+            const auto logical_count = chunk->LogicalElementCount();
+            AssertInfo(logical_begin + logical_count <=
+                           std::numeric_limits<int32_t>::max(),
+                       "logical element count {} exceeds int32 range",
+                       logical_begin + logical_count);
+            for (int64_t j = 0; j < logical_count; ++j) {
+                if (validity[j >> 3] & (1 << (j & 7))) {
+                    element_p2l_ids_.push_back(
+                        static_cast<int32_t>(logical_begin + j));
+                }
+            }
+            const auto physical_count =
+                static_cast<int64_t>(element_p2l_ids_.size()) -
+                physical_elements_until_chunk_.back();
+            AssertInfo(physical_count == chunk->PhysicalElementCount(),
+                       "chunk {} element bitmap marks {} valid elements but "
+                       "stores {} vectors",
+                       i,
+                       physical_count,
+                       chunk->PhysicalElementCount());
+            logical_begin += logical_count;
+            physical_elements_until_chunk_.push_back(
+                static_cast<int64_t>(element_p2l_ids_.size()));
+        }
+        element_p2l_ids_built_.store(true, std::memory_order_release);
+    }
+
+    // Logical element ids of the vectors physically stored in chunk_id.
+    // Requires BuildElementPhysicalToLogicalIds.
+    OffsetMappingIdView
+    GetElementPhysicalToLogicalIds(int64_t chunk_id) const {
+        AssertInfo(element_p2l_ids_built_.load(std::memory_order_acquire),
+                   "element physical-to-logical ids are not built");
+        AssertInfo(
+            chunk_id >= 0 &&
+                chunk_id + 1 <
+                    static_cast<int64_t>(physical_elements_until_chunk_.size()),
+            "Chunk id {} out of range, element id chunks {}",
+            chunk_id,
+            physical_elements_until_chunk_.size() - 1);
+        const auto begin = physical_elements_until_chunk_[chunk_id];
+        const auto end = physical_elements_until_chunk_[chunk_id + 1];
+        return {element_p2l_ids_.data() + begin, end - begin};
+    }
+
     virtual void
     BuildValidRowIds(milvus::OpContext* op_ctx) {
         if (!IsNullable()) {
@@ -272,9 +391,9 @@ class ChunkedColumnInterface {
         if (valid_row_ids_built_.load(std::memory_order_relaxed)) {
             return;
         }
+        auto chunk_pws = GetAllChunks(op_ctx);
         const auto total_chunks = num_chunks();
         const auto total_rows = NumRows();
-        auto chunk_pws = GetAllChunks(op_ctx);
 
         valid_data_.resize(total_rows);
         valid_count_per_chunk_.assign(total_chunks, 0);
@@ -348,16 +467,6 @@ class ChunkedColumnInterface {
     }
 
     virtual void
-    BulkRawJsonAt(milvus::OpContext* op_ctx,
-                  std::function<void(Json, size_t, bool)> fn,
-                  const int64_t* offsets,
-                  int64_t count) const {
-        ThrowInfo(
-            ErrorCode::Unsupported,
-            "RawJsonAt only supported for ChunkColumnInterface of Json type");
-    }
-
-    virtual void
     BulkRawBsonAt(milvus::OpContext* op_ctx,
                   std::function<void(BsonView, uint32_t, uint32_t)> fn,
                   const uint32_t* row_offsets,
@@ -422,14 +531,16 @@ class ChunkedColumnInterface {
 
  protected:
     using TakeCellPin = std::function<PinWrapper<Chunk*>(int64_t)>;
+    using TakeCellRead = std::function<Chunk*(int64_t)>;
+    using TakeCellAccess = std::variant<TakeCellPin, TakeCellRead>;
 
-    // Return a generation-stable accessor used by the default Raw Take
-    // implementation to pin one Cell at a time after Take() returns. The
-    // accessor must own the cache resources it needs; it must not capture a
-    // bare column pointer. The caller keeps op_ctx alive until borrowed access
-    // and any GetOwn() materialization are complete.
-    virtual TakeCellPin
-    MakeTakeCellPin(milvus::OpContext* op_ctx) const {
+    // The Raw Take accessor owns its generation, never a bare Column pointer.
+    // Batch access borrows pointers from its retained pin set; CurrentCell
+    // returns an owning pin only on a Cell change. op_ctx outlives borrowed reads.
+    virtual TakeCellAccess
+    MakeTakeCellAccess(
+        milvus::OpContext* op_ctx,
+        const std::vector<int64_t>* batch_cell_ids = nullptr) const {
         return {};
     }
 
@@ -452,6 +563,10 @@ class ChunkedColumnInterface {
         return std::nullopt;
     }
 
+    virtual void
+    ValidateArrayViewTarget(TargetType target_type) const {
+    }
+
     FixedVector<bool> valid_data_;
     std::vector<int64_t> valid_count_per_chunk_;
     std::vector<int64_t> num_valid_rows_until_chunk_;
@@ -459,6 +574,10 @@ class ChunkedColumnInterface {
     SealedOffsetMapping offset_mapping_;
     std::atomic<bool> valid_row_ids_built_{false};
     std::mutex offset_mapping_build_mutex_;
+    std::vector<int32_t> element_p2l_ids_;
+    std::vector<int64_t> physical_elements_until_chunk_;
+    std::atomic<bool> element_p2l_ids_built_{false};
+    std::mutex element_p2l_ids_build_mutex_;
 
     virtual void
     BuildValidArrayOffsetsInChunks(
@@ -471,7 +590,9 @@ class ChunkedColumnInterface {
         valid_array_offsets_per_chunk_.assign(chunk_pws.size(), {});
         for (size_t i = 0; i < chunk_pws.size(); ++i) {
             auto chunk = static_cast<VectorArrayChunk*>(chunk_pws[i].get());
-            auto logical_offsets = chunk->Offsets();
+            // Offsets() is the physical vector prefix sum. Null elements do
+            // not occupy payload slots, including in element-nullable chunks.
+            auto physical_offsets = chunk->Offsets();
             auto& valid_offsets = valid_array_offsets_per_chunk_[i];
             valid_offsets.reserve(valid_count_per_chunk_[i] + 1);
             valid_offsets.push_back(0);
@@ -482,7 +603,7 @@ class ChunkedColumnInterface {
                 if (!chunk->isValid(j)) {
                     continue;
                 }
-                total += logical_offsets[j + 1] - logical_offsets[j];
+                total += physical_offsets[j + 1] - physical_offsets[j];
                 valid_offsets.push_back(total);
             }
         }

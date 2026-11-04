@@ -33,6 +33,29 @@ func (e *testBodyEncoder) BodyType() *msgpb.InsertRequest {
 	return nil
 }
 
+func TestReplicateMessagePreservesIdempotencyKey(t *testing.T) {
+	// A replicated message carries the SOURCE cluster's idempotency key: message
+	// properties cross the replication boundary verbatim. The idempotency
+	// interceptor and the recovery observer must therefore skip replicated
+	// messages BEFORE reading the key — otherwise a foreign key would
+	// materialize a local window entry.
+	msgID := walimplstest.NewTestMessageID(1)
+	immutableMsg := message.NewInsertMessageBuilderV1().
+		WithVChannel("v1").
+		WithHeader(&message.InsertMessageHeader{}).
+		WithBody(&msgpb.InsertRequest{}).
+		WithIdempotencyKey("key-1").
+		MustBuildMutable().
+		WithTimeTick(100).
+		WithLastConfirmed(msgID).
+		IntoImmutableMessage(msgID)
+	require.Equal(t, message.IdempotencyKey("key-1"), message.IdempotencyKeyOf(immutableMsg))
+
+	replicateMsg := message.MustNewReplicateMessage("by-dev", immutableMsg.IntoImmutableMessageProto())
+	require.NotNil(t, replicateMsg.ReplicateHeader())
+	require.Equal(t, message.IdempotencyKey("key-1"), message.IdempotencyKeyOf(replicateMsg))
+}
+
 func TestMutableBuilder(t *testing.T) {
 	b := message.NewTimeTickMessageBuilderV1().
 		WithHeader(&message.TimeTickMessageHeader{}).
@@ -94,7 +117,7 @@ func TestMutableBuilderWithBodyEncoder(t *testing.T) {
 
 	insertMsg, err := message.AsMutableInsertMessageV1(msg)
 	require.NoError(t, err)
-	actualBody, err := insertMsg.Body()
+	actualBody, err := insertMsg.Body(context.Background())
 	require.NoError(t, err)
 	assert.True(t, proto.Equal(body, actualBody))
 }
@@ -199,6 +222,7 @@ func TestImmutableTxnBuilder(t *testing.T) {
 	mutableMsg := msg.WithTimeTick(2).WithTxnContext(txnCtx).WithLastConfirmed(msgID)
 	mlog.Info(context.TODO(), "test", mlog.Object("msg", mutableMsg))
 	immutableMsg := mutableMsg.IntoImmutableMessage(msgID)
+	decodedBody := message.MustAsImmutableInsertMessageV1(immutableMsg).MustBody()
 	b.Add(immutableMsg)
 
 	commit := message.NewCommitTxnMessageBuilderV2().
@@ -227,6 +251,11 @@ func TestImmutableTxnBuilder(t *testing.T) {
 	assert.Equal(t, "v1", immutableTxnMsg.ReplicateHeader().VChannel)
 	assert.Equal(t, msgID, immutableTxnMsg.ReplicateHeader().MessageID)
 	assert.Equal(t, msgID, immutableTxnMsg.ReplicateHeader().LastConfirmedMessageID)
+	assert.NoError(t, immutableTxnMsg.RangeOver(func(msg message.ImmutableMessage) error {
+		assert.Equal(t, uint64(3), msg.TimeTick())
+		assert.Same(t, decodedBody, message.MustAsImmutableInsertMessageV1(msg).MustBody())
+		return nil
+	}))
 	mlog.Info(context.TODO(), "test", mlog.Object("msg", immutableTxnMsg))
 }
 

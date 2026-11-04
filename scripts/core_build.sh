@@ -92,8 +92,8 @@ BUILD_UNITTEST="OFF"
 INSTALL_PREFIX="${CPP_SRC_DIR}/output"
 BUILD_COVERAGE="OFF"
 RUN_CPPLINT="OFF"
-CUDA_COMPILER=/usr/local/cuda/bin/nvcc
-GPU_VERSION="OFF" #defaults to CPU version
+CUDA_COMPILER=${CUDACXX:-/usr/local/cuda/bin/nvcc}
+WITH_GPU=""
 CUDA_ARCH="DEFAULT"
 EMBEDDED_MILVUS="OFF"
 BUILD_DISK_ANN="OFF"
@@ -102,6 +102,7 @@ USE_DYNAMIC_SIMD="ON"
 USE_SVS="OFF"
 WITH_CRT="OFF"
 TANTIVY_FEATURES=""
+: "${TANTIVY_ANALYZER_REMOTE_TLS:=ON}"
 INDEX_ENGINE="KNOWHERE"
 ENABLE_AZURE_FS="ON"
 if [[ "$(uname)" == "Darwin" ]]; then
@@ -111,8 +112,9 @@ fi
 # Build acceleration options (override via env vars)
 : "${USE_PCH:="ON"}"
 : "${USE_UNITY_BUILD:="OFF"}"
+: "${USE_SPLIT_DWARF:="OFF"}"
 
-while getopts "p:t:s:n:a:y:x:f:S:R:ulcgbZh" arg; do
+while getopts "p:t:s:n:a:y:x:G:f:S:R:ulcbZh" arg; do
   case $arg in
   p)
     INSTALL_PREFIX=$OPTARG
@@ -129,9 +131,6 @@ while getopts "p:t:s:n:a:y:x:f:S:R:ulcgbZh" arg; do
     ;;
   c)
     BUILD_COVERAGE="ON"
-    ;;
-  g)
-    GPU_VERSION="ON"
     ;;
   s)
     CUDA_ARCH=$OPTARG
@@ -155,6 +154,9 @@ while getopts "p:t:s:n:a:y:x:f:S:R:ulcgbZh" arg; do
   x)
     INDEX_ENGINE=$OPTARG
     ;;
+  G)
+    WITH_GPU=$OPTARG
+    ;;
   S)
     USE_SVS=$OPTARG
     ;;
@@ -174,7 +176,8 @@ parameter:
 -u: building unit test options(default: OFF)
 -l: run cpplint, clang-format and clang-tidy(default: OFF)
 -c: code coverage(default: OFF)
--g: build GPU version(default: OFF)
+-x: index engine: knowhere/cardinal(default: knowhere)
+-G: build with GPU support: ON/OFF(default: ON for cardinal, OFF for knowhere)
 -e: build without prometheus(default: OFF)
 -s: build with CUDA arch(default:DEFAULT), for example '-gencode=compute_61,code=sm_61;-gencode=compute_75,code=sm_75'
 -b: build embedded milvus(default: OFF)
@@ -185,8 +188,12 @@ parameter:
 -f: build milvus with tantivy features(default: '')
 -h: help
 
+environment:
+TANTIVY_ANALYZER_REMOTE_TLS: ON/OFF (default: ON). Set OFF for FIPS builds that must not link rustls/ring
+  (disables Lindera online dictionary download and gRPC tokenizer TLS).
+
 usage:
-./core_build.sh -p \${INSTALL_PREFIX} -t \${BUILD_TYPE} -s \${CUDA_ARCH} -f \${TANTIVY_FEATURES} [-u] [-l] [-c] [-z] [-g] [-m] [-e] [-h] [-b] [-o] [-R \${WITH_CRT}]
+./core_build.sh -p \${INSTALL_PREFIX} -t \${BUILD_TYPE} -s \${CUDA_ARCH} -f \${TANTIVY_FEATURES} [-x \${INDEX_ENGINE}] [-G \${WITH_GPU}] [-u] [-l] [-c] [-z] [-m] [-e] [-h] [-b] [-o] [-R \${WITH_CRT}]
                 "
     exit 0
     ;;
@@ -196,6 +203,14 @@ usage:
     ;;
   esac
 done
+
+if [[ -z "${WITH_GPU}" ]]; then
+  if [[ "${INDEX_ENGINE}" == "cardinal" ]]; then
+    WITH_GPU="ON"
+  else
+    WITH_GPU="OFF"
+  fi
+fi
 
 # Azure SDK build has been removed as we now use Arrow with Azure support directly
 
@@ -215,6 +230,36 @@ if command -v ninja &> /dev/null; then
     fi
 else
     CMAKE_GENERATOR="Unix Makefiles"
+fi
+
+if [[ -n "${MILVUS_CARGO_TARGET_ROOT:-}" ]]; then
+  if [[ "${MILVUS_CARGO_TARGET_ROOT}" != /* ]]; then
+    echo "ERROR: MILVUS_CARGO_TARGET_ROOT must be an absolute path" >&2
+    exit 1
+  fi
+
+  mkdir -p "${MILVUS_CARGO_TARGET_ROOT}/tantivy" "${MILVUS_CARGO_TARGET_ROOT}/milvus-storage"
+
+  # Corrosion passes --target-dir=${BUILD_OUTPUT_DIR}/cargo/build explicitly,
+  # so CARGO_TARGET_DIR cannot relocate milvus-storage's Rust artifacts.
+  # Keep Corrosion's generated command unchanged and redirect its parent
+  # directory to the persistent cache instead.
+  CORROSION_CARGO_DIR="${BUILD_OUTPUT_DIR}/cargo"
+  MILVUS_STORAGE_CARGO_DIR="${MILVUS_CARGO_TARGET_ROOT}/milvus-storage"
+  if [[ -L "${CORROSION_CARGO_DIR}" ]]; then
+    ln -sfn "${MILVUS_STORAGE_CARGO_DIR}" "${CORROSION_CARGO_DIR}"
+  elif [[ -d "${CORROSION_CARGO_DIR}" ]]; then
+    # Migrate a generated target directory left by builds that predate the
+    # persistent Cargo root. Cargo can safely recreate all of its contents.
+    echo "Migrating ${CORROSION_CARGO_DIR} to persistent Cargo target storage"
+    rm -rf -- "${CORROSION_CARGO_DIR}"
+    ln -s "${MILVUS_STORAGE_CARGO_DIR}" "${CORROSION_CARGO_DIR}"
+  elif [[ -e "${CORROSION_CARGO_DIR}" ]]; then
+    echo "ERROR: ${CORROSION_CARGO_DIR} already exists and is not a symbolic link" >&2
+    exit 1
+  else
+    ln -s "${MILVUS_STORAGE_CARGO_DIR}" "${CORROSION_CARGO_DIR}"
+  fi
 fi
 
 # build with diskann index if OS is ubuntu or rocky or amzn
@@ -242,12 +287,13 @@ CMAKE_CMD="cmake \
 ${CMAKE_EXTRA_ARGS} \
 -DCMAKE_TOOLCHAIN_FILE=${BUILD_OUTPUT_DIR}/conan/conan_toolchain.cmake \
 -DBUILD_UNIT_TEST=${BUILD_UNITTEST} \
+-DMILVUS_AUDIT_AWS_RUNTIME=${MILVUS_AUDIT_AWS_RUNTIME:-${BUILD_UNITTEST}} \
 -DCMAKE_INSTALL_PREFIX=${INSTALL_PREFIX} \
 -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
 -DCMAKE_CUDA_COMPILER=${CUDA_COMPILER} \
 -DCMAKE_LIBRARY_ARCHITECTURE=${arch} \
 -DBUILD_COVERAGE=${BUILD_COVERAGE} \
--DMILVUS_GPU_VERSION=${GPU_VERSION} \
+-DWITH_GPU=${WITH_GPU} \
 -DMILVUS_CUDA_ARCH=${CUDA_ARCH} \
 -DEMBEDDED_MILVUS=${EMBEDDED_MILVUS} \
 -DBUILD_DISK_ANN=${BUILD_DISK_ANN} \
@@ -257,11 +303,14 @@ ${CMAKE_EXTRA_ARGS} \
 -DWITH_SVS=${USE_SVS} \
 -DINDEX_ENGINE=${INDEX_ENGINE} \
 -DTANTIVY_FEATURES_LIST=${TANTIVY_FEATURES} \
+-DTANTIVY_ANALYZER_REMOTE_TLS=${TANTIVY_ANALYZER_REMOTE_TLS} \
 -DENABLE_GCP_NATIVE=${ENABLE_GCP_NATIVE} \
 -DENABLE_AZURE_FS=${ENABLE_AZURE_FS} \
 -DWITH_CRT=${WITH_CRT} \
 -DMILVUS_USE_PCH=${USE_PCH} \
--DMILVUS_UNITY_BUILD=${USE_UNITY_BUILD} "
+-DMILVUS_UNITY_BUILD=${USE_UNITY_BUILD} \
+-DMILVUS_USE_SPLIT_DWARF=${USE_SPLIT_DWARF} \
+-DMILVUS_CARGO_TARGET_ROOT=${MILVUS_CARGO_TARGET_ROOT:-} "
 # Azure build variables removed as we now use Arrow with Azure support directly
 CMAKE_CMD=${CMAKE_CMD}"${CPP_SRC_DIR}"
 

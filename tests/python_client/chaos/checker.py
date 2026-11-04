@@ -4,6 +4,7 @@ import math
 import os
 import random
 import re
+import tempfile
 import threading
 import time
 import unittest
@@ -22,7 +23,6 @@ from chaos import constants
 from common import common_func as cf
 from common import common_type as ct
 from common.common_type import CheckTasks
-from common.milvus_sys import MilvusSys
 from faker import Faker
 from minio import Minio
 from prettytable import PrettyTable
@@ -273,6 +273,7 @@ class Op(Enum):
     create_collection = "create_collection"
     create_partition = "create_partition"
     insert = "insert"
+    recovery_continuation = "recovery_continuation"
     insert_freshness = "insert_freshness"
     upsert = "upsert"
     upsert_freshness = "upsert_freshness"
@@ -317,6 +318,7 @@ class Op(Enum):
     restore_snapshot = "restore_snapshot"
     entity_ttl = "entity_ttl"
     external_table = "external_table"
+    external_table_load = "external_table_load"
     unknown = "unknown"
 
 
@@ -571,7 +573,6 @@ class Checker:
         p_name = partition_name if partition_name is not None else "_default"
         self.p_name = p_name
         self.p_names = [self.p_name] if partition_name is not None else None
-        self.ms = MilvusSys()
         self.bucket_name = cf.param_info.param_bucket_name
 
         # Initialize MilvusClient - prioritize uri and token
@@ -590,9 +591,9 @@ class Checker:
             token = f"{cf.param_info.param_user}:{cf.param_info.param_password}"
         self.milvus_client = MilvusClient(uri=uri, token=token)
 
-        # Also create a connection for low-level APIs that MilvusClient doesn't support
-        self.alias = cf.gen_unique_str("checker_alias_")
-        connections.connect(alias=self.alias, uri=uri, token=token)
+        # Legacy workloads open an ORM connection only when they access alias.
+        self._legacy_alias = None
+        self._legacy_connection = {"uri": uri, "token": token}
 
         # Get or create schema
         collection_exists = self.milvus_client.has_collection(c_name)
@@ -831,6 +832,14 @@ class Checker:
             raise ValueError("initial_jitter_seconds must be non-negative")
         self.operation_interval_seconds = interval_seconds
         self.initial_jitter_seconds = initial_jitter_seconds
+
+    @property
+    def alias(self):
+        if self._legacy_alias is None:
+            alias = cf.gen_unique_str("checker_alias_")
+            connections.connect(alias=alias, **self._legacy_connection)
+            self._legacy_alias = alias
+        return self._legacy_alias
 
     def get_schema(self):
         collection_info = self.milvus_client.describe_collection(self.c_name)
@@ -1301,6 +1310,46 @@ class ExternalTableChecker(Checker):
         while self._keep_running:
             self.run_task()
             sleep(constants.WAIT_PER_OP)
+
+
+class ExternalTableLoadChecker(ExternalTableChecker):
+    """Reload a fixed external table to check DataCoord recovery targets."""
+
+    def _reload_and_check(self):
+        # A refresh here would rebuild in-memory binlogs and hide missing recovery targets.
+        self._reset_milvus_client()
+        self.milvus_client.release_collection(collection_name=self.c_name, timeout=timeout)
+        self.milvus_client.load_collection(collection_name=self.c_name, timeout=timeout)
+        return self._wait_external_table_row_count()
+
+    @trace()
+    def external_table_load(self):
+        try:
+            return self._reload_and_check()
+        except Exception as e:
+            self._try_reset_milvus_client("external table reload failed")
+            log.info(f"external table reload failed: {e}")
+            return str(e), False
+
+    @exception_handler()
+    def run_task(self):
+        return self.external_table_load()
+
+    def verify_consistency(self, submit_retry_timeout=None):
+        """Check the persisted external snapshot without submitting another refresh."""
+        deadline = time.time() + (submit_retry_timeout or self.refresh_timeout)
+        last_error = None
+        while time.time() < deadline:
+            try:
+                return self._reload_and_check()
+            except Exception as e:
+                self._try_reset_milvus_client("external table recovery check failed")
+                last_error = str(e)
+                sleep(5)
+        return f"external table reload did not recover in time, last error: {last_error}", False
+
+    def keep_running(self):
+        _run_checker_with_interval(self, 30)
 
 
 class CollectionLoadChecker(Checker):
@@ -3210,6 +3259,7 @@ class BulkInsertChecker(Checker):
 
     def prepare(self, data_size=100000):
         with RemoteBulkWriter(
+            local_path=tempfile.mkdtemp(prefix="bulk_writer_"),
             schema=self.schema,
             file_type=BulkFileType.NUMPY,
             remote_path="bulk_data",
@@ -3504,6 +3554,7 @@ class Import2PCChecker(Checker):
 
     def _write_import_files(self, rows):
         with RemoteBulkWriter(
+            local_path=tempfile.mkdtemp(prefix="bulk_writer_"),
             schema=self.schema,
             file_type=BulkFileType.PARQUET,
             remote_path=self.import_remote_path,
@@ -4161,10 +4212,11 @@ class NullVectorQueryChecker(Checker):
     field is non-null is collected; each query() call fetches those specific rows
     and asserts they are still non-null.
 
-    Avoids using 'vec_field is not null' as a server-side filter because Milvus
-    does not yet support IsNull/IsNotNull on vector fields.  Excludes dynamically-
-    added new_vec_* fields: segments sealed before those fields were added have
-    all-null values by design, so sampling those fields at init would yield no PKs.
+    Samples by reading vector output fields instead of using a server-side
+    'vec_field is not null' filter, so the checker keeps validating query
+    result materialization. Excludes dynamically-added new_vec_* fields:
+    segments sealed before those fields were added have all-null values by
+    design, so sampling those fields at init would yield no PKs.
     """
 
     def __init__(self, collection_name=None, shards_num=2, replica_number=1, schema=None):

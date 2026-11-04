@@ -720,7 +720,7 @@ TEST_F(IndexEntryWriterV3Test, ReadEntriesToFiles) {
     ::unlink(file_b.c_str());
 }
 
-TEST_F(IndexEntryWriterV3Test, GetEntryNames) {
+TEST_F(IndexEntryWriterV3Test, DirectoryEntries) {
     const std::string file_path = kV3FilePath + "_names";
     auto data = GeneratePattern(64);
 
@@ -737,12 +737,12 @@ TEST_F(IndexEntryWriterV3Test, GetEntryNames) {
     int64_t file_size = GetFileSize(file_path);
     auto reader = IndexEntryReader::Open(input, file_size);
 
-    auto names = reader->GetEntryNames();
-    ASSERT_EQ(names.size(), 4);
-    EXPECT_EQ(names[0], "alpha");
-    EXPECT_EQ(names[1], "beta");
-    EXPECT_EQ(names[2], "gamma");
-    EXPECT_EQ(names[3], "__meta__");
+    const auto& entries = reader->Directory().Entries();
+    ASSERT_EQ(entries.size(), 4);
+    EXPECT_EQ(entries[0].name, "__meta__");
+    EXPECT_EQ(entries[1].name, "alpha");
+    EXPECT_EQ(entries[2].name, "beta");
+    EXPECT_EQ(entries[3].name, "gamma");
 }
 
 TEST_F(IndexEntryWriterV3Test, EntryNotFound) {
@@ -839,11 +839,11 @@ TEST_F(IndexEntryWriterV3Test, MixedSizeEntries) {
     int64_t file_size = GetFileSize(file_path);
     auto reader = IndexEntryReader::Open(input, file_size);
 
-    auto names = reader->GetEntryNames();
-    ASSERT_EQ(names.size(), 3);
-    EXPECT_EQ(names[0], "tiny_meta");
-    EXPECT_EQ(names[1], "large_data");
-    EXPECT_EQ(names[2], "__meta__");
+    const auto& entries = reader->Directory().Entries();
+    ASSERT_EQ(entries.size(), 3);
+    EXPECT_EQ(entries[0].name, "__meta__");
+    EXPECT_EQ(entries[1].name, "large_data");
+    EXPECT_EQ(entries[2].name, "tiny_meta");
 
     auto tiny_entry = reader->ReadEntry("tiny_meta");
     VerifyPattern(tiny_entry.data, tiny_size);
@@ -870,12 +870,12 @@ TEST_F(IndexEntryWriterV3Test, SetMetaRoundtrip) {
     auto reader = IndexEntryReader::Open(input, file_size);
 
     // Verify __meta__ entry is present
-    auto names = reader->GetEntryNames();
-    EXPECT_EQ(names.back(), "__meta__");
+    EXPECT_TRUE(reader->Directory().HasEntry("__meta__"));
 
     // Read and verify the meta content via GetMeta
-    EXPECT_EQ(reader->GetMeta<std::string>("index_type"), "bitmap");
-    EXPECT_EQ(reader->GetMeta<int>("build_id"), 42);
+    EXPECT_EQ(reader->IndexMeta().at("index_type").get<std::string>(),
+              "bitmap");
+    EXPECT_EQ(reader->IndexMeta().at("build_id").get<int>(), 42);
 
     // Regular data entry should still be readable
     auto data_entry = reader->ReadEntry("data");
@@ -997,9 +997,9 @@ TEST_F(IndexEntryWriterV3Test, LargeDirectoryTableNeedsSecondIO) {
     int64_t file_size = GetFileSize(file_path);
     auto reader = IndexEntryReader::Open(input, file_size);
 
-    auto names = reader->GetEntryNames();
+    const auto& entries = reader->Directory().Entries();
     // +1 for __meta__
-    ASSERT_EQ(names.size(), num_entries + 1);
+    ASSERT_EQ(entries.size(), num_entries + 1);
 
     // Verify a few entries
     auto entry0 = reader->ReadEntry(name_prefix + "0");
@@ -1009,7 +1009,7 @@ TEST_F(IndexEntryWriterV3Test, LargeDirectoryTableNeedsSecondIO) {
     VerifyPattern(entry_last.data, 64);
 }
 
-TEST_F(IndexEntryWriterV3Test, InspectStreamLoadInfoReadsOnlyFileTail) {
+TEST_F(IndexEntryWriterV3Test, ReadDirectoryReadsOnlyFileTail) {
     const std::string file_path = kV3FilePath + "_inspect_tail_only";
     auto data = GeneratePattern(1024);
 
@@ -1023,16 +1023,17 @@ TEST_F(IndexEntryWriterV3Test, InspectStreamLoadInfoReadsOnlyFileTail) {
     auto input =
         std::make_shared<RecordingInputStream>(CreateInputStream(file_path));
     auto file_size = input->Size();
-    auto info = IndexEntryReader::InspectStreamLoadInfo(input, file_size);
+    auto [directory, encryption] =
+        ReadIndexEntryDirectory(input, file_size, {});
 
-    EXPECT_FALSE(info.encrypted);
+    EXPECT_FALSE(encryption.has_value());
     ASSERT_EQ(input->ReadRanges().size(), 1);
     auto tail_size = std::min<size_t>(file_size, 64 * 1024);
     EXPECT_EQ(input->ReadRanges()[0].offset, file_size - tail_size);
     EXPECT_EQ(input->ReadRanges()[0].size, tail_size);
 }
 
-TEST_F(IndexEntryWriterV3Test, InspectStreamLoadInfoDoesNotPrefetchLargeMeta) {
+TEST_F(IndexEntryWriterV3Test, ReadDirectoryDoesNotPrefetchLargeMeta) {
     const std::string file_path = kV3FilePath + "_inspect_large_meta";
     auto data = GeneratePattern(1024);
 
@@ -1047,9 +1048,10 @@ TEST_F(IndexEntryWriterV3Test, InspectStreamLoadInfoDoesNotPrefetchLargeMeta) {
     auto input =
         std::make_shared<RecordingInputStream>(CreateInputStream(file_path));
     auto file_size = input->Size();
-    auto info = IndexEntryReader::InspectStreamLoadInfo(input, file_size);
+    auto [directory, encryption] =
+        ReadIndexEntryDirectory(input, file_size, {});
 
-    EXPECT_FALSE(info.encrypted);
+    EXPECT_FALSE(encryption.has_value());
     auto non_magic_reads = std::count_if(
         input->ReadRanges().begin(),
         input->ReadRanges().end(),
@@ -1084,7 +1086,7 @@ TEST_F(IndexEntryWriterV3Test, LargeMetaLoadsSeparatelyFromDirectory) {
     auto reader = IndexEntryReader::Open(input, file_size);
 
     // Verify meta can be read
-    auto meta_value = reader->GetMeta<std::string>("large_field");
+    auto meta_value = reader->IndexMeta().at("large_field").get<std::string>();
     ASSERT_EQ(meta_value.size(), 70 * 1024);
     ASSERT_EQ(meta_value, std::string(70 * 1024, 'X'));
 
@@ -1115,7 +1117,7 @@ TEST_F(IndexEntryWriterV3Test, LargeMetaEntryMultiRange) {
     auto reader = IndexEntryReader::Open(input, file_size);
 
     // Verify large meta
-    auto meta_value = reader->GetMeta<std::string>("huge_field");
+    auto meta_value = reader->IndexMeta().at("huge_field").get<std::string>();
     ASSERT_EQ(meta_value.size(), 20 * 1024 * 1024);
     ASSERT_EQ(meta_value[0], 'Y');
     ASSERT_EQ(meta_value[meta_value.size() - 1], 'Y');
@@ -1258,8 +1260,7 @@ TEST_F(IndexEntryEncryptedV3Test, EncryptedMultiSliceEntry) {
     VerifyEncryptedEntry(file_path, "large_enc", entry_size);
 }
 
-TEST_F(IndexEntryEncryptedV3Test,
-       InspectStreamLoadInfoUsesPersistedCiphertextSizes) {
+TEST_F(IndexEntryEncryptedV3Test, DirectoryPreservesCiphertextSizes) {
     IndexEntryStreamConfigGuard guard;
     const std::string file_path = kV3FilePath + "_enc_stream_load_info";
     const size_t slice_size = kStreamSliceAlignment;
@@ -1280,24 +1281,16 @@ TEST_F(IndexEntryEncryptedV3Test,
     }
 
     auto input = CreateInputStream(file_path);
-    auto info = IndexEntryReader::InspectStreamLoadInfo(input, input->Size());
-
-    // The encryptor expands ciphertext beyond 3x plaintext. The directory also
-    // contains the encrypted two-byte "{}" metadata entry.
-    EXPECT_TRUE(info.encrypted);
-    EXPECT_EQ(info.max_task_transient_bytes, 6 * slice_size + 17);
-    EXPECT_EQ(info.total_transient_bytes,
-              2 * (6 * slice_size + 17) + (6 * 100 + 17) + 29);
-
-    milvus::SetLoadTransientBudgetBytes(0);
-    EXPECT_EQ(EntryStreamMaxTransientBytes(info.total_transient_bytes,
-                                           info.max_task_transient_bytes),
-              info.total_transient_bytes);
-
-    milvus::SetLoadTransientBudgetBytes(1);
-    EXPECT_EQ(EntryStreamMaxTransientBytes(info.total_transient_bytes,
-                                           info.max_task_transient_bytes),
-              info.max_task_transient_bytes);
+    auto [directory, encryption] =
+        ReadIndexEntryDirectory(input, input->Size(), {});
+    ASSERT_TRUE(encryption.has_value());
+    const auto& slices =
+        std::get<EncryptedEntrySource>(directory.At("data").source).slices;
+    ASSERT_EQ(slices.size(), 3);
+    EXPECT_EQ(slices[0].remote_bytes, 4 * slice_size + 17);
+    EXPECT_EQ(slices[1].remote_bytes, 4 * slice_size + 17);
+    EXPECT_EQ(slices[2].remote_bytes, 4 * 100 + 17);
+    EXPECT_EQ(directory.At("data").plaintext_size, entry_size);
 }
 
 TEST_F(IndexEntryEncryptedV3Test, EncryptedMultipleEntriesMultiSlice) {
@@ -1366,7 +1359,7 @@ TEST_F(IndexEntryEncryptedV3Test, EncryptedLargeMetaMultiSlice) {
 
     auto input = CreateInputStream(file_path);
     auto reader = IndexEntryReader::Open(input, GetFileSize(file_path), 100);
-    EXPECT_EQ(reader->GetMeta<std::string>("large_meta"),
+    EXPECT_EQ(reader->IndexMeta().at("large_meta").get<std::string>(),
               std::string(5000, 'M'));
 }
 
@@ -1747,6 +1740,10 @@ TEST_F(IndexEntryWriterV3Test, ReadEntryStreamMatchesReadEntry) {
 }
 
 TEST_F(IndexEntryWriterV3Test, ReadEntryStreamToFileWritesEntry) {
+    const auto previous_mode = FileWriter::GetMode();
+    auto restore =
+        folly::makeGuard([&] { FileWriter::SetMode(previous_mode); });
+    FileWriter::SetMode(FileWriter::WriteMode::DIRECT);
     const std::string file_path = kV3FilePath + "_stream_to_file";
     const size_t entry_size = 3 * 1024 * 1024 + 19;
     auto data = GeneratePattern(entry_size);
@@ -1764,7 +1761,7 @@ TEST_F(IndexEntryWriterV3Test, ReadEntryStreamToFileWritesEntry) {
 
     std::string local_file = GetRootPath() + "/stream_entry_output.bin";
     reader->ReadEntryStreamToFile(
-        "data", local_file, milvus::storage::io::Priority::HIGH);
+        "data", local_file, milvus::storage::io::Priority::LOW);
 
     std::ifstream ifs(local_file, std::ios::binary | std::ios::ate);
     ASSERT_TRUE(ifs.is_open());
@@ -2241,4 +2238,319 @@ TEST_F(IndexEntryWriterV3Test, GetEntrySize) {
     auto reader = IndexEntryReader::Open(input, file_size);
 
     ASSERT_EQ(reader->GetEntrySize("sized_entry"), entry_size);
+}
+
+// A one-byte budget admits one oversized slice exclusively. The submission
+// loop cannot reach future.get() until the worker releases that reservation.
+TEST_F(IndexEntryEncryptedV3Test, PositionedConsumerReleasesBeforeFutureGet) {
+    const auto previous_mode = FileWriter::GetMode();
+    auto restore_mode =
+        folly::makeGuard([&] { FileWriter::SetMode(previous_mode); });
+    FileWriter::SetMode(FileWriter::WriteMode::DIRECT);
+    auto& budget = LoadAdmissionController::GetInstance();
+    const auto previous = budget.CapacityBytes();
+    auto restore = folly::makeGuard([&] { budget.SetCapacityBytes(previous); });
+    for (bool encrypted : {false, true}) {
+        SCOPED_TRACE(encrypted);
+        const auto path = kV3FilePath + "_positioned_consumer";
+        const auto size = 2 * DefaultEntryStreamSliceSize() + 17;
+        const auto data = GeneratePattern(size);
+        if (encrypted) {
+            IndexEntryEncryptedLocalWriter writer(path,
+                                                  fs_,
+                                                  mock_cipher_,
+                                                  1,
+                                                  100,
+                                                  GetRootPath(),
+                                                  kMinStreamSliceSize);
+            writer.WriteEntry("data", data.data(), data.size());
+            writer.Finish();
+        } else {
+            IndexEntryDirectStreamWriter writer(CreateOutputStream(path));
+            writer.WriteEntry("data", data.data(), data.size());
+            writer.Finish();
+        }
+        auto reader = IndexEntryReader::Open(
+            CreateInputStream(path), GetFileSize(path), 100);
+        const auto local = GetRootPath() + "/positioned_consumer.bin";
+        PositionedFileWriter writer(local, size, io::Priority::LOW);
+        std::atomic<size_t> writes{0};
+        std::atomic<bool> caller_wrote{false};
+        budget.SetCapacityBytes(1);
+        ASSERT_EQ(budget.CapacityBytes(), 1);
+        auto task = std::async(std::launch::async, [&] {
+            const auto caller = std::this_thread::get_id();
+            reader->ReadEntryStreamAt(
+                "data", [&](size_t offset, const uint8_t* bytes, size_t len) {
+                    if (std::this_thread::get_id() == caller)
+                        caller_wrote = true;
+                    writer.WriteAt(offset, bytes, len);
+                    ++writes;
+                });
+        });
+        const auto status = task.wait_for(std::chrono::seconds(10));
+        // Release a stuck submitter before reporting the regression.
+        if (status != std::future_status::ready)
+            budget.SetCapacityBytes(0);
+        EXPECT_NO_THROW(task.get());
+        EXPECT_EQ(status, std::future_status::ready);
+        EXPECT_FALSE(caller_wrote.load());
+        EXPECT_GT(writes.load(), 1);
+        writer.Finish();
+        std::ifstream file(local, std::ios::binary);
+        std::vector<uint8_t> actual(size);
+        file.read(reinterpret_cast<char*>(actual.data()), actual.size());
+        EXPECT_EQ(actual, data);
+        budget.SetCapacityBytes(0);
+    }
+}
+
+TEST_F(IndexEntryWriterV3Test,
+       PositionedConsumerFailureDrainsAndPreservesCode) {
+    const auto path = kV3FilePath + "_positioned_failure";
+    const auto data = GeneratePattern(2 * DefaultEntryStreamSliceSize() + 17);
+    {
+        IndexEntryDirectStreamWriter writer(CreateOutputStream(path));
+        writer.WriteEntry("data", data.data(), data.size());
+        writer.Finish();
+    }
+    auto reader =
+        IndexEntryReader::Open(CreateInputStream(path), GetFileSize(path));
+    std::atomic<int> active{0};
+    try {
+        reader->ReadEntryStreamAt(
+            "data", [&](size_t offset, const uint8_t*, size_t) {
+                ++active;
+                auto leave = folly::makeGuard([&] { --active; });
+                if (offset == 0) {
+                    ThrowInfo(milvus::ErrorCode::FileWriteFailed,
+                              "injected positioned write failure");
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            });
+        FAIL() << "write failure must propagate";
+    } catch (const milvus::SegcoreError& error) {
+        EXPECT_EQ(error.get_error_code(), milvus::ErrorCode::FileWriteFailed);
+    }
+    EXPECT_EQ(active.load(), 0);
+    // The reader remains usable, and no task can mutate a retired target.
+    std::vector<uint8_t> actual(data.size());
+    reader->ReadEntryStreamAt(
+        "data", [&](size_t offset, const uint8_t* bytes, size_t len) {
+            std::memcpy(actual.data() + offset, bytes, len);
+        });
+    EXPECT_EQ(actual, data);
+}
+
+TEST_F(IndexEntryWriterV3Test, PositionedConsumerCancellationDrainsWriter) {
+    const auto path = kV3FilePath + "_positioned_cancel";
+    const auto data = GeneratePattern(2 * DefaultEntryStreamSliceSize() + 17);
+    {
+        IndexEntryDirectStreamWriter writer(CreateOutputStream(path));
+        writer.WriteEntry("data", data.data(), data.size());
+        writer.Finish();
+    }
+    folly::CancellationSource cancel;
+    auto reader = IndexEntryReader::Open(CreateInputStream(path),
+                                         GetFileSize(path),
+                                         0,
+                                         milvus::HIGH,
+                                         cancel.getToken());
+    std::promise<void> entered;
+    auto entered_future = entered.get_future();
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    std::atomic<int> active{0};
+    auto task = std::async(std::launch::async, [&] {
+        reader->ReadEntryStreamAt(
+            "data", [&](size_t offset, const uint8_t*, size_t) {
+                ++active;
+                auto leave = folly::makeGuard([&] { --active; });
+                if (offset == 0) {
+                    entered.set_value();
+                    released.wait();
+                }
+            });
+    });
+    const auto status = entered_future.wait_for(std::chrono::seconds(5));
+    cancel.requestCancellation();
+    release.set_value();
+    try {
+        task.get();
+        FAIL() << "cancelled load must not be published";
+    } catch (const milvus::SegcoreError& error) {
+        EXPECT_EQ(error.get_error_code(), milvus::ErrorCode::FollyCancel);
+    }
+    EXPECT_EQ(status, std::future_status::ready);
+    EXPECT_EQ(active.load(), 0);
+}
+
+TEST_F(IndexEntryWriterV3Test, PositionedConsumerShortReadDrains) {
+    const auto path = kV3FilePath + "_positioned_short";
+    const auto data = GeneratePattern(2 * DefaultEntryStreamSliceSize() + 17);
+    {
+        IndexEntryDirectStreamWriter writer(CreateOutputStream(path));
+        writer.WriteEntry("data", data.data(), data.size());
+        writer.Finish();
+    }
+    auto input = std::make_shared<DelayedFailingInputStream>(
+        CreateInputStream(path),
+        std::vector<DelayedFailingInputStream::Rule>{
+            {MILVUS_V3_MAGIC_SIZE, std::chrono::milliseconds(0), true}});
+    auto reader = IndexEntryReader::Open(input, GetFileSize(path));
+    std::atomic<int> active{0};
+    EXPECT_THROW(
+        reader->ReadEntryStreamAt(
+            "data",
+            [&](size_t, const uint8_t*, size_t) {
+                ++active;
+                auto leave = folly::makeGuard([&] { --active; });
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }),
+        milvus::SegcoreError);
+    EXPECT_EQ(active.load(), 0);
+    const auto local = GetRootPath() + "/positioned_failed_file.bin";
+    EXPECT_THROW(reader->ReadEntryStreamToFile("data", local),
+                 milvus::SegcoreError);
+    EXPECT_FALSE(std::filesystem::exists(local));
+}
+
+TEST_F(IndexEntryWriterV3Test,
+       PositionedConsumerPreservesUnalignedConcatenation) {
+    const auto previous_mode = FileWriter::GetMode();
+    auto restore =
+        folly::makeGuard([&] { FileWriter::SetMode(previous_mode); });
+    FileWriter::SetMode(FileWriter::WriteMode::DIRECT);
+    const auto path = kV3FilePath + "_positioned_concat";
+    const auto first = GeneratePattern(kMinStreamSliceSize + 1);
+    const auto second = GeneratePattern(997);
+    {
+        IndexEntryDirectStreamWriter writer(CreateOutputStream(path));
+        writer.WriteEntry("first", first.data(), first.size());
+        writer.WriteEntry("second", second.data(), second.size());
+        writer.Finish();
+    }
+    auto reader =
+        IndexEntryReader::Open(CreateInputStream(path), GetFileSize(path));
+    const auto local = GetRootPath() + "/positioned_concat.bin";
+    PositionedFileWriter writer(local,
+                                first.size() + second.size(),
+                                io::Priority::LOW,
+                                FileWriter::WriteMode::BUFFERED);
+    reader->ReadEntryStreamAt(
+        "first", [&](size_t offset, const uint8_t* data, size_t len) {
+            writer.WriteAt(offset, data, len);
+        });
+    reader->ReadEntryStreamAt(
+        "second", [&](size_t offset, const uint8_t* data, size_t len) {
+            writer.WriteAt(first.size() + offset, data, len);
+        });
+    EXPECT_EQ(writer.Finish(), first.size() + second.size());
+    std::vector<uint8_t> expected(first);
+    expected.insert(expected.end(), second.begin(), second.end());
+    std::vector<uint8_t> actual(expected.size());
+    std::ifstream file(local, std::ios::binary);
+    file.read(reinterpret_cast<char*>(actual.data()), actual.size());
+    EXPECT_EQ(actual, expected);
+}
+
+TEST_F(IndexEntryWriterV3Test, PositionedFileRejectsCorruptPayloadAndCleansUp) {
+    const auto path = kV3FilePath + "_positioned_corrupt";
+    const auto data = GeneratePattern(kMinStreamSliceSize + 17);
+    {
+        IndexEntryDirectStreamWriter writer(CreateOutputStream(path));
+        writer.WriteEntry("data", data.data(), data.size());
+        writer.Finish();
+    }
+    {
+        std::fstream file(GetRootPath() + "/" + path,
+                          std::ios::in | std::ios::out | std::ios::binary);
+        ASSERT_TRUE(file.is_open());
+        file.seekp(MILVUS_V3_MAGIC_SIZE);
+        const auto corrupt = static_cast<char>(data.front() ^ 0xff);
+        file.write(&corrupt, 1);
+        ASSERT_TRUE(file.good());
+    }
+    auto reader =
+        IndexEntryReader::Open(CreateInputStream(path), GetFileSize(path));
+    const auto local = GetRootPath() + "/positioned_corrupt_output.bin";
+    EXPECT_THROW(reader->ReadEntryStreamToFile("data", local),
+                 milvus::SegcoreError);
+    EXPECT_FALSE(std::filesystem::exists(local));
+}
+
+// One oversized slice owns admission exclusively, making failure-to-submitter
+// propagation deterministic: no later payload read may begin after it fails.
+TEST_F(IndexEntryEncryptedV3Test, PositionedFailureStopsFurtherReads) {
+    auto& budget = LoadAdmissionController::GetInstance();
+    const auto previous = budget.CapacityBytes();
+    auto restore = folly::makeGuard([&] { budget.SetCapacityBytes(previous); });
+    for (bool encrypted : {false, true}) {
+        for (int mode :
+             {0, 1, 2}) {  // read failure, write failure, bulk read failure
+            SCOPED_TRACE(encrypted);
+            SCOPED_TRACE(mode);
+            budget.SetCapacityBytes(0);
+            const auto path = kV3FilePath + "_positioned_stop";
+            const auto data =
+                GeneratePattern(3 * DefaultEntryStreamSliceSize() + 17);
+            if (encrypted) {
+                IndexEntryEncryptedLocalWriter writer(
+                    path,
+                    fs_,
+                    mock_cipher_,
+                    1,
+                    100,
+                    GetRootPath(),
+                    DefaultEntryStreamSliceSize());
+                writer.WriteEntry("data", data.data(), data.size());
+                writer.WriteEntry("later", data.data(), 17);
+                writer.Finish();
+            } else {
+                IndexEntryDirectStreamWriter writer(CreateOutputStream(path));
+                writer.WriteEntry("data", data.data(), data.size());
+                writer.WriteEntry("later", data.data(), 17);
+                writer.Finish();
+            }
+            auto failing = std::make_shared<DelayedFailingInputStream>(
+                CreateInputStream(path),
+                std::vector<DelayedFailingInputStream::Rule>{
+                    {MILVUS_V3_MAGIC_SIZE,
+                     std::chrono::milliseconds(0),
+                     false,
+                     [mode] {
+                         if (mode != 1) {
+                             ThrowInfo(milvus::ErrorCode::FileReadFailed,
+                                       "injected first payload read failure");
+                         }
+                     }}});
+            auto input = std::make_shared<RecordingInputStream>(failing);
+            auto reader = IndexEntryReader::Open(input, GetFileSize(path), 100);
+            const auto metadata_reads = input->ReadRanges().size();
+            budget.SetCapacityBytes(1);
+            std::atomic<size_t> writes{0};
+            try {
+                if (mode == 2) {
+                    reader->ReadEntriesStreamToFiles(
+                        {{"data", GetRootPath() + "/positioned_stop.bin"},
+                         {"later",
+                          GetRootPath() + "/positioned_stop_later.bin"}});
+                } else {
+                    reader->ReadEntryStreamAt(
+                        "data", [&](size_t, const uint8_t*, size_t) {
+                            ++writes;
+                            ThrowInfo(milvus::ErrorCode::FileWriteFailed,
+                                      "injected first payload write failure");
+                        });
+                }
+                FAIL() << "worker failure must propagate";
+            } catch (const milvus::SegcoreError& error) {
+                EXPECT_EQ(error.get_error_code(),
+                          mode == 1 ? milvus::ErrorCode::FileWriteFailed
+                                    : milvus::ErrorCode::FileReadFailed);
+            }
+            EXPECT_EQ(input->ReadRanges().size() - metadata_reads, 1);
+            EXPECT_EQ(writes.load(), mode == 1 ? 1 : 0);
+        }
+    }
 }

@@ -39,8 +39,8 @@
 #include "folly/FBVector.h"
 #include "glog/logging.h"
 #include "monitor/Monitor.h"
-#include "index/json_stats/JsonKeyStats.h"
-#include "index/json_stats/utils.h"
+#include "segcore/json_stats/JsonKeyStats.h"
+#include "segcore/json_stats/utils.h"
 #include "log/Log.h"
 #include "opentelemetry/trace/span.h"
 #include "pb/plan.pb.h"
@@ -174,8 +174,14 @@ PhyTermFilterExpr::Eval(EvalCtx& context, VectorPtr& result) {
 template <typename T>
 bool
 PhyTermFilterExpr::CanSkipSegment() {
-    auto skip_index = segment_->GetSkipIndex();
-    T min, max;
+    if (expr_->vals_.empty()) {
+        // No literal means no bound to build a range from; min/max would stay
+        // indeterminate and the skip verdict would be read off uninitialised
+        // storage. Nothing to prune on, so fail open.
+        return false;
+    }
+    T min{};
+    T max{};
     for (auto i = 0; i < expr_->vals_.size(); i++) {
         auto val = GetValueFromProto<T>(expr_->vals_[i]);
         max = i == 0 ? val : std::max(val, max);
@@ -184,8 +190,7 @@ PhyTermFilterExpr::CanSkipSegment() {
     auto can_skip = [&]() -> bool {
         bool res = false;
         for (int i = 0; i < num_data_chunk_; ++i) {
-            if (!skip_index->CanSkipBinaryRange<T>(
-                    op_ctx_, field_id_, i, min, max, true, true)) {
+            if (!skip_view_.CanSkipBinaryRange<T>(i, min, max, true, true)) {
                 return false;
             } else {
                 res = true;
@@ -332,7 +337,7 @@ PhyTermFilterExpr::ExecTermArrayVariableInField(EvalCtx& context) {
         }
         auto executor = [&](size_t offset) {
             for (int i = 0; i < data[offset].length(); i++) {
-                auto val = data[offset].template get_data<GetType>(i);
+                auto val = data[offset].template get_data_unchecked<GetType>(i);
                 if (val == target_val) {
                     return true;
                 }
@@ -399,26 +404,31 @@ PhyTermFilterExpr::ExecTermArrayFieldInVariable(EvalCtx& context) {
     TargetBitmapView res(res_vec->GetRawData(), real_batch_size);
     TargetBitmapView valid_res(res_vec->GetValidRawData(), real_batch_size);
 
-    int index = -1;
-    if (expr_->column_.nested_path_.size() > 0) {
-        index = std::stoi(expr_->column_.nested_path_[0]);
-    }
+    int index = ParseArraySubscript(expr_->column_.nested_path_);
     if (!arg_inited_) {
         arg_set_ = std::make_shared<SetElement<ValueType>>(expr_->vals_);
         arg_inited_ = true;
     }
 
+    if (is_nested_array_field_) {
+        ThrowInfo(ErrorCode::Unsupported,
+                  "nested ARRAY field {} does not support element term "
+                  "predicates",
+                  field_id_.get());
+    }
+
+    // `x IN ()` is FALSE for every x, including NULL: a null row, a missing
+    // element and a null element are all FALSE, not UNKNOWN.
     if (arg_set_->Empty()) {
         res.reset();
         MoveCursor();
         return res_vec;
     }
-
     int processed_cursor = 0;
-    auto execute_sub_batch =
-        [&processed_cursor, &
-         bitmap_input ]<FilterType filter_type = FilterType::sequential>(
-            const ArrayView* data,
+    auto make_sub_batch = [&]<typename ArrayType>() {
+        return [&processed_cursor, &
+                bitmap_input ]<FilterType filter_type = FilterType::sequential>(
+            const ArrayType* data,
             ValidityView valid_data,
             const int32_t* offsets,
             const int size,
@@ -426,62 +436,42 @@ PhyTermFilterExpr::ExecTermArrayFieldInVariable(EvalCtx& context) {
             TargetBitmapView valid_res,
             int index,
             const std::shared_ptr<MultiElement>& term_set) {
-        if (!term_set->Empty()) {
             AssertInfo(index >= 0,
                        "array element term predicate requires nested path");
-        }
-        // If data is nullptr, this chunk was skipped by SkipIndex.
-        // We only need to update processed_cursor for bitmap_input indexing.
-        if (data == nullptr) {
+            // If data is nullptr, this chunk was skipped by SkipIndex.
+            // We only need to update processed_cursor for bitmap_input indexing.
+            if (data == nullptr) {
+                processed_cursor += size;
+                return;
+            }
+            bool has_bitmap_input = !bitmap_input.empty();
+            for (int i = 0; i < size; ++i) {
+                auto offset = i;
+                if constexpr (filter_type == FilterType::random) {
+                    offset = (offsets) ? offsets[i] : i;
+                }
+                if (valid_data && !valid_data[offset]) {
+                    res[i] = valid_res[i] = false;
+                    continue;
+                }
+                if (!HasArrayElementAt(data[offset], index)) {
+                    res[i] = false;
+                    valid_res[i] = false;
+                    continue;
+                }
+                if (has_bitmap_input && !bitmap_input[processed_cursor + i]) {
+                    continue;
+                }
+                auto value =
+                    data[offset].template get_data_unchecked<GetType>(index);
+                res[i] = term_set->In(ValueType(value));
+            }
             processed_cursor += size;
-            return;
-        }
-        bool has_bitmap_input = !bitmap_input.empty();
-        for (int i = 0; i < size; ++i) {
-            auto offset = i;
-            if constexpr (filter_type == FilterType::random) {
-                offset = (offsets) ? offsets[i] : i;
-            }
-            if (valid_data && !valid_data[offset]) {
-                res[i] = valid_res[i] = false;
-                continue;
-            }
-            if (term_set->Empty()) {
-                res[i] = false;
-                continue;
-            }
-            if (index >= data[offset].length()) {
-                res[i] = false;
-                valid_res[i] = false;
-                continue;
-            }
-            if (has_bitmap_input && !bitmap_input[processed_cursor + i]) {
-                continue;
-            }
-            auto value = data[offset].get_data<GetType>(index);
-            res[i] = term_set->In(ValueType(value));
-        }
-        processed_cursor += size;
+        };
     };
 
-    int64_t processed_size;
-    if (has_offset_input_) {
-        processed_size =
-            ProcessDataByOffsets<milvus::ArrayView>(execute_sub_batch,
-                                                    std::nullptr_t{},
-                                                    input,
-                                                    res,
-                                                    valid_res,
-                                                    index,
-                                                    arg_set_);
-    } else {
-        processed_size = ProcessDataChunks<milvus::ArrayView>(execute_sub_batch,
-                                                              std::nullptr_t{},
-                                                              res,
-                                                              valid_res,
-                                                              index,
-                                                              arg_set_);
-    }
+    int64_t processed_size = ProcessArrayRows(
+        make_sub_batch, input, res, valid_res, index, arg_set_);
     AssertInfo(processed_size == real_batch_size,
                "internal error: expr processed rows {} not equal "
                "expect batch size {}",
@@ -914,6 +904,9 @@ PhyTermFilterExpr::ExecTermJsonFieldInVariable(EvalCtx& context) {
 template <typename T>
 VectorPtr
 PhyTermFilterExpr::ExecVisitorImpl(EvalCtx& context) {
+    if (expr_->column_.element_level_ && expr_->vals_.empty()) {
+        return ExecElementLevelEmptyTerm(context);
+    }
     if (exec_path_ == ExprExecPath::ScalarIndex && !has_offset_input_) {
         return ExecVisitorImplForIndex<T>();
     } else {
@@ -921,13 +914,29 @@ PhyTermFilterExpr::ExecVisitorImpl(EvalCtx& context) {
     }
 }
 
+// `$[x] IN ()` is FALSE for every element, including a null one. Keyed on
+// the literal list, not on the values left after dropping the ones that
+// overflow the element type: `$[i8] IN (1000)` on a null element is UNKNOWN.
+VectorPtr
+PhyTermFilterExpr::ExecElementLevelEmptyTerm(EvalCtx& context) {
+    auto* input = context.get_offset_input();
+    auto next_batch_size = GetNextRealBatchSize(input, true);
+    if (!next_batch_size.has_value()) {
+        return nullptr;
+    }
+    auto real_batch_size = *next_batch_size;
+    if (auto res = AdvanceEmptyElementBatch(input, true, real_batch_size)) {
+        return res;
+    }
+    MoveCursor();
+    return std::make_shared<ColumnVector>(TargetBitmap(real_batch_size, false),
+                                          TargetBitmap(real_batch_size, true));
+}
+
 template <typename T>
 VectorPtr
 PhyTermFilterExpr::ExecVisitorImplForIndex() {
-    typedef std::
-        conditional_t<std::is_same_v<T, std::string_view>, std::string, T>
-            IndexInnerType;
-    using Index = index::ScalarIndex<IndexInnerType>;
+    using ReaderType = index_value_t<T>;
     auto next_batch_size =
         GetNextRealBatchSize(nullptr, expr_->column_.element_level_);
     if (!next_batch_size.has_value()) {
@@ -940,7 +949,7 @@ PhyTermFilterExpr::ExecVisitorImplForIndex() {
     }
 
     if (!arg_inited_) {
-        std::vector<IndexInnerType> vals;
+        std::vector<ReaderType> vals;
         for (auto& val : expr_->vals_) {
             if constexpr (std::is_same_v<T, double>) {
                 if (val.has_int64_val()) {
@@ -953,28 +962,29 @@ PhyTermFilterExpr::ExecVisitorImplForIndex() {
             // Generic overflow handling for all types
             bool overflowed = false;
             auto converted_val =
-                GetValueFromProtoWithOverflow<T>(val, overflowed);
+                GetValueFromProtoWithOverflow<ReaderType>(val, overflowed);
             if (!overflowed) {
                 vals.emplace_back(converted_val);
             }
         }
-        arg_set_ = std::make_shared<FlatVectorElement<IndexInnerType>>(vals);
+        arg_set_ = std::make_shared<FlatVectorElement<ReaderType>>(vals);
         arg_inited_ = true;
     }
-    auto execute_sub_batch = [](Index* index_ptr,
-                                const std::vector<IndexInnerType>& vals) {
-        TermIndexFunc<T> func;
-        return func(index_ptr, vals.size(), vals.data());
-    };
+    auto execute_sub_batch =
+        [](const index::IScalarPredicateReader<ReaderType>* reader,
+           const std::vector<ReaderType>& vals) {
+            TermIndexFunc<ReaderType> func;
+            return func(reader, vals.size(), vals.data());
+        };
     auto args =
-        std::dynamic_pointer_cast<FlatVectorElement<IndexInnerType>>(arg_set_);
+        std::dynamic_pointer_cast<FlatVectorElement<ReaderType>>(arg_set_);
     if (field_type_ == DataType::JSON && args->values_.empty()) {
         MoveCursor();
         return std::make_shared<ColumnVector>(
             TargetBitmap(real_batch_size, false),
             TargetBitmap(real_batch_size, true));
     }
-    auto res = ProcessIndexChunks<T>(execute_sub_batch, args->values_);
+    auto res = ProcessIndexChunks<ReaderType>(execute_sub_batch, args->values_);
     AssertInfo(res->size() == real_batch_size,
                "internal error: expr processed rows {} not equal "
                "expect batch size {}",
@@ -986,7 +996,6 @@ PhyTermFilterExpr::ExecVisitorImplForIndex() {
 template <>
 VectorPtr
 PhyTermFilterExpr::ExecVisitorImplForIndex<bool>() {
-    using Index = index::ScalarIndex<bool>;
     auto next_batch_size =
         GetNextRealBatchSize(nullptr, expr_->column_.element_level_);
     if (!next_batch_size.has_value()) {
@@ -1006,11 +1015,14 @@ PhyTermFilterExpr::ExecVisitorImplForIndex<bool>() {
         arg_set_ = std::make_shared<FlatVectorElement<uint8_t>>(vals);
         arg_inited_ = true;
     }
-    auto execute_sub_batch = [](Index* index_ptr,
-                                const std::vector<uint8_t>& vals) {
-        TermIndexFunc<bool> func;
-        return func(index_ptr, vals.size(), (bool*)vals.data());
-    };
+    auto execute_sub_batch =
+        [](const index::IScalarPredicateReader<bool>* reader,
+           const std::vector<uint8_t>& vals) {
+            TermIndexFunc<bool> func;
+            return func(reader,
+                        vals.size(),
+                        reinterpret_cast<const bool*>(vals.data()));
+        };
     auto args = std::dynamic_pointer_cast<FlatVectorElement<uint8_t>>(arg_set_);
     if (field_type_ == DataType::JSON && args->values_.empty()) {
         MoveCursor();
@@ -1116,8 +1128,6 @@ PhyTermFilterExpr::ExecVisitorImplForData(EvalCtx& context) {
             cached_str_set_elem_ =
                 dynamic_cast<SetElement<std::string>*>(arg_set_.get());
         }
-        // Cache element values for skip_index (avoids per-chunk copy)
-        cached_skip_elements_ = GetElementValues<T>(arg_set_);
         arg_inited_ = true;
     }
 
@@ -1193,16 +1203,15 @@ PhyTermFilterExpr::ExecVisitorImplForData(EvalCtx& context) {
         processed_cursor += size;
     };
 
-    auto skip_index_func =
-        [op_ctx = op_ctx_, &cached_elements = cached_skip_elements_](
-            const SkipIndex& skip_index, FieldId field_id, int64_t chunk_id) {
-            auto* elements = std::any_cast<std::vector<T>>(&cached_elements);
-            if (elements == nullptr) {
-                return false;
-            }
-            return skip_index.CanSkipInQuery<T>(
-                op_ctx, field_id, chunk_id, *elements);
+    SkipChunkFn skip_index_func;
+    if (CanUseSkipFilter(is_nullable_, null_rejecting_) &&
+        skip_view_.HasMetrics()) {
+        const auto& skip_query = GetSkipIndexQuery<T>();
+        skip_index_func = [&skip_query](const FieldSkipMetricsView& view,
+                                        int64_t chunk_id) {
+            return view.CanSkipInQuery(chunk_id, skip_query);
         };
+    }
 
     int64_t processed_size;
     if (has_offset_input_) {
@@ -1287,34 +1296,17 @@ PhyTermFilterExpr::DetermineExecPath() {
         return;
     }
 
-    SegmentExpr::DetermineExecPath();
-    if (exec_path_ != ExprExecPath::ScalarIndex) {
-        return;
-    }
-
+    auto req = MakeIndexRequirement(RequiredReader::Predicate);
+    req.value_type = field_type_ == DataType::JSON ? value_type_ : data_type;
     if (data_type == DataType::JSON && !expr_->vals_.empty() &&
         expr_->vals_[0].val_case() ==
             proto::plan::GenericValue::ValCase::kInt64Val) {
-        const auto has_unsafe_literal = std::any_of(
+        req.requires_flat_json_index = std::any_of(
             expr_->vals_.begin(), expr_->vals_.end(), [this](const auto& val) {
                 return !IsInt64SafeForJsonDoubleIndex(val.int64_val());
             });
-        if (has_unsafe_literal && !PinnedJsonIndexIsFlat()) {
-            exec_path_ = ExprExecPath::RawData;
-        }
-        return;
     }
-
-    // IN / NOT IN is a disjunction of equalities. Ask the pinned string index
-    // whether it wants the equality op (represented as Equal): FMINDEX declines
-    // it (a term set of exact values is better served by the scan / an equality
-    // index), while INVERTED and the others accept it (base default). FMINDEX is
-    // VARCHAR-only, so only the string path needs the check.
-    if ((data_type == DataType::VARCHAR || data_type == DataType::TEXT) &&
-        !SegmentExpr::CanUseIndexForOp<std::string>(
-            proto::plan::OpType::Equal)) {
-        exec_path_ = ExprExecPath::RawData;
-    }
+    SelectAndPinIndex(req);
 }
 
 void
@@ -1350,14 +1342,7 @@ PhyTermFilterExpr::PrefetchRawData() {
             PrefetchRawData<double>();
             break;
         case DataType::VARCHAR:
-            if (segment_->type() == SegmentType::Growing &&
-                !storage::MmapManager::GetInstance()
-                     .GetMmapConfig()
-                     .growing_enable_mmap) {
-                PrefetchRawData<std::string>();
-            } else {
-                PrefetchRawData<std::string_view>();
-            }
+            PrefetchRawData<std::string_view>();
             break;
         default:
             SegmentExpr::PrefetchRawData(expr_->column_.field_id_);
@@ -1366,23 +1351,68 @@ PhyTermFilterExpr::PrefetchRawData() {
 }
 
 template <typename T>
+const index::PreparedInQuery&
+PhyTermFilterExpr::GetSkipIndexQuery() {
+    // Both owning and view scan templates borrow the same immutable literals.
+    // Do not extract from arg_set_: its representation depends on IN-list size
+    // and it need not have been initialized when driver prefetch runs.
+    using ValueType =
+        std::conditional_t<std::is_same_v<T, std::string>, std::string_view, T>;
+    std::call_once(skip_values_once_, [this]() {
+        std::vector<index::Metrics> values;
+        values.reserve(expr_->vals_.size());
+        for (const auto& value : expr_->vals_) {
+            if constexpr (std::is_floating_point_v<ValueType>) {
+                // GetValueFromProtoWithOverflow asserts kFloatVal, but an
+                // int64 literal legitimately reaches float/double dispatch
+                // (see the int-to-double cast note above), and this runs on
+                // the prefetch executor where an assert surfaces as an opaque
+                // query failure. Accept both encodings, as the
+                // GetValueWithCastNumber this replaced did.
+                values.emplace_back(GetValueWithCastNumber<ValueType>(value));
+            } else {
+                bool overflowed = false;
+                auto converted =
+                    GetValueFromProtoWithOverflow<ValueType>(value, overflowed);
+                if (!overflowed) {
+                    values.emplace_back(converted);
+                }
+            }
+        }
+        // Compute the range after conversion/overflow filtering and publish it
+        // together with the values to both prefetch and evaluation.
+        cached_skip_query_ = index::PreparedInQuery(std::move(values));
+        skip_values_type_ = &typeid(ValueType);
+    });
+    if (skip_values_type_ == nullptr ||
+        *skip_values_type_ != typeid(ValueType)) {
+        // The PrefetchRawData and Eval dispatch switches disagree on the value
+        // type for this column, so the cache holds variants of another
+        // alternative and CanSkipIn would compare the wrong thing. Fail open
+        // rather than assert: this also runs on the prefetch executor, where a
+        // throw would surface as an opaque query failure.
+        static const index::PreparedInQuery kNoSkipQuery;
+        return kNoSkipQuery;
+    }
+    return cached_skip_query_;
+}
+
+template <typename T>
 void
 PhyTermFilterExpr::PrefetchRawData() {
-    auto skip_index = segment_->GetSkipIndex();
-
-    std::vector<T> elements;
-    elements.reserve(expr_->vals_.size());
-    for (const auto& val : expr_->vals_) {
-        auto e = GetValueWithCastNumber<T>(val);
-        elements.push_back(e);
+    if (!CanUseSkipFilter(is_nullable_, null_rejecting_) ||
+        !skip_view_.HasMetrics()) {
+        SegmentExpr::PrefetchRawData(field_id_);
+        return;
     }
-
+    const auto& query = GetSkipIndexQuery<T>();
     std::vector<int64_t> chunks_may_hit;
     for (size_t i = RawDataPrefetchStartChunk(); i < num_data_chunk_; ++i) {
-        auto skip = skip_index->CanSkipInQuery(field_id_, i, elements);
-        if (!skip) {
-            chunks_may_hit.push_back(i);
+        auto skip = skip_view_.CanSkipInQuery(i, query);
+        if (skip) {
+            continue;
         }
+        chunks_may_hit.push_back(i);
     }
 
     segment_->prefetch_chunks(op_ctx_, field_id_, chunks_may_hit);

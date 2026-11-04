@@ -46,6 +46,7 @@
 #include "storage/loon_ffi/external_spec_c.h"
 #include "storage/loon_ffi/property_singleton.h"
 #include "storage/loon_ffi/util.h"
+#include "storage/loon_ffi/loon_error_code.h"
 
 using json = nlohmann::json;
 
@@ -73,9 +74,17 @@ MakeInternalPropertiesFromStorageConfig(CStorageConfig c_storage_config) {
                                       PROPERTY_FS_ACCESS_KEY_VALUE,
                                       c_storage_config.access_key_value);
     }
-    if (c_storage_config.root_path != nullptr) {
+    const std::string storage_type = c_storage_config.storage_type != nullptr
+                                         ? c_storage_config.storage_type
+                                         : "";
+    if (c_storage_config.root_path != nullptr || storage_type == "local") {
+        const std::string root_path = c_storage_config.root_path != nullptr
+                                          ? c_storage_config.root_path
+                                          : "";
         milvus_storage::api::SetValue(
-            *properties_map, PROPERTY_FS_ROOT_PATH, c_storage_config.root_path);
+            *properties_map,
+            PROPERTY_FS_ROOT_PATH,
+            LoonFSRootPath(storage_type, root_path).c_str());
     }
     if (c_storage_config.storage_type != nullptr) {
         milvus_storage::api::SetValue(*properties_map,
@@ -141,6 +150,12 @@ MakeInternalPropertiesFromStorageConfig(CStorageConfig c_storage_config) {
             std::to_string(c_storage_config.max_connections).c_str());
     }
 
+    (*properties_map)[PROPERTY_FS_S3_CRT_QUEUE_SIZES] =
+        c_storage_config.crt_queue_sizes > 0
+            ? c_storage_config.crt_queue_sizes
+            : milvus::storage::LoonFFIPropertiesSingleton::GetInstance()
+                  .GetS3CrtQueueSizes();
+
     if (c_storage_config.tls_min_version != nullptr) {
         std::string tls_ver(c_storage_config.tls_min_version);
         if (!tls_ver.empty() && tls_ver != "default") {
@@ -154,6 +169,34 @@ MakeInternalPropertiesFromStorageConfig(CStorageConfig c_storage_config) {
         *properties_map,
         PROPERTY_FS_USE_CRC32C_CHECKSUM,
         c_storage_config.use_crc32c_checksum ? "true" : "false");
+
+    const bool is_local =
+        c_storage_config.storage_type != nullptr &&
+        std::string_view(c_storage_config.storage_type) == "local";
+    const std::pair<const char*, uint32_t> talon_values[] = {
+        {PROPERTY_FS_TALON_MODE, c_storage_config.talon_mode},
+        {PROPERTY_FS_TALON_SMALL_READ_THRESHOLD,
+         c_storage_config.talon_small_read_threshold},
+        {PROPERTY_FS_TALON_BLOCK_SIZE, c_storage_config.talon_block_size},
+        {PROPERTY_FS_TALON_MAX_IDLE_PER_ADDR,
+         c_storage_config.talon_max_idle_per_addr}};
+    // Keep the External Table policy alongside ordinary filesystem properties.
+    // This Milvus-only key is consumed below; storage ignores unknown properties.
+    (*properties_map)["milvus.talon.external_mode"] =
+        std::to_string(c_storage_config.talon_enable_for_external_table
+                           ? c_storage_config.talon_mode
+                           : 0);
+    for (const auto& [key, value] : talon_values) {
+        const bool is_mode = std::string_view(key) == PROPERTY_FS_TALON_MODE;
+        if (!is_mode && value == 0) {
+            continue;  // Unset in older StorageConfig messages: use storage defaults.
+        }
+        (*properties_map)[key] = is_mode && is_local ? uint32_t{0} : value;
+    }
+    if (c_storage_config.talon_coordinator != nullptr) {
+        (*properties_map)[PROPERTY_FS_TALON_COORDINATOR] =
+            std::string(c_storage_config.talon_coordinator);
+    }
 
     // Carry the configured arrow reader prebuffer limits into every
     // freshly-built properties map. Index build (index_c.cpp) and the FFI
@@ -185,6 +228,7 @@ static const std::unordered_set<std::string> kAllowedExtfsSpecKeys = {
     "use_virtual_host",
     "region",
     "cloud_provider",
+    "endpoint_url",
     "iam_endpoint",
     "storage_type",
     "ssl_ca_cert",
@@ -248,6 +292,7 @@ ExternalFsPropertyKey(const std::string& extfs_prefix,
 // milvus.yaml, not from a user-supplied external_spec.
 static const std::vector<const char*> kExtfsInheritedFsFields = {
     PROPERTY_FS_MAX_CONNECTIONS,
+    PROPERTY_FS_S3_CRT_QUEUE_SIZES,
 };
 
 // PropertyValueAsString renders a PropertyVariant back to the string form
@@ -479,10 +524,12 @@ InjectExternalSpecProperties(
     // Caller must have run Go ValidateExternalSource; malformed here
     // signals etcd corruption or bypass — fail adjacent to bad input.
     auto scheme_end = external_source.find("://");
-    AssertInfo(scheme_end != std::string::npos,
-               "external_source for collection {} missing scheme: {}",
-               collection_id,
-               external_source);
+    if (!(scheme_end != std::string::npos)) {
+        ThrowInfo(milvus::ErrorCode::ConfigInvalid,
+                  "external_source for collection {} missing scheme: {}",
+                  collection_id,
+                  external_source);
+    }
 
     std::string scheme = external_source.substr(0, scheme_end);
     auto rest = external_source.substr(scheme_end + 3);
@@ -492,10 +539,12 @@ InjectExternalSpecProperties(
     // where rest itself is empty.
     std::string host =
         (slash_pos != std::string::npos) ? rest.substr(0, slash_pos) : rest;
-    AssertInfo(!host.empty(),
-               "external_source for collection {} has empty host: {}",
-               collection_id,
-               external_source);
+    if (!(!host.empty())) {
+        ThrowInfo(milvus::ErrorCode::ConfigInvalid,
+                  "external_source for collection {} has empty host: {}",
+                  collection_id,
+                  external_source);
+    }
 
     std::string path_part =
         (slash_pos != std::string::npos) ? rest.substr(slash_pos + 1) : "";
@@ -528,9 +577,12 @@ InjectExternalSpecProperties(
     // Layer 2: apply spec.extfs JSON. Gate every key through
     // kAllowedExtfsSpecKeys — defense-in-depth against property injection
     // if a caller bypasses Go ParseExternalSpec. Note: "address" is NOT in
-    // the allowlist; user-facing endpoint override must use Milvus-form URI.
+    // the allowlist. endpoint_url is captured below and translated to the
+    // internal address property instead of being forwarded verbatim.
     std::string spec_cloud_provider;
     std::string spec_region;
+    std::string spec_endpoint_url;
+    bool has_spec_endpoint_url = false;
     if (!external_spec.empty()) {
         try {
             simdjson::ondemand::parser parser;
@@ -553,6 +605,11 @@ InjectExternalSpecProperties(
                         }
                         auto val =
                             std::string(field.value().get_string().value());
+                        if (key == "endpoint_url") {
+                            has_spec_endpoint_url = true;
+                            spec_endpoint_url = val;
+                            continue;
+                        }
                         if (val.empty()) {
                             continue;
                         }
@@ -570,10 +627,15 @@ InjectExternalSpecProperties(
                         if (key == "cloud_provider" && val == "minio") {
                             continue;
                         }
+                        // Keep the legacy spec key compatible with storage's shared Broker property.
+                        const auto property =
+                            key == "azure_credential_endpoint"
+                                ? ExternalFsPropertyKey(
+                                      extfs_prefix,
+                                      PROPERTY_FS_CREDENTIAL_ENDPOINT)
+                                : extfs_prefix + key;
                         milvus_storage::api::SetValue(
-                            properties,
-                            (extfs_prefix + key).c_str(),
-                            val.c_str());
+                            properties, property.c_str(), val.c_str());
                     } catch (const simdjson::simdjson_error& per_field) {
                         LOG_WARN(
                             "extfs field parse failed, skipping "
@@ -590,48 +652,104 @@ InjectExternalSpecProperties(
                 "(collection_id={}): {}",
                 collection_id,
                 e.what());
-            ThrowInfo(milvus::ErrorCode::UnexpectedError,
+            ThrowInfo(milvus::ErrorCode::ConfigInvalid,
                       "external_spec parse failed for collection {}: {}",
                       collection_id,
                       e.what());
         }
     }
 
-    // Layer 3: AWS-form disambiguation via derived-endpoint vs URI.host.
-    //   Compute DeriveEndpoint(cp, region). If non-empty and different from
-    //   URI.host, source is AWS-form (scheme://bucket/key) — swap URI.host
-    //   into bucket_name and write derived endpoint as address. Otherwise
-    //   Milvus-form (URI.host == endpoint) or unresolvable — keep Layer1
-    //   values.
+    // Layer 3: resolve the effective endpoint.
     //
-    //   Path-segment heuristics are unreliable: AWS-form S3 keys may contain
-    //   '/' (`s3://bucket/deep/key.parquet`) and Milvus-form URIs may omit
-    //   keys (`s3://endpoint/bucket`). Comparing derive result with host
-    //   handles both cases correctly — the derived endpoint string is a
-    //   stable cloud-provider identifier, not dependent on path structure.
-    // Swap decision uses ONLY the user-supplied cloud_provider, never a
-    // scheme-inferred fallback. Self-hosted MinIO with
-    // `s3://localhost:9000/bucket/...` is Milvus-form; inferring
-    // cloud_provider=aws from scheme=s3 would produce
-    // derived=https://s3.<region>.amazonaws.com, falsely classify host
-    // as a bucket, and swap. When the user does not declare
-    // cloud_provider, DeriveEndpoint returns empty and the URI is
-    // treated as Milvus-form (host is endpoint).
-    std::string derived = DeriveEndpoint(spec_cloud_provider, spec_region);
-    // Cloud-family host suffix check: if URI.host ends with a known cloud
-    // provider domain (AWS, GCP, Aliyun, Tencent, Huawei, Azure — all
-    // endpoint variants including global/accelerate/dualstack/FIPS/VPC), the
-    // URI is Milvus-form and URI.host is authoritative. Skip swap regardless
-    // of whether DeriveEndpoint string-matches. This prevents misclassifying
-    // `s3://s3.amazonaws.com/bucket/key` as AWS-form when spec.region is a
-    // regional value.
-    bool uri_host_is_cloud_endpoint = IsCloudEndpointHost(host);
-    if (!uri_host_is_cloud_endpoint && !derived.empty() &&
-        StripURIScheme(derived) != host) {
+    // endpoint_url selects explicit-endpoint mode. In this mode
+    // external_source has the standard scheme://bucket/key shape: URI.host is
+    // the bucket, while endpoint_url is the physical S3-compatible address.
+    // The Go API boundary validates the full URL contract. The checks here are
+    // defense in depth for corrupted metadata or callers that bypass Go.
+    if (has_spec_endpoint_url) {
+        std::string effective_endpoint = spec_endpoint_url;
+        if (!effective_endpoint.empty() && effective_endpoint.back() == '/') {
+            effective_endpoint.pop_back();
+        }
+        auto endpoint_scheme_end = effective_endpoint.find("://");
+        AssertInfo(endpoint_scheme_end != std::string::npos,
+                   "extfs.endpoint_url for collection {} missing scheme",
+                   collection_id);
+        std::string endpoint_scheme =
+            effective_endpoint.substr(0, endpoint_scheme_end);
+        std::transform(endpoint_scheme.begin(),
+                       endpoint_scheme.end(),
+                       endpoint_scheme.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        AssertInfo(endpoint_scheme == "http" || endpoint_scheme == "https",
+                   "extfs.endpoint_url for collection {} must use http or "
+                   "https",
+                   collection_id);
+        std::string endpoint_authority =
+            effective_endpoint.substr(endpoint_scheme_end + 3);
+        AssertInfo(
+            !endpoint_authority.empty() &&
+                endpoint_authority.find_first_of("/@?#") == std::string::npos,
+            "extfs.endpoint_url for collection {} must contain only "
+            "scheme and authority",
+            collection_id);
+        AssertInfo(
+            host.find(':') == std::string::npos,
+            "external_source host for collection {} must be a bucket name "
+            "without a port when extfs.endpoint_url is set",
+            collection_id);
+
+        effective_endpoint = endpoint_scheme + "://" + endpoint_authority;
+        milvus_storage::api::SetValue(properties,
+                                      (extfs_prefix + "address").c_str(),
+                                      effective_endpoint.c_str());
         milvus_storage::api::SetValue(
             properties, (extfs_prefix + "bucket_name").c_str(), host.c_str());
         milvus_storage::api::SetValue(
-            properties, (extfs_prefix + "address").c_str(), derived.c_str());
+            properties,
+            (extfs_prefix + "use_ssl").c_str(),
+            endpoint_scheme == "https" ? "true" : "false");
+    } else {
+        // AWS-form disambiguation via derived-endpoint vs URI.host.
+        //   Compute DeriveEndpoint(cp, region). If non-empty and different
+        //   from URI.host, source is AWS-form (scheme://bucket/key) — swap
+        //   URI.host into bucket_name and write derived endpoint as address.
+        //   Otherwise Milvus-form (URI.host == endpoint) or unresolvable —
+        //   keep Layer1 values.
+        //
+        //   Path-segment heuristics are unreliable: AWS-form S3 keys may
+        //   contain '/' (`s3://bucket/deep/key.parquet`) and Milvus-form URIs
+        //   may omit keys (`s3://endpoint/bucket`). Comparing derive result
+        //   with host handles both cases correctly — the derived endpoint
+        //   string is a stable cloud-provider identifier, not dependent on
+        //   path structure.
+        // Swap decision uses ONLY the user-supplied cloud_provider, never a
+        // scheme-inferred fallback. Self-hosted MinIO with
+        // `s3://localhost:9000/bucket/...` is Milvus-form; inferring
+        // cloud_provider=aws from scheme=s3 would produce
+        // derived=https://s3.<region>.amazonaws.com, falsely classify host
+        // as a bucket, and swap. When the user does not declare
+        // cloud_provider, DeriveEndpoint returns empty and the URI is
+        // treated as Milvus-form (host is endpoint).
+        std::string derived = DeriveEndpoint(spec_cloud_provider, spec_region);
+        // Cloud-family host suffix check: if URI.host ends with a known cloud
+        // provider domain (AWS, GCP, Aliyun, Tencent, Huawei, Azure — all
+        // endpoint variants including global/accelerate/dualstack/FIPS/VPC),
+        // the URI is Milvus-form and URI.host is authoritative. Skip swap
+        // regardless of whether DeriveEndpoint string-matches. This prevents
+        // misclassifying `s3://s3.amazonaws.com/bucket/key` as AWS-form when
+        // spec.region is a regional value.
+        bool uri_host_is_cloud_endpoint = IsCloudEndpointHost(host);
+        if (!uri_host_is_cloud_endpoint && !derived.empty() &&
+            StripURIScheme(derived) != host) {
+            milvus_storage::api::SetValue(
+                properties,
+                (extfs_prefix + "bucket_name").c_str(),
+                host.c_str());
+            milvus_storage::api::SetValue(properties,
+                                          (extfs_prefix + "address").c_str(),
+                                          derived.c_str());
+        }
     }
 
     // Reconcile bare address with final use_ssl. Addresses that already
@@ -653,6 +771,28 @@ InjectExternalSpecProperties(
         milvus_storage::api::SetValue(properties,
                                       (extfs_prefix + "address").c_str(),
                                       (scheme + *final_address).c_str());
+    }
+
+    // External Tables share the filesystem tuning, with an independently
+    // configured mode. Local external filesystems never use Talon.
+    const bool external_is_local =
+        PropertyValueAsString(
+            properties, (extfs_prefix + "storage_type").c_str()) == "local";
+    for (const auto* key : {PROPERTY_FS_TALON_MODE,
+                            PROPERTY_FS_TALON_SMALL_READ_THRESHOLD,
+                            PROPERTY_FS_TALON_COORDINATOR,
+                            PROPERTY_FS_TALON_BLOCK_SIZE,
+                            PROPERTY_FS_TALON_MAX_IDLE_PER_ADDR}) {
+        const auto* source_key = std::string_view(key) == PROPERTY_FS_TALON_MODE
+                                     ? "milvus.talon.external_mode"
+                                     : key;
+        const auto value = PropertyValueAsString(properties, source_key);
+        const auto extfs_key = ExternalFsPropertyKey(extfs_prefix, key);
+        if (external_is_local) {
+            properties.erase(extfs_key);
+        } else if (value.has_value()) {
+            properties[extfs_key] = *value;
+        }
     }
 
     // Format-layer: emit per-format properties derived from spec.format.
@@ -731,17 +871,12 @@ InjectExternalSpecProperties(milvus_storage::api::Properties& properties,
     }
 }
 
-std::shared_ptr<milvus_storage::api::Properties>
-MakeInternalLocalProperies(const char* c_path) {
-    auto properties_map = std::make_shared<milvus_storage::api::Properties>();
-
-    milvus_storage::api::SetValue(
-        *properties_map, PROPERTY_FS_STORAGE_TYPE, "local");
-
-    milvus_storage::api::SetValue(
-        *properties_map, PROPERTY_FS_ROOT_PATH, c_path);
-
-    return properties_map;
+std::string
+LoonFSRootPath(const std::string& storage_type, const std::string& root_path) {
+    if (storage_type == "local") {
+        return kLoonLocalFSRootPath;
+    }
+    return root_path;
 }
 
 CStorageConfig
@@ -765,66 +900,113 @@ ToCStorageConfig(const milvus::storage::StorageConfig& config) {
                           false,  // this field does not exist in StorageConfig
                           config.max_connections,
                           config.tls_min_version.c_str(),
-                          config.use_crc32c_checksum};
+                          config.use_crc32c_checksum,
+                          config.talon_mode,
+                          config.talon_small_read_threshold,
+                          config.talon_coordinator.c_str(),
+                          config.talon_block_size,
+                          config.talon_max_idle_per_addr,
+                          config.talon_enable_for_external_table};
+}
+
+std::optional<LoonManifestPath>
+ParseLoonManifestPath(const std::string& path) {
+    auto j = json::parse(path, nullptr, /*allow_exceptions=*/false);
+    if (j.is_discarded() || !j.is_object()) {
+        return std::nullopt;
+    }
+    auto base_path = j.find("base_path");
+    auto ver = j.find("ver");
+    if (base_path == j.end() || !base_path->is_string() || ver == j.end() ||
+        !ver->is_number_integer()) {
+        return std::nullopt;
+    }
+    LoonManifestPath manifest_path{base_path->get<std::string>(),
+                                   ver->get<int64_t>()};
+    if (auto size = j.find("size");
+        size != j.end() && size->is_number_integer()) {
+        manifest_path.size = size->get<int64_t>();
+    }
+    return manifest_path;
+}
+
+LoonFFIResult
+ReadLoonManifest(const LoonManifestPath& manifest_path,
+                 const LoonProperties* properties,
+                 LoonManifest** out_manifest) {
+    LoonTransactionHandle handle = 0;
+    auto result = loon_transaction_open(manifest_path.base_path.c_str(),
+                                        properties,
+                                        manifest_path.version,
+                                        manifest_path.size,
+                                        LOON_TRANSACTION_RESOLVE_FAIL,
+                                        1,
+                                        &handle);
+    if (loon_ffi_is_success(&result) == 0) {
+        return result;
+    }
+    loon_ffi_free_result(&result);
+    result = loon_transaction_get_manifest(handle, out_manifest);
+    loon_transaction_destroy(handle);
+    return result;
 }
 
 std::shared_ptr<milvus_storage::api::Manifest>
 GetLoonManifest(
     const std::string& path,
     const std::shared_ptr<milvus_storage::api::Properties>& properties) {
-    try {
-        // Parse the JSON string
-        json j = json::parse(path);
-
-        // Extract base_path & version
-        std::string base_path = j.at("base_path").get<std::string>();
-        int64_t version = j.at("ver").get<int64_t>();
-
-        auto fs_result =
-            milvus_storage::FilesystemCache::getInstance().get(*properties);
-        if (!fs_result.ok()) {
-            auto error = milvus_storage::ToSegcoreError(fs_result.status());
-            ThrowInfo(error.get_error_code(),
-                      "Failed to get filesystem: {}",
-                      error.what());
-        }
-        auto fs = std::move(fs_result.ValueOrDie());
-
-        auto transaction_result =
-            milvus_storage::api::transaction::Transaction::Open(
-                fs,
-                base_path,
-                version,
-                milvus_storage::api::transaction::FailResolver,
-                1);
-        if (!transaction_result.ok()) {
-            auto error =
-                milvus_storage::ToSegcoreError(transaction_result.status());
-            ThrowInfo(error.get_error_code(),
-                      "Failed to open transaction: {}",
-                      error.what());
-        }
-        auto transaction = std::move(transaction_result.ValueOrDie());
-        auto manifest_result = transaction->GetManifest();
-        if (!manifest_result.ok()) {
-            auto error =
-                milvus_storage::ToSegcoreError(manifest_result.status());
-            ThrowInfo(error.get_error_code(),
-                      "Failed to get manifest: {}",
-                      error.what());
-        }
-        auto current_manifest = manifest_result.ValueOrDie();
-        return current_manifest;
-    } catch (const json::parse_error& e) {
-        throw std::runtime_error(
-            std::string("Failed to parse manifest JSON: ") + e.what());
-    } catch (const json::out_of_range& e) {
-        throw std::runtime_error(
-            std::string("Missing required field in manifest: ") + e.what());
-    } catch (const json::type_error& e) {
-        throw std::runtime_error(
-            std::string("Invalid field type in manifest: ") + e.what());
+    auto manifest_path = ParseLoonManifestPath(path);
+    if (!manifest_path.has_value()) {
+        ThrowInfo(milvus::ErrorCode::DataFormatBroken,
+                  "Invalid manifest path: {}",
+                  path);
     }
+
+    auto fs_result =
+        milvus_storage::FilesystemCache::getInstance().get(*properties);
+    if (!fs_result.ok()) {
+        auto error = milvus_storage::ToSegcoreError(fs_result.status());
+        ThrowInfo(error.get_error_code(),
+                  "Failed to get filesystem: {}",
+                  error.what());
+    }
+    auto fs = std::move(fs_result.ValueOrDie());
+
+    auto transaction_result =
+        milvus_storage::api::transaction::Transaction::Open(
+            fs,
+            manifest_path->base_path,
+            manifest_path->version,
+            manifest_path->size,
+            milvus_storage::api::transaction::FailResolver,
+            1);
+    if (!transaction_result.ok()) {
+        auto error =
+            milvus_storage::ToSegcoreError(transaction_result.status());
+        ThrowInfo(error.get_error_code(),
+                  "Failed to open transaction: {}",
+                  error.what());
+    }
+    auto transaction = std::move(transaction_result.ValueOrDie());
+    auto manifest_result = transaction->GetManifest();
+    if (!manifest_result.ok()) {
+        auto error = milvus_storage::ToSegcoreError(manifest_result.status());
+        ThrowInfo(
+            error.get_error_code(), "Failed to get manifest: {}", error.what());
+    }
+    return manifest_result.ValueOrDie();
+}
+
+bool
+IsSameLoonManifestPath(const std::string& lhs, const std::string& rhs) {
+    if (lhs == rhs) {
+        return true;
+    }
+    auto lhs_revision = ParseLoonManifestPath(lhs);
+    auto rhs_revision = ParseLoonManifestPath(rhs);
+    return lhs_revision.has_value() && rhs_revision.has_value() &&
+           lhs_revision->base_path == rhs_revision->base_path &&
+           lhs_revision->version == rhs_revision->version;
 }
 
 // ==================== C-ABI: external spec injection ====================

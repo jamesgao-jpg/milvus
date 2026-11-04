@@ -16,6 +16,8 @@
 #include "milvus-storage/filesystem/fs.h"
 #include "milvus-storage/properties.h"
 #include "log/Log.h"
+#include "storage/loon_ffi/property_singleton.h"
+#include "storage/loon_ffi/util.h"
 
 namespace milvus::storage {
 
@@ -39,7 +41,11 @@ StorageV2FSCache::Get(const Key& key) {
     props[PROPERTY_FS_BUCKET_NAME] = key.bucket_name;
     props[PROPERTY_FS_ACCESS_KEY_ID] = key.access_key_id;
     props[PROPERTY_FS_ACCESS_KEY_VALUE] = key.access_key_value;
-    props[PROPERTY_FS_ROOT_PATH] = key.root_path;
+    // Keys handed to this filesystem already carry the storage prefix, so the
+    // local filesystem is rooted at "/" (remote is rooted at the bucket by
+    // milvus-storage regardless of root_path). See LoonFSRootPath.
+    const auto fs_root_path = LoonFSRootPath(key.storage_type, key.root_path);
+    props[PROPERTY_FS_ROOT_PATH] = fs_root_path;
     props[PROPERTY_FS_STORAGE_TYPE] = key.storage_type;
     props[PROPERTY_FS_CLOUD_PROVIDER] = key.cloud_provider;
     props[PROPERTY_FS_IAM_ENDPOINT] = key.iam_endpoint;
@@ -54,17 +60,35 @@ StorageV2FSCache::Get(const Key& key) {
     props[PROPERTY_FS_GCP_CREDENTIAL_JSON] = key.gcp_credential_json;
     props[PROPERTY_FS_USE_CUSTOM_PART_UPLOAD] = key.use_custom_part_upload;
     props[PROPERTY_FS_MAX_CONNECTIONS] = key.max_connections;
+    props[PROPERTY_FS_S3_CRT_QUEUE_SIZES] =
+        LoonFFIPropertiesSingleton::GetInstance().GetS3CrtQueueSizes();
     if (!key.tls_min_version.empty() && key.tls_min_version != "default") {
         props[PROPERTY_FS_TLS_MIN_VERSION] = key.tls_min_version;
     }
     props[PROPERTY_FS_USE_CRC32C_CHECKSUM] = key.use_crc32c_checksum;
+    if (key.storage_type != "local") {
+        props[PROPERTY_FS_TALON_MODE] = key.talon_mode;
+        props[PROPERTY_FS_TALON_COORDINATOR] = key.talon_coordinator;
+        if (key.talon_small_read_threshold > 0) {
+            props[PROPERTY_FS_TALON_SMALL_READ_THRESHOLD] =
+                key.talon_small_read_threshold;
+        }
+        if (key.talon_block_size > 0) {
+            props[PROPERTY_FS_TALON_BLOCK_SIZE] = key.talon_block_size;
+        }
+        if (key.talon_max_idle_per_addr > 0) {
+            props[PROPERTY_FS_TALON_MAX_IDLE_PER_ADDR] =
+                key.talon_max_idle_per_addr;
+        }
+    }
 
     LOG_INFO(
-        "StorageV2FSCache::Get: address={}, bucket={}, root_path={}, "
-        "storage_type={}",
+        "StorageV2FSCache::Get: address={}, bucket={}, key_prefix={}, "
+        "fs_root_path={}, storage_type={}",
         key.address,
         key.bucket_name,
         key.root_path,
+        fs_root_path,
         key.storage_type);
 
     auto result = milvus_storage::FilesystemCache::getInstance().get(props, "");

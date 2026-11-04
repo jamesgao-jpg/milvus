@@ -59,6 +59,32 @@ type BinlogRecordWriter interface {
 	Schema() *schemapb.CollectionSchema
 }
 
+// SegmentManifestBasePath returns the loon manifest base path for a segment's
+// insert log: <rootPath>/insert_log/<collectionID>/<partitionID>/<segmentID>.
+//
+// The rule is the same for every backend: a key is the storage prefix
+// (minio.rootPath for remote, localStorage.path for local) followed by the
+// layout, and the manifest stores exactly that key. The loon filesystem is
+// rooted at the namespace root (the bucket, or "/" for local; see
+// storagev2.LoonFSRootPath), so the manifest path, the ChunkManager key and the
+// physical location are one string. Every primary-storage V3 writer (flush,
+// compaction, import) must derive the path through this helper; building it
+// from minio.rootPath under local storage was #53052.
+func SegmentManifestBasePath(rootPath string, collectionID, partitionID, segmentID UniqueID) string {
+	k := metautil.JoinIDPath(collectionID, partitionID, segmentID)
+	return path.Join(rootPath, common.SegmentInsertLogPath, k)
+}
+
+// SegmentPartitionBasePath returns the partition-level base path used for TEXT
+// LOB files: <storageConfig.RootPath>/insert_log/<collectionID>/<partitionID>.
+// It shares the rule of SegmentManifestBasePath so LOB references written by
+// mix/clustering compaction resolve to the same files the reader reconstructs
+// from the manifest base.
+func SegmentPartitionBasePath(rootPath string, collectionID, partitionID UniqueID) string {
+	k := metautil.JoinIDPath(collectionID, partitionID)
+	return path.Join(rootPath, common.SegmentInsertLogPath, k)
+}
+
 type packedBinlogRecordWriterBase struct {
 	// attributes
 	collectionID         UniqueID
@@ -99,6 +125,11 @@ type packedBinlogRecordWriterBase struct {
 
 	// Track null counts per field for nullable fields
 	nullCounts map[FieldID]int64
+	// Valid element counts of VectorArray fields; a field whose column could
+	// not be counted is dropped from the map and listed in
+	// validElementUnknown, so its binlogs carry no count.
+	validElementCounts  map[FieldID]int64
+	validElementUnknown map[FieldID]struct{}
 }
 
 func (pw *packedBinlogRecordWriterBase) getColumnStatsFromRecord(r Record, allFields []*schemapb.FieldSchema) map[int64]storagecommon.ColumnStats {
@@ -245,6 +276,12 @@ func (pw *packedBinlogRecordWriterBase) collectNullCounts(r Record) {
 			pw.nullCounts[field.FieldID] += int64(col.NullN())
 		}
 	}
+	pw.validElementCounts, pw.validElementUnknown = CollectVectorArrayValidElements(
+		pw.schema, r, pw.validElementCounts, pw.validElementUnknown)
+}
+
+func (pw *packedBinlogRecordWriterBase) getFieldValidElementCountsForColumnGroup(columnGroup storagecommon.ColumnGroup) map[int64]int64 {
+	return ColumnGroupValidElementCounts(columnGroup, pw.validElementCounts)
 }
 
 func (pw *packedBinlogRecordWriterBase) getFieldNullCountsForColumnGroup(columnGroup storagecommon.ColumnGroup) map[int64]int64 {
@@ -345,13 +382,14 @@ func (pw *PackedBinlogRecordWriter) finalizeBinlogs() {
 			}
 		}
 		pw.fieldBinlogs[columnGroupID].Binlogs = append(pw.fieldBinlogs[columnGroupID].Binlogs, &datapb.Binlog{
-			LogSize:         int64(pw.writer.GetColumnGroupWrittenCompressed(columnGroupID)),
-			MemorySize:      int64(pw.writer.GetColumnGroupWrittenUncompressed(columnGroupID)),
-			LogPath:         pw.writer.GetWrittenPaths(columnGroupID),
-			EntriesNum:      pw.writer.GetWrittenRowNum(),
-			TimestampFrom:   pw.tsFrom,
-			TimestampTo:     pw.tsTo,
-			FieldNullCounts: pw.getFieldNullCountsForColumnGroup(columnGroup),
+			LogSize:                 int64(pw.writer.GetColumnGroupWrittenCompressed(columnGroupID)),
+			MemorySize:              int64(pw.writer.GetColumnGroupWrittenUncompressed(columnGroupID)),
+			LogPath:                 pw.writer.GetWrittenPaths(columnGroupID),
+			EntriesNum:              pw.writer.GetWrittenRowNum(),
+			TimestampFrom:           pw.tsFrom,
+			TimestampTo:             pw.tsTo,
+			FieldNullCounts:         pw.getFieldNullCountsForColumnGroup(columnGroup),
+			FieldValidElementCounts: pw.getFieldValidElementCountsForColumnGroup(columnGroup),
 		})
 	}
 	pw.manifest = pw.writer.GetWrittenManifest()
@@ -375,6 +413,7 @@ func newPackedBinlogRecordWriter(collectionID, partitionID, segmentID UniqueID, 
 	storageConfig *indexpb.StorageConfig,
 	storagePluginContext *indexcgopb.StoragePluginContext,
 	writerFormat string,
+	pkStatsConfig *PkStatsConfig,
 ) (*PackedBinlogRecordWriter, error) {
 	arrowSchema, err := ConvertToArrowSchema(schema, true)
 	if err != nil {
@@ -409,6 +448,7 @@ func newPackedBinlogRecordWriter(collectionID, partitionID, segmentID UniqueID, 
 		collectionID,
 		schema,
 		maxRowNum,
+		pkStatsConfig,
 	)
 	if err != nil {
 		return nil, err
@@ -477,8 +517,7 @@ func (pw *PackedManifestRecordWriter) initWriters(r Record) error {
 		writerFormat, schemaBasedFormats := pw.fillV3ColumnGroupFormats()
 
 		var err error
-		k := metautil.JoinIDPath(pw.collectionID, pw.partitionID, pw.segmentID)
-		pw.basePath = path.Join(pw.storageConfig.GetRootPath(), common.SegmentInsertLogPath, k)
+		pw.basePath = SegmentManifestBasePath(pw.storageConfig.GetRootPath(), pw.collectionID, pw.partitionID, pw.segmentID)
 		pw.writer, err = newPackedRecordBatchWriter(pw.basePath, pw.schema, pw.bufferSize, pw.multiPartUploadSize, pw.columnGroups, pw.storageConfig, pw.storagePluginContext, true, pw.textRefsAsBinary, writerFormat, schemaBasedFormats)
 		if err != nil {
 			return merr.WrapErrStorage(err, "can not new packed record writer")
@@ -505,13 +544,14 @@ func (pw *PackedManifestRecordWriter) finalizeBinlogs() {
 			}
 		}
 		pw.fieldBinlogs[columnGroupID].Binlogs = append(pw.fieldBinlogs[columnGroupID].Binlogs, &datapb.Binlog{
-			LogSize:         int64(pw.writer.GetColumnGroupWrittenCompressed(columnGroupID)),
-			MemorySize:      int64(pw.writer.GetColumnGroupWrittenUncompressed(columnGroupID)),
-			LogPath:         pw.writer.GetWrittenPaths(columnGroupID),
-			EntriesNum:      pw.writer.GetWrittenRowNum(),
-			TimestampFrom:   pw.tsFrom,
-			TimestampTo:     pw.tsTo,
-			FieldNullCounts: pw.getFieldNullCountsForColumnGroup(columnGroup),
+			LogSize:                 int64(pw.writer.GetColumnGroupWrittenCompressed(columnGroupID)),
+			MemorySize:              int64(pw.writer.GetColumnGroupWrittenUncompressed(columnGroupID)),
+			LogPath:                 pw.writer.GetWrittenPaths(columnGroupID),
+			EntriesNum:              pw.writer.GetWrittenRowNum(),
+			TimestampFrom:           pw.tsFrom,
+			TimestampTo:             pw.tsTo,
+			FieldNullCounts:         pw.getFieldNullCountsForColumnGroup(columnGroup),
+			FieldValidElementCounts: pw.getFieldValidElementCountsForColumnGroup(columnGroup),
 		})
 	}
 }
@@ -540,7 +580,8 @@ func (pw *PackedManifestRecordWriter) Close() error {
 	if err := pw.appendV3Stats(updates); err != nil {
 		return err
 	}
-	newManifest, err := packed.CommitManifestUpdates(pw.basePath, packed.ManifestEarliest, pw.storageConfig, updates)
+	newManifest, err := packed.CommitManifestUpdates(
+		packed.MarshalManifestPath(pw.basePath, packed.ManifestEarliest), pw.storageConfig, updates)
 	if err != nil {
 		return merr.Wrap(err, "PackedManifestRecordWriter.Close commit")
 	}
@@ -606,6 +647,7 @@ func newPackedManifestRecordWriter(collectionID, partitionID, segmentID UniqueID
 	storagePluginContext *indexcgopb.StoragePluginContext,
 	textRefsAsBinary bool,
 	writerFormat string,
+	pkStatsConfig *PkStatsConfig,
 ) (*PackedManifestRecordWriter, error) {
 	arrowSchema, err := ConvertToArrowSchema(schema, true)
 	if err != nil {
@@ -641,6 +683,7 @@ func newPackedManifestRecordWriter(collectionID, partitionID, segmentID UniqueID
 		collectionID,
 		schema,
 		maxRowNum,
+		pkStatsConfig,
 	)
 	if err != nil {
 		return nil, err
@@ -710,9 +753,11 @@ func (pw *PackedTextManifestRecordWriter) initWriters(r Record) error {
 		writerFormat, schemaBasedFormats := pw.fillV3ColumnGroupFormats()
 
 		var err error
-		k := metautil.JoinIDPath(pw.collectionID, pw.partitionID, pw.segmentID)
-		pw.basePath = path.Join(pw.storageConfig.GetRootPath(), common.SegmentInsertLogPath, k)
-		pw.writer, err = NewPackedTextBatchWriter(pw.storageConfig.GetBucketName(), pw.basePath, pw.schema, pw.bufferSize, pw.multiPartUploadSize, pw.columnGroups, pw.storageConfig, pw.textColumnConfigs, writerFormat, schemaBasedFormats)
+		pw.basePath = SegmentManifestBasePath(pw.storageConfig.GetRootPath(), pw.collectionID, pw.partitionID, pw.segmentID)
+		// TODO: pass pw.storagePluginContext instead of nil once the TEXT read
+		// chain supports CMEK decryption; encrypting TEXT now would make it
+		// unreadable.
+		pw.writer, err = NewPackedTextBatchWriter(pw.storageConfig.GetBucketName(), pw.basePath, pw.schema, pw.bufferSize, pw.multiPartUploadSize, pw.columnGroups, pw.storageConfig, pw.textColumnConfigs, nil, writerFormat, schemaBasedFormats)
 		if err != nil {
 			return merr.WrapErrStorage(err, "can not new packed text writer")
 		}
@@ -738,13 +783,14 @@ func (pw *PackedTextManifestRecordWriter) finalizeBinlogs() {
 			}
 		}
 		pw.fieldBinlogs[columnGroupID].Binlogs = append(pw.fieldBinlogs[columnGroupID].Binlogs, &datapb.Binlog{
-			LogSize:         int64(pw.writer.GetColumnGroupWrittenCompressed(columnGroupID)),
-			MemorySize:      int64(pw.writer.GetColumnGroupWrittenUncompressed(columnGroupID)),
-			LogPath:         pw.writer.GetWrittenPaths(columnGroupID),
-			EntriesNum:      pw.writer.GetWrittenRowNum(),
-			TimestampFrom:   pw.tsFrom,
-			TimestampTo:     pw.tsTo,
-			FieldNullCounts: pw.getFieldNullCountsForColumnGroup(columnGroup),
+			LogSize:                 int64(pw.writer.GetColumnGroupWrittenCompressed(columnGroupID)),
+			MemorySize:              int64(pw.writer.GetColumnGroupWrittenUncompressed(columnGroupID)),
+			LogPath:                 pw.writer.GetWrittenPaths(columnGroupID),
+			EntriesNum:              pw.writer.GetWrittenRowNum(),
+			TimestampFrom:           pw.tsFrom,
+			TimestampTo:             pw.tsTo,
+			FieldNullCounts:         pw.getFieldNullCountsForColumnGroup(columnGroup),
+			FieldValidElementCounts: pw.getFieldValidElementCountsForColumnGroup(columnGroup),
 		})
 	}
 }
@@ -771,8 +817,8 @@ func (pw *PackedTextManifestRecordWriter) Close() error {
 	if err := pw.appendV3Stats(updates); err != nil {
 		return err
 	}
-	newManifest, err := packed.CommitManifestUpdates(pw.basePath, packed.ManifestEarliest, pw.storageConfig,
-		updates)
+	newManifest, err := packed.CommitManifestUpdates(
+		packed.MarshalManifestPath(pw.basePath, packed.ManifestEarliest), pw.storageConfig, updates)
 	if err != nil {
 		return merr.Wrap(err, "PackedTextManifestRecordWriter.Close commit")
 	}
@@ -792,7 +838,9 @@ func NewPackedTextManifestRecordWriter(
 	columnGroups []storagecommon.ColumnGroup,
 	storageConfig *indexpb.StorageConfig,
 	textColumnConfigs []packed.TextColumnConfig,
+	storagePluginContext *indexcgopb.StoragePluginContext,
 	writerFormat string,
+	pkStatsConfig *PkStatsConfig,
 ) (*PackedTextManifestRecordWriter, error) {
 	arrowSchema, err := ConvertToArrowSchema(schema, true)
 	if err != nil {
@@ -801,23 +849,24 @@ func NewPackedTextManifestRecordWriter(
 
 	writer := &PackedTextManifestRecordWriter{
 		packedBinlogRecordWriterBase: packedBinlogRecordWriterBase{
-			collectionID:        collectionID,
-			partitionID:         partitionID,
-			segmentID:           segmentID,
-			schema:              schema,
-			arrowSchema:         arrowSchema,
-			BlobsWriter:         blobsWriter,
-			allocator:           allocator,
-			maxRowNum:           maxRowNum,
-			bufferSize:          bufferSize,
-			multiPartUploadSize: multiPartUploadSize,
-			columnGroups:        columnGroups,
-			storageConfig:       storageConfig,
-			writerFormat:        writerFormat,
-			tsFrom:              typeutil.MaxTimestamp,
-			tsTo:                0,
-			ttlFieldID:          getTTLFieldID(schema),
-			ttlFieldValues:      make([]int64, 0),
+			collectionID:         collectionID,
+			partitionID:          partitionID,
+			segmentID:            segmentID,
+			schema:               schema,
+			arrowSchema:          arrowSchema,
+			BlobsWriter:          blobsWriter,
+			allocator:            allocator,
+			maxRowNum:            maxRowNum,
+			bufferSize:           bufferSize,
+			multiPartUploadSize:  multiPartUploadSize,
+			columnGroups:         columnGroups,
+			storageConfig:        storageConfig,
+			storagePluginContext: storagePluginContext,
+			writerFormat:         writerFormat,
+			tsFrom:               typeutil.MaxTimestamp,
+			tsTo:                 0,
+			ttlFieldID:           getTTLFieldID(schema),
+			ttlFieldValues:       make([]int64, 0),
 		},
 		textColumnConfigs: textColumnConfigs,
 	}
@@ -827,6 +876,7 @@ func NewPackedTextManifestRecordWriter(
 		collectionID,
 		schema,
 		maxRowNum,
+		pkStatsConfig,
 	)
 	if err != nil {
 		return nil, err

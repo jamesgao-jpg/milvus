@@ -26,9 +26,10 @@ import (
 func (c *DDLCallbacks) batchUpdateManifestV2AckCallback(ctx context.Context, result message.BroadcastResultBatchUpdateManifestMessageV2) error {
 	body := result.Message.MustBody()
 	var (
-		operators []UpdateOperator
-		v2Count   int
-		v3Count   int
+		operators  []UpdateOperator
+		segmentIDs []UniqueID
+		v2Count    int
+		v3Count    int
 	)
 	for _, item := range body.GetItems() {
 		segID := item.GetSegmentId()
@@ -42,6 +43,7 @@ func (c *DDLCallbacks) batchUpdateManifestV2AckCallback(ctx context.Context, res
 			continue
 		case hasV2:
 			operators = append(operators, UpdateSegmentColumnGroupsOperator(segID, cg.GetColumnGroups()))
+			segmentIDs = append(segmentIDs, segID)
 			v2Count++
 		case hasV3:
 			// TODO(segment-manifest-commit): a batch broadcast carries up to 512
@@ -65,6 +67,7 @@ func (c *DDLCallbacks) batchUpdateManifestV2AckCallback(ctx context.Context, res
 			// callback (and the external collection refresh path) through it is the
 			// remaining follow-up.
 			operators = append(operators, UpdateManifestVersion(segID, item.GetManifestVersion()))
+			segmentIDs = append(segmentIDs, segID)
 			v3Count++
 		default:
 			mlog.Warn(ctx, "batch update manifest item has no payload; skipping",
@@ -76,6 +79,14 @@ func (c *DDLCallbacks) batchUpdateManifestV2AckCallback(ctx context.Context, res
 			mlog.Warn(ctx, "batch update manifest failed", mlog.Err(err))
 			return err
 		}
+		// The SegmentMeta mutation is committed (manifest versions advanced
+		// for V3 items); reconcile the DataView snapshot asynchronously so
+		// consumers observe the new manifest versions. V2 column-group
+		// updates do not touch the manifest, so only V3 items trigger.
+		if v3Count > 0 {
+			c.meta.recomputeDataView(ctx, result.Message.Header().GetCollectionId())
+		}
+		notifySegmentIndexBuild(segmentIDs...)
 	}
 	mlog.Info(ctx, "batch update manifest handled",
 		mlog.Int("itemCount", len(body.GetItems())),

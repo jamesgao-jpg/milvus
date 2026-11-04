@@ -70,8 +70,16 @@ class RestImportTestBase(TestBase):
         t0 = time.time()
         last_count = None
         last_refresh_rsp = None
+        # refresh_load answers ErrCollectionNotLoaded (101) / ErrCollectionNotFullyLoaded (103)
+        # while the load triggered by collection creation is still in progress. That is a
+        # transient server state, not an import failure, so keep polling instead of asserting
+        # on the first response; the timeout error below still reports the last response.
+        pending_load_codes = {101, 103}
         while time.time() - t0 < timeout:
             last_refresh_rsp = self.collection_client.refresh_load(collection_name, db_name=db_name)
+            if last_refresh_rsp.get("code") in pending_load_codes:
+                time.sleep(2)
+                continue
             assert last_refresh_rsp.get("code") == 0, last_refresh_rsp
             last_count = self._query_count(
                 collection_name,
@@ -2592,8 +2600,14 @@ class TestCreateImportJob(RestImportTestBase):
             if time.time() - t0 > IMPORT_TIMEOUT:
                 assert False, "Import job timeout"
 
-    def test_import_parquet_array_float_nan_validation(self):
-        """Test Parquet import with Array<Float> containing NaN - should fail"""
+    @pytest.mark.tags(CaseLabel.L2)
+    @pytest.mark.parametrize(
+        "invalid_value",
+        [float("nan"), float("inf"), float("-inf"), None],
+        ids=["nan", "positive_inf", "negative_inf", "null_element"],
+    )
+    def test_import_parquet_array_float_nan_validation(self, invalid_value):
+        """Import rejects non-finite and null Array<Float> elements without exposing rows."""
         name = gen_collection_name()
         dim = 128
 
@@ -2619,13 +2633,12 @@ class TestCreateImportJob(RestImportTestBase):
         self.collection_client.collection_create(payload)
         self.wait_load_completed(name)
 
-        # Create DataFrame with NaN in float array
+        # Build Arrow arrays directly so NaN is not normalized to a null element.
         data = {
             "id": [1, 2],
             "vector": [[random.random() for _ in range(dim)] for _ in range(2)],
-            "float_array": [[1.0, 2.0, 3.0], [4.0, None, 6.0]],  # Second row has None
+            "float_array": [[1.0, 2.0, 3.0], [4.0, invalid_value, 6.0]],
         }
-        df = pd.DataFrame(data)
 
         # Save to Parquet
         file_name = f"test_parquet_nan_{uuid4()}.parquet"
@@ -2635,13 +2648,18 @@ class TestCreateImportJob(RestImportTestBase):
         pa_schema = pa.schema(
             [("id", pa.int64()), ("vector", pa.list_(pa.float32())), ("float_array", pa.list_(pa.float32()))]
         )
-        table = pa.Table.from_pandas(df, schema=pa_schema)
+        table = pa.Table.from_pydict(data, schema=pa_schema)
+        element = table["float_array"].combine_chunks().values[4]
+        if invalid_value is None:
+            assert not element.is_valid
+        else:
+            assert element.is_valid and not np.isfinite(element.as_py())
         logger.info(f"table: {table}")
         pq.write_table(table, file_path)
 
         self.storage_client.upload_file(file_path, file_name)
 
-        # Import should fail due to NaN
+        # Import should fail due to the invalid array element.
         payload = {"collectionName": name, "files": [[file_name]]}
         rsp = self.import_job_client.create_import_jobs(payload)
         job_id = rsp["data"]["jobId"]
@@ -2653,13 +2671,14 @@ class TestCreateImportJob(RestImportTestBase):
             rsp = self.import_job_client.get_import_job_progress(job_id)
             if rsp["data"]["state"] == "Failed":
                 reason = rsp["data"].get("reason", "").lower()
-                assert "nan" in reason or "infinite" in reason or "invalid" in reason
+                assert "nan" in reason or "inf" in reason or "null" in reason or "invalid" in reason
                 finished = True
             elif rsp["data"]["state"] == "Completed":
-                assert False, "Import should have failed due to NaN value"
+                assert False, "Import should have failed due to an invalid array element"
             time.sleep(5)
             if time.time() - t0 > IMPORT_TIMEOUT:
                 assert False, "Import job timeout"
+        assert self._query_count(name) == 0
 
     def test_import_csv_extra_columns_without_dynamic(self):
         """Test CSV import with extra columns when dynamic field is disabled - should be ignored"""
@@ -3000,7 +3019,7 @@ class TestCreateImportJob(RestImportTestBase):
                 assert False, "Import job timeout"
 
     def test_import_parquet_vector_dim_mismatch(self):
-        """Test Parquet import with wrong vector dimension - should fail"""
+        """Wrong Parquet vector dimensions must fail in V2/V3 without publishing rows."""
         name = gen_collection_name()
         dim = 128
         num_entities = 3000
@@ -3045,14 +3064,33 @@ class TestCreateImportJob(RestImportTestBase):
         while not finished:
             rsp = self.import_job_client.get_import_job_progress(job_id)
             if rsp["data"]["state"] == "Failed":
-                reason = rsp["data"].get("reason", "").lower()
-                assert "dim" in reason or "dimension" in reason or "mismatch" in reason
+                actual_reason = rsp["data"].get("reason", "").lower()
+                # IV3-FN-21: V2/V3 readers may report either diagnostic; filenames alone must never match.
+                assert (
+                    f"length of vector is not aligned: expected {dim} but got {wrong_dim}:" in actual_reason
+                    and "data type: floatvector" in actual_reason
+                ) or (
+                    f"expected dim '{dim}' for field 'vector' with type 'floatvector', got dim '{wrong_dim}'"
+                    in actual_reason
+                ), actual_reason
                 finished = True
             elif rsp["data"]["state"] == "Completed":
                 assert False, "Import should have failed due to vector dimension mismatch in Parquet"
             time.sleep(5)
             if time.time() - t0 > IMPORT_TIMEOUT:
                 assert False, "Import job timeout"
+
+        # Reload to inspect the current persisted view, not an older loaded empty view.
+        rsp = self.collection_client.collection_release(collection_name=name)
+        assert rsp["code"] == 0, rsp
+        rsp = self.collection_client.collection_load(collection_name=name)
+        assert rsp["code"] == 0, rsp
+        self.wait_load_completed(name)
+        assert self._query_count(name) == 0
+        rsp = self.vector_client.vector_query(
+            {"collectionName": name, "filter": "id >= 0", "outputFields": ["id"], "limit": 1}, timeout=1
+        )
+        assert rsp["code"] == 0 and rsp.get("data") == [], rsp
 
     def test_import_parquet_with_nullable_and_default_fields(self):
         """Test Parquet import with nullable and default fields missing - should auto-fill"""

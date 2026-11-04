@@ -17,6 +17,7 @@
 package indexparamcheck
 
 import (
+	"strconv"
 	"strings"
 
 	"google.golang.org/protobuf/proto"
@@ -134,6 +135,48 @@ func WrapUserIndexParams(metricType string) []*commonpb.KeyValuePair {
 	}
 }
 
+// ResolveAutoIndexParams validates an AutoIndex request, overlays its supported
+// user parameters on the selected physical configuration, and returns the
+// normalized user-facing parameters persisted with the index.
+func ResolveAutoIndexParams(userParams, autoIndexConfig map[string]string) (map[string]string, []*commonpb.KeyValuePair, bool, error) {
+	allowedKeys := map[string]struct{}{
+		common.IndexTypeKey:     {},
+		common.MetricTypeKey:    {},
+		common.MRLDimKey:        {},
+		common.WithMRLRefineKey: {},
+	}
+	for key := range userParams {
+		if _, ok := allowedKeys[key]; !ok {
+			return nil, nil, false, merr.WrapErrParameterInvalidMsg("only metric type can be passed when use AutoIndex")
+		}
+	}
+	if indexType, ok := userParams[common.IndexTypeKey]; ok && indexType != common.AutoIndexName {
+		return nil, nil, false, merr.WrapErrParameterInvalidMsg("only metric type can be passed when use AutoIndex")
+	}
+
+	resolvedAutoIndexParams := make(map[string]string, len(autoIndexConfig)+2)
+	for key, value := range autoIndexConfig {
+		resolvedAutoIndexParams[key] = value
+	}
+
+	metricType := autoIndexConfig[common.MetricTypeKey]
+	userMetricType, userMetricTypeSpecified := userParams[common.MetricTypeKey]
+	if userMetricTypeSpecified {
+		metricType = userMetricType
+		resolvedAutoIndexParams[common.MetricTypeKey] = userMetricType
+	}
+
+	resolvedUserParams := WrapUserIndexParams(metricType)
+	for _, key := range []string{common.MRLDimKey, common.WithMRLRefineKey} {
+		if value, ok := userParams[key]; ok {
+			resolvedAutoIndexParams[key] = value
+			resolvedUserParams = append(resolvedUserParams, &commonpb.KeyValuePair{Key: key, Value: value})
+		}
+	}
+
+	return resolvedAutoIndexParams, resolvedUserParams, userMetricTypeSpecified, nil
+}
+
 // AdjustAutoIndexParamsByDataType adjusts autoindex params based on vector data type.
 // If data_type is bf16 and refine_type is fp16/fp32, adjust to BF16.
 // If data_type is fp16 and refine_type is bf16/fp32, adjust to FP16.
@@ -184,6 +227,24 @@ func GetDenseFloatAutoIndexParams(collectionProperties []*commonpb.KeyValuePair)
 		return autoIndexCfg.LargeTopKIndexParams.GetAsJSONMap()
 	}
 	return autoIndexCfg.IndexParams.GetAsJSONMap()
+}
+
+// GetSparseAutoIndexParams returns the metric-specific sparse autoindex build
+// params. BM25 function output fields select the BM25 config even when the
+// request omits metric_type. Each metric-specific ParamItem falls back to the
+// legacy autoIndex.params.sparse.build key when it is not configured.
+func GetSparseAutoIndexParams(metricType string, functionType schemapb.FunctionType) map[string]string {
+	autoIndexCfg := &paramtable.Get().AutoIndexConfig
+	var config map[string]string
+	if metricType == metric.BM25 || functionType == schemapb.FunctionType_BM25 {
+		config = autoIndexCfg.SparseBM25IndexParams.GetAsJSONMap()
+	} else {
+		config = autoIndexCfg.SparseIPIndexParams.GetAsJSONMap()
+	}
+	if len(config) == 0 {
+		return autoIndexCfg.SparseIndexParams.GetAsJSONMap()
+	}
+	return config
 }
 
 // PrepareFunctionOutputIndexParams expands the user-provided extra params of a
@@ -241,7 +302,7 @@ func PrepareFunctionOutputIndexParams(functionType schemapb.FunctionType, field 
 	case typeutil.IsDenseFloatVectorType(field.GetDataType()):
 		config = AdjustAutoIndexParamsByDataType(GetDenseFloatAutoIndexParams(collectionProperties), field.GetDataType())
 	case typeutil.IsSparseFloatVectorType(field.GetDataType()):
-		config = autoIndexCfg.SparseIndexParams.GetAsJSONMap()
+		config = GetSparseAutoIndexParams(userMetric, functionType)
 	case typeutil.IsBinaryVectorType(field.GetDataType()):
 		// A MinHash output field with no user metric must resolve to the
 		// deduplicate config (MINHASH_LSH/MHJACCARD): the generic binary config
@@ -372,6 +433,15 @@ func ValidateFieldIndexParams(field *schemapb.FieldSchema, indexParamsMap map[st
 	if typeutil.IsNestedArrayTypeSchema(field.GetTypeSchema()) {
 		return merr.WrapErrParameterInvalidMsg("indexing recursive ARRAY field %s is not supported", field.GetName())
 	}
+	if field.GetDataType() == schemapb.DataType_Array && field.GetElementNullable() {
+		return merr.WrapErrParameterInvalidMsg("indexing element-nullable ARRAY field %s is not supported yet", field.GetName())
+	}
+	if field.GetDataType() == schemapb.DataType_ArrayOfVector {
+		metricType := indexParamsMap[common.MetricTypeKey]
+		if err := ValidateArrayOfVectorMetricType(field.GetElementType(), field.GetElementNullable(), metricType); err != nil {
+			return err
+		}
+	}
 
 	if err := ValidateIndexParamsMapSize(indexParamsMap); err != nil {
 		return err
@@ -412,7 +482,65 @@ func ValidateFieldIndexParams(field *schemapb.FieldSchema, indexParamsMap map[st
 	if err := checker.CheckValidDataType(indexType, effectiveField); err != nil {
 		return err
 	}
-	return checker.CheckTrain(effectiveDataType, effectiveElementType, indexParamsMap)
+	trainParams, err := prepareMRLTrainParams(field, indexParamsMap)
+	if err != nil {
+		return err
+	}
+	return checker.CheckTrain(effectiveDataType, effectiveElementType, trainParams)
+}
+
+func prepareMRLTrainParams(field *schemapb.FieldSchema, indexParams map[string]string) (map[string]string, error) {
+	trainParams := make(map[string]string, len(indexParams))
+	for key, value := range indexParams {
+		trainParams[key] = value
+	}
+	delete(trainParams, common.MRLDimKey)
+	delete(trainParams, common.WithMRLRefineKey)
+
+	withRefine := false
+	if value, ok := indexParams[common.WithMRLRefineKey]; ok {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return nil, merr.WrapErrParameterInvalidMsg("%s must be a boolean", common.WithMRLRefineKey)
+		}
+		withRefine = parsed
+		indexParams[common.WithMRLRefineKey] = strconv.FormatBool(parsed)
+	}
+
+	mrlValue, exists := indexParams[common.MRLDimKey]
+	if !exists {
+		if withRefine {
+			return nil, merr.WrapErrParameterInvalidMsg("%s requires a valid %s", common.WithMRLRefineKey, common.MRLDimKey)
+		}
+		return trainParams, nil
+	}
+	mrlDim, err := strconv.ParseInt(mrlValue, 10, 64)
+	if err != nil {
+		return nil, merr.WrapErrParameterInvalidMsg("%s must be an integer", common.MRLDimKey)
+	}
+	if mrlDim == -1 {
+		if withRefine {
+			return nil, merr.WrapErrParameterInvalidMsg("%s requires a valid %s", common.WithMRLRefineKey, common.MRLDimKey)
+		}
+		return trainParams, nil
+	}
+
+	if !typeutil.IsDenseFloatVectorType(field.GetDataType()) || typeutil.IsArrayOfVectorType(field.GetDataType()) {
+		return nil, merr.WrapErrParameterInvalidMsg("MRL supports only dense FLOAT_VECTOR, FLOAT16_VECTOR, and BFLOAT16_VECTOR fields")
+	}
+	metricType := indexParams[common.MetricTypeKey]
+	if metricType != metric.L2 && metricType != metric.IP && metricType != metric.COSINE {
+		return nil, merr.WrapErrParameterInvalidMsg("MRL supports only L2, IP, and COSINE metrics")
+	}
+	sourceDim, err := strconv.ParseInt(indexParams[common.DimKey], 10, 64)
+	if err != nil {
+		return nil, merr.WrapErrParameterInvalidMsg("invalid source dimension for MRL")
+	}
+	if mrlDim <= 0 || mrlDim >= sourceDim {
+		return nil, merr.WrapErrParameterInvalidMsg("%s must satisfy 0 < %s < dim", common.MRLDimKey, common.MRLDimKey)
+	}
+	trainParams[common.DimKey] = strconv.FormatInt(mrlDim, 10)
+	return trainParams, nil
 }
 
 // ValidateIndexName enforces the index-name format rules. Moved from proxy so

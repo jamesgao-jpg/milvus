@@ -19,6 +19,7 @@ package querynodev2
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strconv"
 	"sync"
 	"time"
@@ -33,6 +34,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/msgpb"
 	"github.com/milvus-io/milvus/internal/distributed/streaming"
+	"github.com/milvus-io/milvus/internal/featureusage"
 	"github.com/milvus-io/milvus/internal/flushcommon/syncmgr"
 	"github.com/milvus-io/milvus/internal/querynodev2/delegator"
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
@@ -1009,6 +1011,11 @@ func (node *QueryNode) QuerySegments(ctx context.Context, req *querypb.QueryRequ
 		}
 	}()
 
+	if err := upgradeLegacyCountRequest(ctx, req.GetReq()); err != nil {
+		resp.Status = merr.Status(err)
+		return resp, nil
+	}
+
 	log.Debug(ctx, "start do query segments", mlog.Int64s("segmentIDs", req.GetSegmentIDs()))
 	// add cancel when error occurs
 	queryCtx, cancel := context.WithCancel(ctx)
@@ -1074,6 +1081,11 @@ func (node *QueryNode) Query(ctx context.Context, req *querypb.QueryRequest) (*i
 		}, nil
 	}
 	defer node.lifetime.Done()
+	if err := upgradeLegacyCountRequest(ctx, req.GetReq()); err != nil {
+		return &internalpb.RetrieveResults{
+			Status: merr.Status(err),
+		}, nil
+	}
 	if !node.manager.Collection.Ref(req.GetReq().GetCollectionID(), 1) {
 		err := merr.WrapErrCollectionNotLoaded(req.GetReq().GetCollectionID())
 		log.Warn(ctx, "failed to query collection", mlog.Err(err))
@@ -1131,6 +1143,11 @@ func (node *QueryNode) QueryStream(req *querypb.QueryRequest, srv querypb.QueryN
 		return nil
 	}
 	defer node.lifetime.Done()
+
+	if err := upgradeLegacyCountRequest(ctx, req.GetReq()); err != nil {
+		concurrentSrv.Send(&internalpb.RetrieveResults{Status: merr.Status(err)})
+		return nil
+	}
 
 	runningGp, runningCtx := errgroup.WithContext(ctx)
 
@@ -1198,6 +1215,12 @@ func (node *QueryNode) QueryStreamSegments(req *querypb.QueryRequest, srv queryp
 	}
 	defer node.lifetime.Done()
 
+	if err := upgradeLegacyCountRequest(ctx, req.GetReq()); err != nil {
+		resp.Status = merr.Status(err)
+		concurrentSrv.Send(resp)
+		return nil
+	}
+
 	log.Debug(ctx, "start do query with channel", mlog.Int64s("segmentIDs", req.GetSegmentIDs()))
 
 	tr := timerecord.NewTimeRecorder("queryChannel")
@@ -1255,6 +1278,96 @@ func (node *QueryNode) ShowConfigurations(ctx context.Context, req *internalpb.S
 		Status:        merr.Success(),
 		Configuations: configList,
 	}, nil
+}
+
+// GetFeatureUsage returns this QueryNode's view: the node-level configuration
+// switches in effect (config group). No counter is owned by the QueryNode role
+// today: the execution features of a request, two-stage search and segment
+// pruning included, travel back on its results as feature_bits and are counted
+// by the Proxy, which also counts run_analyzer.
+func (node *QueryNode) GetFeatureUsage(ctx context.Context, req *internalpb.GetFeatureUsageRequest) (*internalpb.GetFeatureUsageResponse, error) {
+	if err := merr.CheckHealthy(node.lifetime.GetState()); err != nil {
+		return &internalpb.GetFeatureUsageResponse{Status: merr.Status(err)}, nil
+	}
+	entries := queryNodeConfigEntries()
+	entries = append(entries, featureusage.SnapshotFor(featureusage.RoleQueryNode)...)
+	return &internalpb.GetFeatureUsageResponse{
+		Status:        merr.Success(),
+		Role:          typeutil.QueryNodeRole,
+		NodeId:        node.GetNodeID(),
+		NodeStartTime: paramtable.GetCreateTime().Unix(),
+		CollectedAt:   time.Now().Unix(),
+		Entries:       entries,
+	}, nil
+}
+
+// queryNodeConfigEntries reports the boolean QueryNode configuration items that
+// switch a capability on or off, as key=true/false. Only booleans: the value is
+// then drawn from a closed set and cannot carry an operator string.
+func queryNodeConfigEntries() []*internalpb.FeatureEntry {
+	items := queryNodeConfigItems()
+	entries := make([]*internalpb.FeatureEntry, 0, len(items))
+	for _, item := range items {
+		value, ok := startConfigValues.Load(item.Key)
+		if !ok {
+			// Refreshable, or no start snapshot (a test): the live value is
+			// the one in effect.
+			value = item.GetAsBool()
+		}
+		entries = append(entries, featureusage.BoolConfigEntry(item.Key, value.(bool)))
+	}
+	return entries
+}
+
+func queryNodeConfigItems() []*paramtable.ParamItem {
+	cfg := &paramtable.Get().QueryNodeCfg
+	return []*paramtable.ParamItem{
+		&cfg.EnableDisk,
+		&cfg.EnableInterminSegmentIndex,
+		&cfg.TieredEvictionEnabled,
+		&cfg.TieredBackgroundEvictionEnabled,
+		&cfg.MultipleChunkedEnable,
+		&cfg.EnableGeometryCache,
+		&cfg.EnableGISSplitFusion,
+		&cfg.MmapVectorField,
+		&cfg.MmapVectorIndex,
+		&cfg.MmapScalarField,
+		&cfg.MmapScalarIndex,
+		&cfg.GrowingMmapEnabled,
+		&cfg.MmapJSONStats,
+		&cfg.ExprResCacheEnabled,
+		&cfg.EnableSegmentPrune,
+		&cfg.EnableSegmentFilter,
+		&cfg.SkipGrowingSegmentBF,
+		&cfg.EnableResultZeroCopy,
+		&cfg.PreferFieldDataWhenIndexHasRawData,
+		&cfg.IDFPreload,
+	}
+}
+
+// startConfigValues holds, for the non-refreshable items above, the value the
+// node started with: the config manager serves the current value, but a
+// non-refreshable item keeps its start value until a restart, and the report
+// describes what the node runs with.
+var startConfigValues sync.Map
+
+// captureStartConfig takes that snapshot. It runs once, at init, before any
+// report can be served; the refreshable tag is read from the config struct
+// so the list of items here never has to say which are which.
+func captureStartConfig() {
+	cfg := &paramtable.Get().QueryNodeCfg
+	refreshable := make(map[*paramtable.ParamItem]bool)
+	v := reflect.ValueOf(cfg).Elem()
+	for i := 0; i < v.NumField(); i++ {
+		if f := v.Field(i); f.CanAddr() && f.Type() == reflect.TypeOf(paramtable.ParamItem{}) {
+			refreshable[f.Addr().Interface().(*paramtable.ParamItem)] = v.Type().Field(i).Tag.Get("refreshable") != "false"
+		}
+	}
+	for _, item := range queryNodeConfigItems() {
+		if !refreshable[item] {
+			startConfigValues.Store(item.Key, item.GetAsBool())
+		}
+	}
 }
 
 // GetMetrics return system infos of the query node, such as total memory, memory usage, cpu usage ...
@@ -1683,7 +1796,7 @@ func (node *QueryNode) DeleteBatch(ctx context.Context, req *querypb.DeleteBatch
 	// maybe it shall be lower in case of heavy CPU usage may impacting search/query
 	pool := segments.GetDeletePool()
 	futures := make([]*conc.Future[struct{}], 0, len(segs))
-	errSet := typeutil.NewConcurrentSet[int64]()
+	errMap := typeutil.NewConcurrentMap[int64, error]()
 
 	for _, segment := range segs {
 		segment := segment
@@ -1692,7 +1805,7 @@ func (node *QueryNode) DeleteBatch(ctx context.Context, req *querypb.DeleteBatch
 			// current implementation still copys pks into protobuf(or arrow) struct
 			err := segment.Delete(ctx, pks, req.GetTimestamps())
 			if err != nil {
-				errSet.Insert(segment.ID())
+				errMap.Insert(segment.ID(), err)
 				log.Warn(ctx, "segment delete failed",
 					mlog.Int64("segmentID", segment.ID()),
 					mlog.Err(err))
@@ -1702,13 +1815,24 @@ func (node *QueryNode) DeleteBatch(ctx context.Context, req *querypb.DeleteBatch
 		}))
 	}
 
-	// ignore error returned, since error segment is recorded into error set
+	// ignore error returned, since error segment is recorded into error map
 	_ = conc.AwaitAll(futures...)
 
-	// return merr.Success(), nil
+	// Carry the typed per-segment failure (index-aligned with failed_ids) so
+	// the delegator can distinguish a retryable failure (OOM, transient IO --
+	// retry) from a permanent one (offline the segment) instead of offlining
+	// on every failure.
+	failedIds := make([]int64, 0, errMap.Len())
+	failedStatuses := make([]*commonpb.Status, 0, errMap.Len())
+	errMap.Range(func(segmentID int64, segErr error) bool {
+		failedIds = append(failedIds, segmentID)
+		failedStatuses = append(failedStatuses, merr.Status(segErr))
+		return true
+	})
 	return &querypb.DeleteBatchResponse{
-		Status:    merr.Success(),
-		FailedIds: errSet.Collect(),
+		Status:         merr.Success(),
+		FailedIds:      failedIds,
+		FailedStatuses: failedStatuses,
 	}, nil
 }
 
@@ -1722,7 +1846,10 @@ func (node *QueryNode) runAnalyzer(req *querypb.RunAnalyzerRequest) ([]*milvuspb
 
 	results := make([]*milvuspb.AnalyzerResult, len(req.GetPlaceholder()))
 	for i, text := range req.GetPlaceholder() {
-		stream := tokenizer.NewTokenStream(string(text))
+		stream, err := tokenizer.NewTokenStream(string(text))
+		if err != nil {
+			return nil, err
+		}
 
 		results[i] = &milvuspb.AnalyzerResult{
 			Tokens: make([]*milvuspb.AnalyzerToken, 0),

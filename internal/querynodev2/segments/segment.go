@@ -35,6 +35,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/apache/arrow/go/v17/arrow"
 	"github.com/cockroachdb/errors"
 	"go.opentelemetry.io/otel"
 	"go.uber.org/atomic"
@@ -47,19 +48,14 @@ import (
 	"github.com/milvus-io/milvus/internal/querynodev2/segments/state"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/storagev2/packed"
-	"github.com/milvus-io/milvus/internal/util/indexparamcheck"
 	"github.com/milvus-io/milvus/internal/util/segcore"
-	"github.com/milvus-io/milvus/internal/util/vecindexmgr"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
-	"github.com/milvus-io/milvus/pkg/v3/proto/cgopb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/segcorepb"
 	"github.com/milvus-io/milvus/pkg/v3/util/contextutil"
-	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/v3/util/indexparams"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/metautil"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
@@ -84,8 +80,9 @@ type IndexedFieldInfo struct {
 }
 
 type baseSegment struct {
-	collection *Collection
-	version    *atomic.Int64
+	collection     *Collection
+	sealedMetadata *sealedRuntimeMetadata
+	version        *atomic.Int64
 
 	segmentType   SegmentType
 	pkCandidate   pkoracle.Candidate // PK candidate: BloomFilterSet for regular collections, ExternalSegmentCandidate for external collections
@@ -136,10 +133,16 @@ func (s *baseSegment) Partition() int64 {
 }
 
 func (s *baseSegment) DatabaseName() string {
+	if s.sealedMetadata != nil {
+		return s.sealedMetadata.database
+	}
 	return s.collection.GetDBName()
 }
 
 func (s *baseSegment) ResourceGroup() string {
+	if s.sealedMetadata != nil {
+		return s.sealedMetadata.resourceGroup
+	}
 	return s.collection.GetResourceGroup()
 }
 
@@ -215,6 +218,14 @@ func compactSegmentLoadInfoForRuntime(loadInfo *querypb.SegmentLoadInfo) *queryp
 	}
 }
 
+// FinalizeLoad caches resource estimates and discards load-only metadata after
+// all data, index, delta and PK metadata consumers have finished.
+func FinalizeLoad(segment Segment) {
+	if local, ok := segment.(*LocalSegment); ok {
+		local.compactLoadInfoForRuntime()
+	}
+}
+
 func (s *baseSegment) compactLoadInfoForRuntime() {
 	if s.segmentType != SegmentTypeSealed || s.Level() == datapb.SegmentLevel_L0 {
 		return
@@ -222,6 +233,8 @@ func (s *baseSegment) compactLoadInfoForRuntime() {
 	loadInfo := s.LoadInfo()
 	usage, err := estimateLogicalResourceUsageOfSegment(s.collection.Schema(), loadInfo, resourceEstimateFactor{
 		deltaDataExpansionFactor:        paramtable.Get().QueryNodeCfg.DeltaDataExpansionRate.GetAsFloat(),
+		jsonKeyStatsExpansionFactor:     paramtable.Get().QueryNodeCfg.JSONKeyStatsExpansionFactor.GetAsFloat(),
+		textIndexExpansionFactor:        paramtable.Get().QueryNodeCfg.TextIndexExpansionFactor.GetAsFloat(),
 		TieredEvictionEnabled:           paramtable.Get().QueryNodeCfg.TieredEvictionEnabled.GetAsBool(),
 		TieredEvictableMemoryCacheRatio: paramtable.Get().QueryNodeCfg.TieredEvictableMemoryCacheRatio.GetAsFloat(),
 		TieredEvictableDiskCacheRatio:   paramtable.Get().QueryNodeCfg.TieredEvictableDiskCacheRatio.GetAsFloat(),
@@ -397,6 +410,8 @@ func (s *baseSegment) ResourceUsageEstimate() ResourceUsage {
 
 	usage, err := estimateLogicalResourceUsageOfSegment(s.collection.Schema(), s.LoadInfo(), resourceEstimateFactor{
 		deltaDataExpansionFactor:        paramtable.Get().QueryNodeCfg.DeltaDataExpansionRate.GetAsFloat(),
+		jsonKeyStatsExpansionFactor:     paramtable.Get().QueryNodeCfg.JSONKeyStatsExpansionFactor.GetAsFloat(),
+		textIndexExpansionFactor:        paramtable.Get().QueryNodeCfg.TextIndexExpansionFactor.GetAsFloat(),
 		TieredEvictionEnabled:           paramtable.Get().QueryNodeCfg.TieredEvictionEnabled.GetAsBool(),
 		TieredEvictableMemoryCacheRatio: paramtable.Get().QueryNodeCfg.TieredEvictableMemoryCacheRatio.GetAsFloat(),
 		TieredEvictableDiskCacheRatio:   paramtable.Get().QueryNodeCfg.TieredEvictableDiskCacheRatio.GetAsFloat(),
@@ -503,7 +518,7 @@ func NewSegment(ctx context.Context,
 		logger.Warn(ctx, "create segment failed", mlog.Err(err))
 		return nil, err
 	}
-	logger.Info(ctx, "create segment done")
+	logger.Debug(ctx, "create segment done")
 
 	segment := &LocalSegment{
 		baseSegment:        base,
@@ -771,6 +786,10 @@ func (s *LocalSegment) syncFieldIndexes(indexInfos []*querypb.FieldIndexInfo) {
 // Search executes a search on the segment.
 // If searchReq.FilterOnly() is true, only executes the filter and returns valid_count (Stage 1 of two-stage search).
 func (s *LocalSegment) Search(ctx context.Context, searchReq *segcore.SearchRequest) (*segcore.SearchResult, error) {
+	return s.searchWithSegment(ctx, searchReq, s.csegment)
+}
+
+func (s *LocalSegment) searchWithSegment(ctx context.Context, searchReq *segcore.SearchRequest, native segcore.CSegment) (*segcore.SearchResult, error) {
 	filterOnly := searchReq.FilterOnly()
 	log := mlog.WithLazy(
 		mlog.Uint64("mvcc", searchReq.MVCC()),
@@ -791,7 +810,7 @@ func (s *LocalSegment) Search(ctx context.Context, searchReq *segcore.SearchRequ
 	log.Debug(ctx, "search segment...")
 
 	tr := timerecord.NewTimeRecorder("cgoSearch")
-	result, err := s.csegment.Search(ctx, searchReq)
+	result, err := native.Search(ctx, searchReq)
 	if err != nil {
 		log.Warn(ctx, "Search failed")
 		return nil, err
@@ -806,6 +825,10 @@ func (s *LocalSegment) Search(ctx context.Context, searchReq *segcore.SearchRequ
 }
 
 func (s *LocalSegment) retrieve(ctx context.Context, plan *segcore.RetrievePlan, log *mlog.Logger) (*segcore.RetrieveResult, error) {
+	return s.retrieveNative(ctx, plan, log, s.csegment)
+}
+
+func (s *LocalSegment) retrieveNative(ctx context.Context, plan *segcore.RetrievePlan, log *mlog.Logger, native segcore.CSegment) (*segcore.RetrieveResult, error) {
 	if !s.ptrLock.PinIf(state.IsNotReleased) {
 		// TODO: check if the segment is readable but not released. too many related logic need to be refactor.
 		return nil, merr.WrapErrSegmentNotLoaded(s.ID(), "segment released")
@@ -819,7 +842,7 @@ func (s *LocalSegment) retrieve(ctx context.Context, plan *segcore.RetrievePlan,
 		ctx,
 		s.segmentType,
 		func() (*segcore.RetrieveResult, error) {
-			return s.csegment.Retrieve(ctx, plan)
+			return native.Retrieve(ctx, plan)
 		},
 		waitSegmentReadGateRetry,
 	)
@@ -833,6 +856,10 @@ func (s *LocalSegment) retrieve(ctx context.Context, plan *segcore.RetrievePlan,
 }
 
 func (s *LocalSegment) Retrieve(ctx context.Context, plan *segcore.RetrievePlan) (*segcorepb.RetrieveResults, error) {
+	return s.retrieveWithSegment(ctx, plan, s.csegment)
+}
+
+func (s *LocalSegment) retrieveWithSegment(ctx context.Context, plan *segcore.RetrievePlan, native segcore.CSegment) (*segcorepb.RetrieveResults, error) {
 	log := mlog.WithLazy(
 		mlog.FieldCollectionID(s.Collection()),
 		mlog.FieldPartitionID(s.Partition()),
@@ -841,7 +868,7 @@ func (s *LocalSegment) Retrieve(ctx context.Context, plan *segcore.RetrievePlan)
 		mlog.String("segmentType", s.segmentType.String()),
 	)
 
-	result, err := s.retrieve(ctx, plan, log)
+	result, err := s.retrieveNative(ctx, plan, log, native)
 	if err != nil {
 		return nil, err
 	}
@@ -859,7 +886,79 @@ func (s *LocalSegment) Retrieve(ctx context.Context, plan *segcore.RetrievePlan)
 	return retrieveResult, nil
 }
 
+// RetrieveArrow retrieves with the Arrow transport, returning the protobuf
+// header and the user output columns as an Arrow record. It is the counterpart
+// of retrieve: the same pin / read-gate / latency choreography, then the Arrow
+// columns.
+//
+// The caller owns the record and must Release it once MaterializeArrowSelection has read it. Returning the two separately rather than merging into
+// FieldData is the point: FieldData is built once, at response assembly,
+// instead of once per segment.
+//
+// There is deliberately NO fallback to the protobuf path: every error it can
+// return is either a bug or one the protobuf path fails on identically, so a
+// fallback would silently paper over the former and buy nothing for the latter.
+// See the design doc for the full argument.
+//
+// common.interface.zeroCopy is the rollback mechanism; bugs here should be loud.
+func (s *LocalSegment) RetrieveArrow(ctx context.Context, plan *segcore.RetrievePlan) (*segcorepb.RetrieveResults, arrow.Record, error) {
+	return s.retrieveArrowWithSegment(ctx, plan, s.csegment)
+}
+
+func (s *LocalSegment) retrieveArrowWithSegment(ctx context.Context, plan *segcore.RetrievePlan, native segcore.CSegment) (*segcorepb.RetrieveResults, arrow.Record, error) {
+	// WithLazy, matching retrieve: this runs once per segment per query and the
+	// only consumer is a Debug line, so the fields should not be encoded at
+	// default log level.
+	log := mlog.WithLazy(
+		mlog.FieldCollectionID(s.Collection()),
+		mlog.FieldPartitionID(s.Partition()),
+		mlog.FieldSegmentID(s.ID()),
+		mlog.String("segmentType", s.segmentType.String()),
+	)
+	if !s.ptrLock.PinIf(state.IsNotReleased) {
+		return nil, nil, merr.WrapErrSegmentNotLoaded(s.ID(), "segment released")
+	}
+	defer s.ptrLock.Unpin()
+
+	tr := timerecord.NewTimeRecorder("cgoRetrieveAsArrow")
+	arrowResult, err := retrySegmentReadGate(
+		ctx,
+		s.segmentType,
+		func() (*segcore.RetrieveArrowResult, error) {
+			return native.RetrieveAsArrow(ctx, plan)
+		},
+		waitSegmentReadGateRetry,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Releasing the CRetrieveArrowResult is safe even though the record outlives
+	// it: importing the Arrow C structs nulls their release callbacks, so this
+	// frees the protobuf header blob and the two now-inert structs, not the
+	// record's buffers.
+	defer arrowResult.Release()
+	metrics.QueryNodeSQSegmentLatencyInCore.WithLabelValues(paramtable.GetStringNodeID(),
+		contextutil.GetQueryLabel(ctx)).Observe(float64(tr.ElapseSpan().Microseconds()) / 1000.0)
+
+	_, span := otel.Tracer(typeutil.QueryNodeRole).Start(ctx, "partial-segcore-results-deserialization")
+	defer span.End()
+
+	header, record, err := arrowResult.GetResult()
+	if err != nil {
+		return nil, nil, err
+	}
+	// The record is NOT released here: ownership moves to the caller, which must
+	// keep it alive until MaterializeArrowSelection has read it. See
+	// RetrieveSegmentResult.Record.
+	log.Debug(ctx, "retrieve segment as arrow done", mlog.Int("resultNum", len(header.Offset)))
+	return header, record, nil
+}
+
 func (s *LocalSegment) retrieveByOffsets(ctx context.Context, plan *segcore.RetrievePlanWithOffsets, log *mlog.Logger) (*segcore.RetrieveResult, error) {
+	return s.retrieveByOffsetsNative(ctx, plan, log, s.csegment)
+}
+
+func (s *LocalSegment) retrieveByOffsetsNative(ctx context.Context, plan *segcore.RetrievePlanWithOffsets, log *mlog.Logger, native segcore.CSegment) (*segcore.RetrieveResult, error) {
 	if !s.ptrLock.PinIf(state.IsNotReleased) {
 		// TODO: check if the segment is readable but not released. too many related logic need to be refactor.
 		return nil, merr.WrapErrSegmentNotLoaded(s.ID(), "segment released")
@@ -872,7 +971,7 @@ func (s *LocalSegment) retrieveByOffsets(ctx context.Context, plan *segcore.Retr
 		ctx,
 		s.segmentType,
 		func() (*segcore.RetrieveResult, error) {
-			return s.csegment.RetrieveByOffsets(ctx, plan)
+			return native.RetrieveByOffsets(ctx, plan)
 		},
 		waitSegmentReadGateRetry,
 	)
@@ -886,6 +985,10 @@ func (s *LocalSegment) retrieveByOffsets(ctx context.Context, plan *segcore.Retr
 }
 
 func (s *LocalSegment) RetrieveByOffsets(ctx context.Context, plan *segcore.RetrievePlanWithOffsets) (*segcorepb.RetrieveResults, error) {
+	return s.retrieveByOffsetsWithSegment(ctx, plan, s.csegment)
+}
+
+func (s *LocalSegment) retrieveByOffsetsWithSegment(ctx context.Context, plan *segcore.RetrievePlanWithOffsets, native segcore.CSegment) (*segcorepb.RetrieveResults, error) {
 	log := mlog.WithLazy(mlog.FieldCollectionID(s.Collection()),
 		mlog.FieldPartitionID(s.Partition()),
 		mlog.FieldSegmentID(s.ID()),
@@ -894,7 +997,7 @@ func (s *LocalSegment) RetrieveByOffsets(ctx context.Context, plan *segcore.Retr
 		mlog.Int("resultNum", len(plan.Offsets)),
 	)
 
-	result, err := s.retrieveByOffsets(ctx, plan, log)
+	result, err := s.retrieveByOffsetsNative(ctx, plan, log, native)
 	if err != nil {
 		return nil, err
 	}
@@ -1145,86 +1248,6 @@ func (s *LocalSegment) LoadDeltaData(ctx context.Context, deltaData *storage.Del
 		mlog.Int64("rowNum", rowNum),
 		mlog.String("segmentType", s.Type().String()))
 	return nil
-}
-
-func GetCLoadInfoWithFunc(ctx context.Context,
-	fieldSchema *schemapb.FieldSchema,
-	loadInfo *querypb.SegmentLoadInfo,
-	indexInfo *querypb.FieldIndexInfo,
-	f func(c *LoadIndexInfo) error,
-) error {
-	// 1.
-	loadIndexInfo, err := newLoadIndexInfo(ctx)
-	if err != nil {
-		return err
-	}
-	defer deleteLoadIndexInfo(loadIndexInfo)
-
-	indexParams := funcutil.KeyValuePair2Map(indexInfo.IndexParams)
-	// as Knowhere reports error if encounter an unknown param, we need to delete it
-	delete(indexParams, common.MmapEnabledKey)
-
-	// some build params also exist in indexParams, which are useless during loading process
-	if vecindexmgr.GetVecIndexMgrInstance().IsDiskANN(indexParams["index_type"]) {
-		if err := indexparams.SetDiskIndexLoadParams(paramtable.Get(), indexParams, indexInfo.GetNumRows()); err != nil {
-			return err
-		}
-	}
-
-	// set whether enable offset cache for bitmap index
-	if indexParams["index_type"] == indexparamcheck.IndexBitmap {
-		indexparams.SetBitmapIndexLoadParams(paramtable.Get(), indexParams)
-	}
-
-	if err := indexparams.AppendPrepareLoadParams(paramtable.Get(), indexParams); err != nil {
-		return err
-	}
-
-	enableMmap := isIndexMmapEnable(fieldSchema, indexInfo)
-	// Add warmup policy to index_params if not already present
-	// C++ will pass it to Knowhere for index loading
-	if existingWarmup, exists := indexParams[common.WarmupKey]; exists {
-		mlog.Info(ctx, "warmup policy already in index params (from QueryCoord)",
-			mlog.FieldSegmentID(loadInfo.GetSegmentID()),
-			mlog.FieldFieldID(indexInfo.GetFieldID()),
-			mlog.String("warmup", existingWarmup))
-	} else {
-		warmupPolicy := getIndexWarmupPolicy(fieldSchema, indexInfo)
-		mlog.Info(ctx, "warmup policy from getIndexWarmupPolicy",
-			mlog.FieldSegmentID(loadInfo.GetSegmentID()),
-			mlog.FieldFieldID(indexInfo.GetFieldID()),
-			mlog.String("warmup", warmupPolicy))
-		if warmupPolicy != "" {
-			indexParams[common.WarmupKey] = warmupPolicy
-		}
-	}
-	// Pass DataCoord-built index file paths through; QueryNode should not
-	// attach v0/v1 path layout semantics to the read path.
-	indexInfoProto := &cgopb.LoadIndexInfo{
-		CollectionID:              loadInfo.GetCollectionID(),
-		PartitionID:               loadInfo.GetPartitionID(),
-		SegmentID:                 loadInfo.GetSegmentID(),
-		Field:                     fieldSchema,
-		EnableMmap:                enableMmap,
-		IndexID:                   indexInfo.GetIndexID(),
-		IndexBuildID:              indexInfo.GetBuildID(),
-		IndexVersion:              indexInfo.GetIndexVersion(),
-		IndexParams:               indexParams,
-		IndexFiles:                indexInfo.GetIndexFilePaths(),
-		IndexEngineVersion:        indexInfo.GetCurrentIndexVersion(),
-		IndexFileSize:             indexInfo.GetIndexSize(),
-		NumRows:                   indexInfo.GetNumRows(),
-		CurrentScalarIndexVersion: indexInfo.GetCurrentScalarIndexVersion(),
-		IndexStorePathVersion:     indexInfo.GetIndexStorePathVersion(),
-	}
-
-	// 2.
-	if err := loadIndexInfo.appendLoadIndexInfo(ctx, indexInfoProto); err != nil {
-		mlog.Warn(ctx, "fail to append load index info", mlog.Err(err))
-		return err
-	}
-	loadIndexInfo.setShard(loadInfo.GetInsertChannel())
-	return f(loadIndexInfo)
 }
 
 func (s *LocalSegment) syncFieldJSONStatsFromLoadInfo(ctx context.Context, loadInfo *querypb.SegmentLoadInfo) {
@@ -1596,6 +1619,7 @@ func (s *LocalSegment) FlushData(ctx context.Context, startOffset, endOffset int
 	cConfig.schema_length = C.int64_t(len(schemaBlob))
 
 	cConfig.read_version = C.int64_t(config.ReadVersion)
+	cConfig.read_manifest_size = C.int64_t(config.ReadManifestSize)
 	cConfig.retry_limit = C.uint32_t(3)
 	writerFormat := config.WriterFormat
 	if writerFormat != "" {
@@ -1764,7 +1788,8 @@ func (s *LocalSegment) FlushData(ctx context.Context, startOffset, endOffset int
 	if idx := strings.Index(rawPath, "/_metadata/"); idx >= 0 {
 		basePath = rawPath[:idx]
 	}
-	manifestPath := packed.MarshalManifestPath(basePath, committedVersion)
+	manifestPath := packed.CommittedManifestPath(basePath, committedVersion, int64(cResult.manifest_size),
+		paramtable.Get().CommonCfg.StorageType.GetValue())
 	fieldNullCounts := make(map[int64]int64, int(cResult.num_field_stats))
 	if cResult.num_field_stats > 0 {
 		fieldIDs := unsafe.Slice(cResult.field_ids, int(cResult.num_field_stats))

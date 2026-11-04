@@ -9,40 +9,56 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
-#include <cstdint>
-#include <optional>
+#pragma once
 
-#include "cachinglayer/Translator.h"
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "common/Tracer.h"
 #include "common/resource_c.h"
-#include "index/Index.h"
-#include "segcore/ChunkedSegmentSealedImpl.h"
+#include "knowhere/index/index_factory.h"
+#include "segcore/storagev1translator/IndexReaderTranslator.h"
+#include "storage/FileManager.h"
+#include "storage/IndexEntryReader.h"
+
+namespace milvus::segcore {
+struct LoadIndexInfo;
+}
 
 namespace milvus::segcore::storagev1translator {
 
-class SealedIndexTranslator
-    : public milvus::cachinglayer::Translator<milvus::index::IndexBase> {
+class SealedIndexTranslator : public IndexReaderTranslator {
  public:
+    // op_ctx is borrowed only for constructor metadata I/O; each Load binds its own context.
     SealedIndexTranslator(
-        milvus::index::CreateIndexInfo index_info,
         const milvus::segcore::LoadIndexInfo* load_index_info,
         milvus::tracer::TraceContext ctx,
         milvus::storage::FileManagerContext file_manager_context,
-        Config config);
+        Config config,
+        milvus::OpContext* op_ctx = nullptr,
+        storage::VectorDataViewScope vector_data_view_scope = {});
     ~SealedIndexTranslator() override = default;
     size_t
     num_cells() const override;
     milvus::cachinglayer::cid_t
     cell_id_of(milvus::cachinglayer::uid_t uid) const override;
-    std::pair<milvus::cachinglayer::ResourceUsage,
-              milvus::cachinglayer::ResourceUsage>
-    estimated_byte_size_of_cell(milvus::cachinglayer::cid_t cid) const override;
+    milvus::cachinglayer::LoadingResourceUsage
+    estimated_loading_usage(
+        const std::vector<milvus::cachinglayer::cid_t>& cids) const override;
     const std::string&
     key() const override;
     std::vector<std::pair<milvus::cachinglayer::cid_t,
-                          std::unique_ptr<milvus::index::IndexBase>>>
+                          std::unique_ptr<milvus::index::IIndexReaderBase>>>
     get_cells(milvus::OpContext* ctx,
               const std::vector<milvus::cachinglayer::cid_t>& cids) override;
-    Meta*
+    milvus::cachinglayer::Meta*
     meta() override;
 
     int64_t
@@ -50,9 +66,7 @@ class SealedIndexTranslator
         const std::vector<milvus::cachinglayer::cid_t>& cids) const override {
         // if index data supports lazy load internally, cell storage size becomes 0
         // currently only vector index is possible to support lazy load
-        if (IsVectorDataType(index_load_info_.field_type) &&
-            knowhere::IndexFactory::Instance().FeatureCheck(
-                index_info_.index_type, knowhere::feature::LAZY_LOAD)) {
+        if (IsVectorDataType(index_load_info_.field_type) && lazy_load_) {
             return 0;
         }
         constexpr int64_t MIN_STORAGE_BYTES = 1 * 1024 * 1024;
@@ -60,11 +74,6 @@ class SealedIndexTranslator
     }
 
  private:
-    LoadResourceRequest
-    EstimateLoadResource(
-        std::optional<milvus::storage::EntryStreamLoadInfo>* stream_load_info,
-        bool* use_shared_memory_overhead_group) const;
-
     struct IndexLoadInfo {
         bool enable_mmap;
         std::string mmap_dir_path;
@@ -84,13 +93,19 @@ class SealedIndexTranslator
         std::optional<LoadResourceRequest> load_resource_request;
     };
 
-    milvus::index::CreateIndexInfo index_info_;
+    IndexType index_type_;
     milvus::tracer::TraceContext ctx_;
     milvus::storage::FileManagerContext file_manager_context_;
     Config config_;
+    storage::VectorDataViewScope vector_data_view_scope_;
+    milvus::index::IndexFamily source_family_;
     std::string index_key_;
     IndexLoadInfo index_load_info_;
     LoadResourceRequest load_resource_request_{};
+    cachinglayer::ResourceUsage shared_overhead_;
+    // Consumed by the first get_cells attempt; never retained across eviction.
+    std::shared_ptr<storage::V1RemoteSource> prepared_legacy_source_;
+    bool lazy_load_{false};
     milvus::cachinglayer::Meta meta_;
 };
 }  // namespace milvus::segcore::storagev1translator

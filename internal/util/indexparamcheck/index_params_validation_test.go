@@ -27,6 +27,7 @@ import (
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/metric"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 )
 
@@ -166,6 +167,54 @@ func TestExpandIndexParams(t *testing.T) {
 	})
 }
 
+func TestResolveAutoIndexParams(t *testing.T) {
+	autoIndexConfig := map[string]string{
+		common.IndexTypeKey:  "HNSW",
+		common.MetricTypeKey: "IP",
+		"M":                  "30",
+	}
+
+	t.Run("use defaults", func(t *testing.T) {
+		resolvedAutoIndexParams, resolvedUserParams, metricSpecified, err :=
+			ResolveAutoIndexParams(map[string]string{}, autoIndexConfig)
+		assert.NoError(t, err)
+		assert.False(t, metricSpecified)
+		assert.Equal(t, autoIndexConfig, resolvedAutoIndexParams)
+		assert.ElementsMatch(t, []*commonpb.KeyValuePair{
+			{Key: common.IndexTypeKey, Value: common.AutoIndexName},
+			{Key: common.MetricTypeKey, Value: "IP"},
+		}, resolvedUserParams)
+	})
+
+	t.Run("overlay supported user params", func(t *testing.T) {
+		userParams := map[string]string{
+			common.IndexTypeKey:     common.AutoIndexName,
+			common.MetricTypeKey:    "L2",
+			common.MRLDimKey:        "1024",
+			common.WithMRLRefineKey: "true",
+		}
+		resolvedAutoIndexParams, resolvedUserParams, metricSpecified, err :=
+			ResolveAutoIndexParams(userParams, autoIndexConfig)
+		assert.NoError(t, err)
+		assert.True(t, metricSpecified)
+		assert.Equal(t, "HNSW", resolvedAutoIndexParams[common.IndexTypeKey])
+		assert.Equal(t, "L2", resolvedAutoIndexParams[common.MetricTypeKey])
+		assert.Equal(t, "1024", resolvedAutoIndexParams[common.MRLDimKey])
+		assert.Equal(t, "true", resolvedAutoIndexParams[common.WithMRLRefineKey])
+		assert.ElementsMatch(t, []*commonpb.KeyValuePair{
+			{Key: common.IndexTypeKey, Value: common.AutoIndexName},
+			{Key: common.MetricTypeKey, Value: "L2"},
+			{Key: common.MRLDimKey, Value: "1024"},
+			{Key: common.WithMRLRefineKey, Value: "true"},
+		}, resolvedUserParams)
+	})
+
+	t.Run("reject unsupported user param", func(t *testing.T) {
+		_, _, _, err := ResolveAutoIndexParams(map[string]string{"nlist": "1024"}, autoIndexConfig)
+		assert.ErrorContains(t, err, "only metric type can be passed when use AutoIndex")
+	})
+}
+
 func TestValidateFieldIndexParams(t *testing.T) {
 	paramtable.Init()
 
@@ -180,6 +229,14 @@ func TestValidateFieldIndexParams(t *testing.T) {
 		DataType: schemapb.DataType_BinaryVector,
 		TypeParams: []*commonpb.KeyValuePair{
 			{Key: common.DimKey, Value: "512"},
+		},
+	}
+	denseField := &schemapb.FieldSchema{
+		FieldID:  103,
+		Name:     "dense",
+		DataType: schemapb.DataType_FloatVector,
+		TypeParams: []*commonpb.KeyValuePair{
+			{Key: common.DimKey, Value: "128"},
 		},
 	}
 
@@ -275,6 +332,98 @@ func TestValidateFieldIndexParams(t *testing.T) {
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "exceeds limit")
 	})
+
+	t.Run("mrl validates base index at prefix dimension", func(t *testing.T) {
+		params := map[string]string{
+			common.IndexTypeKey:     "FLAT",
+			common.MetricTypeKey:    metric.COSINE,
+			common.MRLDimKey:        "32",
+			common.WithMRLRefineKey: "true",
+		}
+		assert.NoError(t, ValidateFieldIndexParams(denseField, params))
+		assert.Equal(t, "128", params[common.DimKey])
+	})
+
+	t.Run("mrl refine flag is normalized", func(t *testing.T) {
+		params := map[string]string{
+			common.IndexTypeKey:     "FLAT",
+			common.MetricTypeKey:    metric.L2,
+			common.MRLDimKey:        "32",
+			common.WithMRLRefineKey: "True",
+		}
+		assert.NoError(t, ValidateFieldIndexParams(denseField, params))
+		assert.Equal(t, "true", params[common.WithMRLRefineKey])
+	})
+
+	for name, values := range map[string]map[string]string{
+		"invalid prefix": {
+			common.MRLDimKey: "128",
+		},
+		"refine without prefix": {
+			common.WithMRLRefineKey: "true",
+		},
+		"invalid refine value": {
+			common.MRLDimKey:        "32",
+			common.WithMRLRefineKey: "sometimes",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			params := map[string]string{
+				common.IndexTypeKey:  "FLAT",
+				common.MetricTypeKey: metric.L2,
+			}
+			for key, value := range values {
+				params[key] = value
+			}
+			assert.Error(t, ValidateFieldIndexParams(denseField, params))
+		})
+	}
+
+	t.Run("mrl rejects unsupported vector field", func(t *testing.T) {
+		params := map[string]string{
+			common.IndexTypeKey:  "MINHASH_LSH",
+			common.MetricTypeKey: "MHJACCARD",
+			common.MRLDimKey:     "32",
+		}
+		assert.Error(t, ValidateFieldIndexParams(binaryField, params))
+	})
+}
+
+func TestElementNullableArrayOfVectorMetrics(t *testing.T) {
+	paramtable.Init()
+	scalar := &schemapb.FieldSchema{
+		Name: "scores", DataType: schemapb.DataType_Array,
+		ElementType: schemapb.DataType_Int64, ElementNullable: true,
+	}
+	assert.ErrorContains(t, ValidateFieldIndexParams(scalar, map[string]string{common.IndexTypeKey: IndexINVERTED}),
+		"indexing element-nullable ARRAY field scores is not supported yet")
+
+	field := &schemapb.FieldSchema{
+		Name: "vectors", DataType: schemapb.DataType_ArrayOfVector,
+		ElementType: schemapb.DataType_FloatVector, ElementNullable: true,
+	}
+	for _, metricType := range EmbListMetrics {
+		err := ValidateArrayOfVectorMetricType(field.GetElementType(), field.GetElementNullable(), metricType)
+		assert.ErrorContains(t, err, "only support element-level metrics")
+		err = ValidateFieldIndexParams(field, map[string]string{common.IndexTypeKey: "HNSW", common.MetricTypeKey: metricType})
+		assert.ErrorContains(t, err, "only support element-level metrics")
+	}
+	for _, metricType := range []string{"COSINE", "L2", "IP"} {
+		field := &schemapb.FieldSchema{
+			Name: "vectors", DataType: schemapb.DataType_ArrayOfVector,
+			ElementType: schemapb.DataType_FloatVector, ElementNullable: true,
+			TypeParams: []*commonpb.KeyValuePair{{Key: common.DimKey, Value: "8"}},
+		}
+		params := map[string]string{
+			common.IndexTypeKey: "HNSW", common.MetricTypeKey: metricType,
+			"M": "16", "efConstruction": "64",
+		}
+		assert.NoError(t, ValidateFieldIndexParams(field, params), metricType)
+	}
+	err := ValidateFieldIndexParams(field, map[string]string{common.IndexTypeKey: "HNSW", common.MetricTypeKey: "UNKNOWN"})
+	assert.ErrorContains(t, err, "does not support metric type")
+	assert.NoError(t, ValidateArrayOfVectorMetricType(field.GetElementType(), true, "COSINE"))
+	assert.NoError(t, ValidateArrayOfVectorMetricType(field.GetElementType(), false, "MAX_SIM_COSINE"))
 }
 
 func TestValidateIndexName(t *testing.T) {
@@ -344,6 +493,20 @@ func TestPrepareFunctionOutputIndexParams(t *testing.T) {
 		assert.Equal(t, "1.2", params["bm25_k1"])
 		assert.Equal(t, "0.75", params["bm25_b"])
 		assert.Equal(t, "100", params["bm25_avgdl"])
+	})
+
+	t.Run("BM25 function uses metric-specific sparse config", func(t *testing.T) {
+		cfg := &paramtable.Get().AutoIndexConfig
+		err := paramtable.Get().Save(cfg.SparseBM25IndexParams.Key,
+			`{"index_type": "SPARSE_INVERTED_INDEX", "metric_type": "BM25", "drop_ratio_build": 0.3}`)
+		assert.NoError(t, err)
+		defer paramtable.Get().Reset(cfg.SparseBM25IndexParams.Key)
+
+		params, resolved, err := PrepareFunctionOutputIndexParams(schemapb.FunctionType_BM25, sparseField, nil, nil)
+		assert.NoError(t, err)
+		assert.True(t, resolved)
+		assert.Equal(t, "BM25", params[common.MetricTypeKey])
+		assert.Equal(t, "0.3", params["drop_ratio_build"])
 	})
 
 	t.Run("AUTOINDEX with metric resolves", func(t *testing.T) {
@@ -496,4 +659,35 @@ func TestPrepareFunctionOutputIndexParams(t *testing.T) {
 		})
 		assert.Error(t, err)
 	})
+}
+
+func TestGetSparseAutoIndexParams(t *testing.T) {
+	paramtable.Init()
+	cfg := &paramtable.Get().AutoIndexConfig
+	assert.NotPanics(t, CheckAutoIndexConfig)
+	t.Cleanup(func() {
+		paramtable.Get().Reset(cfg.SparseIndexParams.Key)
+		paramtable.Get().Reset(cfg.SparseIPIndexParams.Key)
+		paramtable.Get().Reset(cfg.SparseBM25IndexParams.Key)
+	})
+
+	assert.NoError(t, paramtable.Get().Save(cfg.SparseIPIndexParams.Key,
+		`{"index_type": "SPARSE_INVERTED_INDEX", "metric_type": "IP", "drop_ratio_build": 0.1}`))
+	assert.NoError(t, paramtable.Get().Save(cfg.SparseBM25IndexParams.Key,
+		`{"index_type": "SPARSE_INVERTED_INDEX", "metric_type": "BM25", "drop_ratio_build": 0.3}`))
+	assert.Equal(t, "0.1", GetSparseAutoIndexParams(metric.IP, schemapb.FunctionType_Unknown)["drop_ratio_build"])
+	assert.Equal(t, "0.3", GetSparseAutoIndexParams("", schemapb.FunctionType_BM25)["drop_ratio_build"])
+
+	assert.NoError(t, paramtable.Get().Reset(cfg.SparseIPIndexParams.Key))
+	assert.NoError(t, paramtable.Get().Reset(cfg.SparseBM25IndexParams.Key))
+	assert.NoError(t, paramtable.Get().Save(cfg.SparseIndexParams.Key,
+		`{"index_type": "SPARSE_WAND", "drop_ratio_build": 0.2}`))
+	ipParams := GetSparseAutoIndexParams(metric.IP, schemapb.FunctionType_Unknown)
+	bm25Params := GetSparseAutoIndexParams("", schemapb.FunctionType_BM25)
+	assert.Equal(t, "SPARSE_WAND", ipParams[common.IndexTypeKey])
+	assert.Equal(t, "0.2", ipParams["drop_ratio_build"])
+	assert.Equal(t, metric.IP, ipParams[common.MetricTypeKey])
+	assert.Equal(t, "SPARSE_WAND", bm25Params[common.IndexTypeKey])
+	assert.Equal(t, "0.2", bm25Params["drop_ratio_build"])
+	assert.Equal(t, metric.BM25, bm25Params[common.MetricTypeKey])
 }

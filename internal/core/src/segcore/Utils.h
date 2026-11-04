@@ -11,7 +11,9 @@
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
+#include <functional>
 #include <cstdlib>
 #include <optional>
 #include <string>
@@ -21,12 +23,14 @@
 #include "common/QueryResult.h"
 #include "common/type_c.h"
 #include "common/Types.h"
-#include "index/Index.h"
 #include "cachinglayer/Utils.h"
 #include "segcore/ConcurrentVector.h"
 #include "segcore/Types.h"
 #include "common/Consts.h"
+#include "index/contracts/query/IIndexReaderBase.h"
+#include "index/Meta.h"
 #include "segcore/SegmentInterface.h"
+#include "storage/artifact/LoadOptions.h"
 
 namespace milvus::segcore {
 
@@ -55,6 +59,13 @@ GetRawDataSizeOfDataArray(const DataArray* data,
 // modify bulk script implement to make process more clear
 std::unique_ptr<DataArray>
 CreateEmptyScalarDataArray(int64_t count, const FieldMeta& field_meta);
+
+std::unique_ptr<DataArray>
+CreateNullStructSubFieldDataArray(
+    const FieldMeta& field_meta,
+    const int32_t* lengths,
+    int64_t count,
+    const std::function<bool(int64_t)>& row_valid);
 
 void
 SetUpScalarFieldData(milvus::proto::schema::ScalarField*& scalar_array,
@@ -149,7 +160,7 @@ MergeDataArray(std::vector<MergeBase>& merge_bases,
                const FieldMeta& field_meta);
 
 std::unique_ptr<DataArray>
-ReverseDataFromIndex(const index::IndexBase* index,
+ReverseDataFromIndex(const index::IIndexReaderBase* index,
                      const int64_t* seg_offsets,
                      int64_t count,
                      const FieldMeta& field_meta);
@@ -192,10 +203,25 @@ getCacheWarmupPolicy(const std::string& warmup_policy,
 milvus::cachinglayer::CellDataType
 getCellDataType(bool is_vector, bool is_index);
 
+bool
+CanLazyCreateSealedIndexSlot(const LoadIndexInfo& load_index_info);
+
+void
+PrepareLazySealedIndexSlot(
+    LoadIndexInfo& load_index_info,
+    storage::VectorDataViewScope vector_data_view_scope = {});
+
+IndexRegistration
+MakeSealedIndexRegistration(const LoadIndexInfo& info);
+
+IndexCapabilityEntry
+MakeSealedIndexCapability(const LoadIndexInfo& info);
+
 void
 LoadIndexData(milvus::tracer::TraceContext& ctx,
               milvus::segcore::LoadIndexInfo* load_index_info,
-              milvus::OpContext* op_ctx = nullptr);
+              milvus::OpContext* op_ctx = nullptr,
+              storage::VectorDataViewScope vector_data_view_scope = {});
 
 /**
  * Convert Milvus timestamp to physical time in milliseconds.
@@ -275,13 +301,13 @@ GetEffectiveSearchTopk(const SearchInfo& search_info) {
                     lower_bound);
 }
 
-// SortEqualScoresByPks normalizes the in-segment ordering by sorting
-// equal-score runs by PK ASC, in place. The C++ search engine returns rows in
-// score DESC order but with undefined PK order within equal-score runs; the
+// SortEqualScoresByPks normalizes the in-segment ordering by sorting runs of
+// exactly equal scores by PK ASC, in place. The C++ search engine returns rows
+// in score DESC order but with undefined PK order within equal-score runs; the
 // Go reduce path requires a deterministic order so PK dedup picks the same
-// row across runs. Operates on seg_offsets_, distances_, primary_keys_, and
-// (if present) element_indices_ and composite_group_by_values_, using an in-place
-// cyclic permutation.
+// row across runs. Permutes primary_keys_, seg_offsets_, and (if present)
+// element_indices_ and composite_group_by_values_ using in-place cycles.
+// distances_ remain unchanged because each run contains only equal scores.
 void
 SortEqualScoresByPks(SearchResult* search_result);
 

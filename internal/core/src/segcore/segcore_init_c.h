@@ -60,6 +60,10 @@ SegcoreSetNprobe(const int64_t);
 CStatus
 SegcoreSetDenseVectorInterminIndexType(const char*);
 
+CStatus
+SegcoreSetSparseInterimIndexAlgorithms(const char* ip_algo,
+                                       const char* bm25_algo);
+
 void
 SegcoreSetSubDim(const int64_t);
 
@@ -91,6 +95,9 @@ SegcoreSetSimdType(const char*);
 void
 SegcoreEnableKnowhereScoreConsistency();
 
+CStatus
+SegcoreSetMRLRefineRatio(const float value);
+
 void
 SegcoreSetKnowhereBuildThreadPoolNum(const uint32_t num_threads);
 
@@ -116,10 +123,13 @@ void
 SegcoreSetPreferFieldDataWhenIndexHasRawData(const bool value);
 
 void
-SegcoreSetTakeForOutputResultCountLimit(const int64_t value);
+SegcoreSetLazyIndexSlotEnabled(const bool value);
 
-int64_t
-SegcoreGetTakeForOutputResultCountLimit();
+void
+SegcoreSetLazyColumnGroupEnabled(const bool value);
+
+bool
+SegcoreGetLazyColumnGroupEnabled();
 
 void
 SegcoreCloseGlog();

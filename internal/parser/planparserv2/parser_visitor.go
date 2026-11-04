@@ -11,6 +11,7 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	parser "github.com/milvus-io/milvus/internal/parser/planparserv2/generated"
+	"github.com/milvus-io/milvus/internal/parser/planparserv2/rewriter"
 	"github.com/milvus-io/milvus/pkg/v3/proto/planpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/timestamptz"
@@ -23,6 +24,13 @@ type ParserVisitorArgs struct {
 	// hybrid sub-request and every scorer filter share one preflight budget and
 	// one validation cache. Nil means single-expression scope.
 	MembershipBudget *MembershipPreflightBudget
+	// OnParsedExpr, when set, sees every expression this parse produces --
+	// the main predicate and each scorer filter -- after template values are
+	// filled in and before the rewriter runs. The rewriter changes the
+	// operators (a one-value IN becomes ==, an OR of equalities becomes IN,
+	// "arr == []" becomes array_length), so a feature count taken from the
+	// final plan would describe the rewriter's choices, not the user's.
+	OnParsedExpr func(*planpb.Expr)
 }
 
 // int64OverflowError is a special error type used to handle the case where
@@ -308,7 +316,39 @@ func checkDirectComparisonBinaryField(columnInfo *planpb.ColumnInfo) error {
 	if typeutil.IsArrayType(columnInfo.GetDataType()) && len(columnInfo.GetNestedPath()) == 0 && !columnInfo.GetIsElementLevel() {
 		return merr.WrapErrQueryPlanMsg("can not comparisons array fields directly")
 	}
+	if isNestedArrayElement(columnInfo) {
+		return errScalarOpOnNestedArrayElement()
+	}
 	return nil
+}
+
+// isNestedArrayElement reports whether columnInfo addresses one element of a
+// nested Array column, such as struct_array[0][sub] or $[sub] on an Array<T>
+// struct sub-field. That element is an Array<T>, not a scalar.
+func isNestedArrayElement(columnInfo *planpb.ColumnInfo) bool {
+	return typeutil.IsArrayType(columnInfo.GetDataType()) &&
+		columnInfo.GetElementType() == schemapb.DataType_Array &&
+		(len(columnInfo.GetNestedPath()) != 0 || columnInfo.GetIsElementLevel())
+}
+
+func errScalarOpOnNestedArrayElement() error {
+	return merr.WrapErrQueryPlanMsg(
+		"scalar operations are not supported on an element of a nested array field because the element is itself an array")
+}
+
+// isScalarArrayElement reports whether columnInfo addresses one element of a
+// single-level Array column, such as ArrayField[0] or struct_array[0][sub] on
+// a scalar struct sub-field. That element is a scalar, not an array.
+func isScalarArrayElement(columnInfo *planpb.ColumnInfo) bool {
+	return typeutil.IsArrayType(columnInfo.GetDataType()) &&
+		columnInfo.GetElementType() != schemapb.DataType_Array &&
+		len(columnInfo.GetNestedPath()) != 0 && !columnInfo.GetIsElementLevel()
+}
+
+func errArrayFuncOnScalarArrayElement(funcName, operand string) error {
+	return merr.WrapErrQueryPlanMsg(
+		"%s requires an array operand, but %s is a single array element, not an array",
+		funcName, operand)
 }
 
 // contextualizeEmptyArrayLiteral assigns the element type of a whole ARRAY
@@ -527,6 +567,9 @@ func (v *ParserVisitor) VisitEquality(ctx *parser.EqualityContext) interface{} {
 	}
 
 	leftExpr, rightExpr := getExpr(left), getExpr(right)
+	if ret, handled := v.visitNestedArrayEquality(ctx, leftExpr, rightExpr); handled {
+		return ret
+	}
 	contextualizeEmptyArrayLiteral(leftExpr, rightExpr)
 	contextualizeEmptyArrayLiteral(rightExpr, leftExpr)
 
@@ -560,6 +603,70 @@ func (v *ParserVisitor) VisitEquality(ctx *parser.EqualityContext) interface{} {
 		expr:     expr,
 		dataType: schemapb.DataType_Bool,
 	}
+}
+
+// visitNestedArrayEquality handles ==/!= on a nested Array column. An element
+// struct_array[i][sub] of an Array<T> struct sub-field is an Array<T> value and
+// compares with an array literal like a single-level Array field. A whole
+// nested Array column cannot be compared. Other operands are not handled.
+func (v *ParserVisitor) visitNestedArrayEquality(ctx *parser.EqualityContext, leftExpr, rightExpr *ExprWithType) (interface{}, bool) {
+	if leftExpr == nil || rightExpr == nil {
+		return nil, false
+	}
+	columnExpr, otherExpr := leftExpr, rightExpr
+	if columnInfo := toColumnInfo(columnExpr); columnInfo == nil || columnInfo.GetElementType() != schemapb.DataType_Array {
+		columnExpr, otherExpr = rightExpr, leftExpr
+	}
+	columnInfo := toColumnInfo(columnExpr)
+	if columnInfo == nil || !typeutil.IsArrayType(columnInfo.GetDataType()) ||
+		columnInfo.GetElementType() != schemapb.DataType_Array || columnInfo.GetIsElementLevel() {
+		return nil, false
+	}
+	if len(columnInfo.GetNestedPath()) == 0 {
+		return merr.WrapErrQueryPlanMsg(
+			"== and != are not supported on nested array field, only single-level array fields can be compared with an array literal: %s",
+			ctx.GetText()), true
+	}
+
+	leafType, ok, err := v.structIndexArrayLeafType(columnInfo)
+	if err != nil {
+		return err, true
+	}
+	if !ok {
+		return nil, false
+	}
+	valueExpr := otherExpr.expr.GetValueExpr()
+	if isTemplateExpr(valueExpr) {
+		return merr.WrapErrQueryPlanMsg(
+			"template values are not supported when comparing an element of a nested array struct sub-field, use an array literal: %s",
+			ctx.GetText()), true
+	}
+	if valueExpr == nil || !IsArray(valueExpr.GetValue()) {
+		return merr.WrapErrQueryPlanMsg(
+			"an element of a nested array struct sub-field can only be compared with an array literal: %s",
+			ctx.GetText()), true
+	}
+
+	columnInfo.ElementType = leafType
+	if array := valueExpr.GetValue().GetArrayVal(); len(array.GetArray()) == 0 && array.GetElementType() == schemapb.DataType_None {
+		array.ElementType = leafType
+	}
+	if !canBeCompared(columnExpr, otherExpr) {
+		return merr.WrapErrQueryPlanMsg("comparisons between %s and %s are not supported",
+			getDataType(columnExpr), getDataType(otherExpr)), true
+	}
+	return &ExprWithType{
+		expr: &planpb.Expr{
+			Expr: &planpb.Expr_UnaryRangeExpr{
+				UnaryRangeExpr: &planpb.UnaryRangeExpr{
+					ColumnInfo: columnInfo,
+					Op:         cmpOpMap[ctx.GetOp().GetTokenType()],
+					Value:      valueExpr.GetValue(),
+				},
+			},
+		},
+		dataType: schemapb.DataType_Bool,
+	}, true
 }
 
 // VisitRelational translates expr to range/compare plan.
@@ -965,7 +1072,7 @@ func (v *ParserVisitor) parseTextMatchOperand(identifier string, queryExpr parse
 }
 
 func (v *ParserVisitor) VisitTextMatch(ctx *parser.TextMatchContext) interface{} {
-	identifier := ctx.Identifier().GetText()
+	identifier := ctx.FieldName().GetText()
 	columnInfo, value, placeholder, isTemplate, err := v.parseTextMatchOperand(
 		identifier, ctx.Expr(), "text match", "text_match query")
 	if err != nil {
@@ -1004,7 +1111,7 @@ func (v *ParserVisitor) VisitTextMatch(ctx *parser.TextMatchContext) interface{}
 }
 
 func (v *ParserVisitor) VisitTextMatchFuzzy(ctx *parser.TextMatchFuzzyContext) interface{} {
-	identifier := ctx.Identifier(0).GetText()
+	identifier := ctx.FieldName().GetText()
 	columnInfo, value, placeholder, isTemplate, err := v.parseTextMatchOperand(
 		identifier, ctx.Expr(), "text match fuzzy", "text_match_fuzzy query")
 	if err != nil {
@@ -1014,7 +1121,7 @@ func (v *ParserVisitor) VisitTextMatchFuzzy(ctx *parser.TextMatchFuzzyContext) i
 	// The option name is a soft keyword (a plain identifier) so that a scalar
 	// field literally named "max_edit_distance" is still usable elsewhere in a
 	// filter; only accept the expected option name here.
-	optionName := ctx.Identifier(1).GetText()
+	optionName := ctx.Identifier().GetText()
 	if !strings.EqualFold(optionName, "max_edit_distance") {
 		return merr.WrapErrParameterInvalidMsg(
 			"invalid option %q for text_match_fuzzy, expected max_edit_distance", optionName)
@@ -1068,7 +1175,7 @@ func (v *ParserVisitor) VisitTextMatchOption(ctx *parser.TextMatchOptionContext)
 }
 
 func (v *ParserVisitor) VisitPhraseMatch(ctx *parser.PhraseMatchContext) interface{} {
-	identifier := ctx.Identifier().GetText()
+	identifier := ctx.FieldName().GetText()
 	columnInfo, value, placeholder, isTemplate, err := v.parseTextMatchOperand(
 		identifier, ctx.Expr(0), "phrase match", "phrase_match query")
 	if err != nil {
@@ -1157,6 +1264,18 @@ func isTermExprTargetSupported(dataType schemapb.DataType) bool {
 
 // VisitTerm translates expr to term plan.
 func (v *ParserVisitor) VisitTerm(ctx *parser.TermContext) interface{} {
+	// A bracketed left-hand side of two or more plain fields, e.g.
+	// `[a, b] in [[1,2],[3,4]]`, is a correlated multi-column tuple IN, not a
+	// single-column term: dispatch to tuple_term_filter.go's builder instead
+	// of falling into the single-column path below, whose generic Accept(v)
+	// would route through VisitArray and reject every column reference as
+	// "not a generic value". A non-identifier bracketed LHS (e.g. `[1, 2] in
+	// [...]`) is intentionally left to fall through unchanged, so it still
+	// hits today's existing error path.
+	if lhsArray, ok := ctx.Expr(0).(*parser.ArrayContext); ok && isTupleTermLHS(lhsArray) {
+		return v.buildTupleTermExpr(ctx, lhsArray)
+	}
+
 	child := ctx.Expr(0).Accept(v)
 	if err := getError(child); err != nil {
 		return err
@@ -1172,6 +1291,9 @@ func (v *ParserVisitor) VisitTerm(ctx *parser.TermContext) interface{} {
 		return merr.WrapErrParameterInvalidMsg("'term' can only be used on single field, but got: %s", ctx.Expr(0).GetText())
 	}
 
+	if isNestedArrayElement(columnInfo) {
+		return errScalarOpOnNestedArrayElement()
+	}
 	dataType := columnInfo.GetDataType()
 	// Use element type for IN operation in two cases:
 	// 1. Array with nested path (e.g., arr[0] IN [1, 2, 3])
@@ -1331,7 +1453,7 @@ func (v *ParserVisitor) getColumnInfoFromStructSubField(tokenText string) (*plan
 
 	// Check if we're inside an ElementFilter context
 	if v.currentStructArrayField == "" {
-		return nil, merr.WrapErrParameterInvalidMsg("$[%s] syntax can only be used inside ElementFilter", fieldName)
+		return nil, merr.WrapErrParameterInvalidMsg("$[%s] syntax can only be used inside ElementFilter or MATCH_*", fieldName)
 	}
 
 	// Construct full field name for struct array field
@@ -1345,11 +1467,6 @@ func (v *ParserVisitor) getColumnInfoFromStructSubField(tokenText string) (*plan
 	// In element-level context, data_type should be the element type
 	elementType := field.GetElementType()
 
-	nullable := field.GetNullable()
-	if structField := v.schema.GetStructArrayFieldFromName(v.currentStructArrayField); structField != nil {
-		nullable = nullable || structField.GetNullable()
-	}
-
 	return &planpb.ColumnInfo{
 		FieldId:         field.FieldID,
 		DataType:        elementType, // Use element type, not storage type
@@ -1358,9 +1475,23 @@ func (v *ParserVisitor) getColumnInfoFromStructSubField(tokenText string) (*plan
 		IsPartitionKey:  field.IsPartitionKey,
 		IsClusteringKey: field.IsClusteringKey,
 		ElementType:     elementType,
-		Nullable:        nullable,
+		Nullable:        v.structSubFieldElementNullable(field),
 		IsElementLevel:  true, // Mark as element-level access
 	}, nil
+}
+
+// structSubFieldElementNullable reports whether an element-level ColumnInfo on
+// the struct sub-field field must keep null semantics: one element of an
+// element_nullable sub-field can be null, and a nullable struct marks its
+// sub-fields nullable. The rewriter folds predicates to constants only on
+// non-nullable columns, and segcore skips the validity data of a non-nullable
+// column in IS NULL.
+func (v *ParserVisitor) structSubFieldElementNullable(field *schemapb.FieldSchema) bool {
+	nullable := field.GetNullable() || field.GetElementNullable()
+	if structField := v.schema.GetStructArrayFieldFromName(v.currentStructArrayField); structField != nil {
+		nullable = nullable || structField.GetNullable()
+	}
+	return nullable
 }
 
 func (v *ParserVisitor) getColumnInfoFromStructIndexField(identifier string) (*planpb.ColumnInfo, error) {
@@ -1394,7 +1525,33 @@ func (v *ParserVisitor) getColumnInfoFromStructIndexField(identifier string) (*p
 	}, nil
 }
 
-func (v *ParserVisitor) getChildColumnInfo(identifier, child, structSubField, structIndexField antlr.TerminalNode) (*planpb.ColumnInfo, error) {
+// structIndexArrayLeafType returns the leaf type T when columnInfo is
+// struct_array[i][sub] on an Array<T> struct sub-field (stored as
+// Array<Array<T>>). That element is used as an Array<T> value.
+func (v *ParserVisitor) structIndexArrayLeafType(columnInfo *planpb.ColumnInfo) (schemapb.DataType, bool, error) {
+	if columnInfo == nil || columnInfo.GetIsElementLevel() ||
+		!typeutil.IsArrayType(columnInfo.GetDataType()) || len(columnInfo.GetNestedPath()) != 1 {
+		return schemapb.DataType_None, false, nil
+	}
+	field, err := v.schema.GetFieldFromID(columnInfo.GetFieldId())
+	if err != nil {
+		return schemapb.DataType_None, false, err
+	}
+	if !typeutil.IsStructSubField(field.GetName()) || !typeutil.IsNestedArrayTypeSchema(field.GetTypeSchema()) {
+		return schemapb.DataType_None, false, nil
+	}
+	leafType, _, depth, err := typeutil.GetArrayLeaf(field.GetTypeSchema())
+	if err != nil {
+		return schemapb.DataType_None, false, err
+	}
+	if depth != 2 || !typeutil.IsPrimitiveType(leafType) {
+		return schemapb.DataType_None, false, merr.WrapErrParameterInvalidMsg(
+			"only an element of an Array<scalar> struct sub-field can be used as an array, got: %s", field.GetName())
+	}
+	return leafType, true, nil
+}
+
+func (v *ParserVisitor) getChildColumnInfo(identifier parser.IFieldNameContext, child, structSubField, structIndexField antlr.TerminalNode) (*planpb.ColumnInfo, error) {
 	if identifier != nil {
 		childExpr, err := v.translateIdentifier(identifier.GetText())
 		if err != nil {
@@ -1439,7 +1596,7 @@ func (v *ParserVisitor) getStructArrayParentColumnInfo(fieldName string) (*planp
 	}, true, nil
 }
 
-func (v *ParserVisitor) getNullExprColumnInfo(identifier, child antlr.TerminalNode) (*planpb.ColumnInfo, error) {
+func (v *ParserVisitor) getNullExprColumnInfo(identifier parser.IFieldNameContext, child antlr.TerminalNode) (*planpb.ColumnInfo, error) {
 	if identifier != nil {
 		// try struct first
 		if columnInfo, ok, err := v.getStructArrayParentColumnInfo(identifier.GetText()); ok || err != nil {
@@ -1447,10 +1604,6 @@ func (v *ParserVisitor) getNullExprColumnInfo(identifier, child antlr.TerminalNo
 		}
 	}
 	return v.getChildColumnInfo(identifier, child, nil, nil)
-}
-
-func isUnsupportedNullExprVectorType(dataType schemapb.DataType) bool {
-	return typeutil.IsVectorType(dataType) && !typeutil.IsVectorArrayType(dataType)
 }
 
 // VisitCall parses the expr to call plan.
@@ -1509,21 +1662,22 @@ func (v *ParserVisitor) VisitMembershipMatchWithOption(ctx *parser.MembershipMat
 	var fieldText string
 	var fieldInfo *planpb.ColumnInfo
 	var err error
-	fieldText = ctx.GetField().GetText()
-	switch ctx.GetField().GetTokenType() {
-	case parser.PlanParserIdentifier, parser.PlanParserMeta:
+	field := ctx.GetField()
+	fieldText = field.GetText()
+	switch {
+	case field.FieldName() != nil || field.Meta() != nil:
 		var fieldExpr *ExprWithType
 		fieldExpr, err = v.translateIdentifier(fieldText)
 		if err == nil {
 			fieldInfo = toColumnInfo(fieldExpr)
 		}
-	case parser.PlanParserJSONIdentifier:
+	case field.JSONIdentifier() != nil:
 		fieldInfo, err = v.getColumnInfoFromJSONIdentifier(fieldText)
-	case parser.PlanParserStructFieldIdentifier:
+	case field.StructFieldIdentifier() != nil:
 		fieldInfo, err = v.getColumnInfoFromStructField(fieldText)
-	case parser.PlanParserStructIndexFieldIdentifier:
+	case field.StructIndexFieldIdentifier() != nil:
 		fieldInfo, err = v.getColumnInfoFromStructIndexField(fieldText)
-	case parser.PlanParserStructSubFieldIdentifier:
+	case field.StructSubFieldIdentifier() != nil:
 		fieldInfo, err = v.getColumnInfoFromStructSubField(fieldText)
 	}
 	if err != nil {
@@ -1549,7 +1703,7 @@ func (v *ParserVisitor) VisitMembershipMatchWithOption(ctx *parser.MembershipMat
 // VisitRange translates expr to range plan.
 func (v *ParserVisitor) VisitRange(ctx *parser.RangeContext) interface{} {
 	columnInfo, err := v.getChildColumnInfo(
-		ctx.Identifier(),
+		ctx.FieldName(),
 		ctx.JSONIdentifier(),
 		ctx.StructSubFieldIdentifier(),
 		ctx.StructIndexFieldIdentifier(),
@@ -1629,7 +1783,7 @@ func (v *ParserVisitor) VisitRange(ctx *parser.RangeContext) interface{} {
 // VisitReverseRange parses the expression like "1 > a > 0".
 func (v *ParserVisitor) VisitReverseRange(ctx *parser.ReverseRangeContext) interface{} {
 	columnInfo, err := v.getChildColumnInfo(
-		ctx.Identifier(),
+		ctx.FieldName(),
 		ctx.JSONIdentifier(),
 		ctx.StructSubFieldIdentifier(),
 		ctx.StructIndexFieldIdentifier(),
@@ -1709,7 +1863,26 @@ func (v *ParserVisitor) VisitReverseRange(ctx *parser.ReverseRangeContext) inter
 
 // VisitUnary unpack the +expr to expr.
 func (v *ParserVisitor) VisitUnary(ctx *parser.UnaryContext) interface{} {
-	child := ctx.Expr().Accept(v)
+	childCtx := ctx.Expr()
+	notCount := 1
+	if ctx.GetOp().GetTokenType() == parser.PlanParserNOT {
+		// Parentheses do not interrupt a NOT chain. Visit its operand once,
+		// then apply parity after the usual validation (even parity must not
+		// make NOT NOT <non-boolean or restricted predicate> valid).
+		for {
+			if parens, ok := childCtx.(*parser.ParensContext); ok {
+				childCtx = parens.Expr()
+				continue
+			}
+			unary, ok := childCtx.(*parser.UnaryContext)
+			if !ok || unary.GetOp().GetTokenType() != parser.PlanParserNOT {
+				break
+			}
+			notCount++
+			childCtx = unary.Expr()
+		}
+	}
+	child := childCtx.Accept(v)
 	if err := getError(child); err != nil {
 		// Special case: handle -9223372036854775808
 		// ANTLR parses -9223372036854775808 as Unary(SUB, Integer(9223372036854775808)).
@@ -1743,6 +1916,9 @@ func (v *ParserVisitor) VisitUnary(ctx *parser.UnaryContext) interface{} {
 			if err != nil {
 				return err
 			}
+			if notCount%2 == 0 {
+				return child
+			}
 			return n
 		case parser.PlanParserBNOT:
 			n, err := BitNot(childValue)
@@ -1775,6 +1951,9 @@ func (v *ParserVisitor) VisitUnary(ctx *parser.UnaryContext) interface{} {
 	case parser.PlanParserNOT:
 		if !canBeExecuted(childExpr) {
 			return merr.WrapErrParameterInvalidMsg("%s op can only be applied on boolean expression", unaryLogicalNameMap[parser.PlanParserNOT])
+		}
+		if notCount%2 == 0 {
+			return childExpr
 		}
 		return &ExprWithType{
 			expr: &planpb.Expr{
@@ -1833,13 +2012,27 @@ func (v *ParserVisitor) VisitUnary(ctx *parser.UnaryContext) interface{} {
 	}
 }
 
+// Logical operands must produce predicate bitmaps. Keep deferred constants
+// executable even if balancing moves them into a non-template subtree, while
+// retaining the other operand for template validation.
+func normalizeLogicalOperand(expr *planpb.Expr) *planpb.Expr {
+	value := expr.GetValueExpr().GetValue()
+	if !IsBool(value) {
+		return expr
+	}
+	if value.GetBoolVal() {
+		return alwaysTrueExpr()
+	}
+	return alwaysFalseExpr()
+}
+
 func newLogicalBinaryExpr(leftExpr, rightExpr *ExprWithType, op planpb.BinaryExpr_BinaryOp) *ExprWithType {
 	return &ExprWithType{
 		expr: &planpb.Expr{
 			Expr: &planpb.Expr_BinaryExpr{
 				BinaryExpr: &planpb.BinaryExpr{
-					Left:  leftExpr.expr,
-					Right: rightExpr.expr,
+					Left:  normalizeLogicalOperand(leftExpr.expr),
+					Right: normalizeLogicalOperand(rightExpr.expr),
 					Op:    op,
 				},
 			},
@@ -1849,14 +2042,139 @@ func newLogicalBinaryExpr(leftExpr, rightExpr *ExprWithType, op planpb.BinaryExp
 	}
 }
 
-// VisitLogicalOr apply logical or to two boolean expressions.
-func (v *ParserVisitor) VisitLogicalOr(ctx *parser.LogicalOrContext) interface{} {
-	left := ctx.Expr(0).Accept(v)
-	if err := getError(left); err != nil {
+// andExistingPredicate attaches an outer document predicate without losing
+// conditions already captured by a terminal wrapper (for example via OR false),
+// and propagates the combined predicate's template state to that wrapper.
+// Keep wrapperTemplate as well: element_filter may have a templated body, and
+// FillExpressionValue must visit both that body and the document predicate.
+func andExistingPredicate(leftExpr *ExprWithType, existing *planpb.Expr, wrapperTemplate bool) (*planpb.Expr, bool) {
+	predicate := leftExpr.expr
+	if existing != nil {
+		predicate = newLogicalBinaryExpr(leftExpr, &ExprWithType{
+			expr:     existing,
+			dataType: schemapb.DataType_Bool,
+		}, planpb.BinaryExpr_LogicalAnd).expr
+	}
+	return predicate, wrapperTemplate || predicate.GetIsTemplate()
+}
+
+// balanceLogicalResult keeps logical chains shallow before template filling,
+// including predicates captured by the terminal random_sample/element_filter.
+// Nested logical expressions have already been balanced by their own visitors.
+// Semantic folding must finish first to preserve validation and wrapper rules.
+func balanceLogicalResult(result interface{}) interface{} {
+	expr := getExpr(result)
+	if expr == nil {
+		return result
+	}
+	switch e := expr.expr.GetExpr().(type) {
+	case *planpb.Expr_RandomSampleExpr:
+		e.RandomSampleExpr.Predicate = rewriter.BalanceLogicalExpr(e.RandomSampleExpr.GetPredicate())
+	case *planpb.Expr_ElementFilterExpr:
+		e.ElementFilterExpr.Predicate = rewriter.BalanceLogicalExpr(e.ElementFilterExpr.GetPredicate())
+	default:
+		expr.expr = rewriter.BalanceLogicalExpr(expr.expr)
+	}
+	return result
+}
+
+// validateLogicalOperands owns the type and wrapper-placement rules for both
+// whole chains and pairwise folds. Validate a whole chain before folding can
+// discard operands, and recheck accumulated results with the same rules.
+// Boolean literals do not move a terminal wrapper before another predicate.
+func validateLogicalOperands(operands []interface{}, op planpb.BinaryExpr_BinaryOp) error {
+	name := "or"
+	if op == planpb.BinaryExpr_LogicalAnd {
+		name = "and"
+	}
+	lastPredicate := -1
+	predicateCount := 0
+	for i, operand := range operands {
+		if err := getError(operand); err != nil {
+			return err
+		}
+		if value := getGenericValue(operand); value != nil {
+			if !IsBool(value) {
+				return merr.WrapErrQueryPlanMsg("'%s' can only be used between boolean expressions", name)
+			}
+			continue
+		}
+		expr := getExpr(operand)
+		if expr == nil || !canBeExecuted(expr) {
+			return merr.WrapErrQueryPlanMsg("'%s' can only be used between boolean expressions", name)
+		}
+		lastPredicate = i
+		predicateCount++
+	}
+	for i, operand := range operands {
+		if getGenericValue(operand) != nil {
+			continue
+		}
+		expr := getExpr(operand)
+		if isRandomSampleExpr(expr) {
+			// Boolean literals may fold an OR back to the sampler (or true).
+			// A real predicate beside it still makes an unsupported OR plan.
+			if op == planpb.BinaryExpr_LogicalOr && predicateCount != 1 {
+				return merr.WrapErrQueryPlanMsg("random sample expression cannot be used in logical or expression")
+			}
+			if i != lastPredicate {
+				return merr.WrapErrQueryPlanMsg("random sample expression can only be the last expression in the logical and expression")
+			}
+		}
+		if isElementFilterExpr(expr) {
+			// Only boolean literals may accompany element_filter under OR:
+			// they can fold away without mixing document and element scopes.
+			// Validate here so ParseExprTemplate callers enforce the same rule.
+			if op == planpb.BinaryExpr_LogicalOr && predicateCount != 1 {
+				return merr.WrapErrQueryPlanMsg("element filter expression cannot be used in logical or expression with other predicates; combine document-level predicates with AND")
+			}
+			if i != lastPredicate {
+				return merr.WrapErrQueryPlanMsg("element filter expression can only be the last expression in the logical %s expression", name)
+			}
+		}
+	}
+	return nil
+}
+
+// foldOrOperands folds an OR chain of two or more already-visited operands
+// into a single expression, preserving the original pairwise short-circuit
+// semantics. Operands are folded left-to-right in source order so combined
+// literals (e.g. text_match merges) keep their original relative order.
+func (v *ParserVisitor) foldOrOperands(operands []interface{}) interface{} {
+	if err := validateLogicalOperands(operands, planpb.BinaryExpr_LogicalOr); err != nil {
 		return err
 	}
-	right := ctx.Expr(1).Accept(v)
-	if err := getError(right); err != nil {
+	if len(operands) == 1 {
+		return operands[0]
+	}
+
+	cur := operands[0]
+	for i := 1; i < len(operands); i++ {
+		cur = v.foldOr2(cur, operands[i])
+	}
+	return balanceLogicalResult(cur)
+}
+
+// foldAndOperands folds visited operands left-to-right, keeping a terminal
+// random_sample/element_filter last and preserving its document predicate.
+func (v *ParserVisitor) foldAndOperands(operands []interface{}) interface{} {
+	if err := validateLogicalOperands(operands, planpb.BinaryExpr_LogicalAnd); err != nil {
+		return err
+	}
+	if len(operands) == 1 {
+		return operands[0]
+	}
+
+	cur := operands[0]
+	for i := 1; i < len(operands); i++ {
+		cur = v.foldAnd2(cur, operands[i])
+	}
+	return balanceLogicalResult(cur)
+}
+
+// foldOr2 folds two operands after checking them with the shared logical rules.
+func (v *ParserVisitor) foldOr2(left, right interface{}) interface{} {
+	if err := validateLogicalOperands([]interface{}{left, right}, planpb.BinaryExpr_LogicalOr); err != nil {
 		return err
 	}
 
@@ -1878,11 +2196,8 @@ func (v *ParserVisitor) VisitLogicalOr(ctx *parser.LogicalOrContext) interface{}
 			boolLiteral = rightValue
 			otherExpr = getExpr(left)
 		}
-		if !IsBool(boolLiteral) {
-			return merr.WrapErrQueryPlanMsg("'or' can only be used between boolean expressions")
-		}
 		if boolLiteral.GetBoolVal() {
-			if otherExpr != nil && canBeExecuted(otherExpr) && otherExpr.expr.GetIsTemplate() {
+			if otherExpr.expr.GetIsTemplate() {
 				return newLogicalBinaryExpr(getExpr(left), getExpr(right), planpb.BinaryExpr_LogicalOr)
 			}
 			// true or expr → always true
@@ -1892,35 +2207,60 @@ func (v *ParserVisitor) VisitLogicalOr(ctx *parser.LogicalOrContext) interface{}
 			}
 		}
 		// false or expr → expr
-		if otherExpr == nil || !canBeExecuted(otherExpr) {
-			return merr.WrapErrQueryPlanMsg("'or' can only be used between boolean expressions")
-		}
 		return otherExpr
 	}
 
 	leftExpr, rightExpr := getExpr(left), getExpr(right)
-	if isRandomSampleExpr(leftExpr) || isRandomSampleExpr(rightExpr) {
-		return merr.WrapErrQueryPlanMsg("random sample expression cannot be used in logical and expression")
-	}
-
-	if isElementFilterExpr(leftExpr) {
-		return merr.WrapErrQueryPlanMsg("element filter expression can only be the last expression in the logical or expression")
-	}
-
-	if !canBeExecuted(leftExpr) || !canBeExecuted(rightExpr) {
-		return merr.WrapErrQueryPlanMsg("'or' can only be used between boolean expressions")
-	}
 	return newLogicalBinaryExpr(leftExpr, rightExpr, planpb.BinaryExpr_LogicalOr)
 }
 
-// VisitLogicalAnd apply logical and to two boolean expressions.
-func (v *ParserVisitor) VisitLogicalAnd(ctx *parser.LogicalAndContext) interface{} {
-	left := ctx.Expr(0).Accept(v)
-	if err := getError(left); err != nil {
-		return err
+// collectLogicalOperands iteratively flattens a same-operator chain, including
+// parentheses, without crossing mixed AND/OR boundaries. Reverse stack pushes
+// preserve source order and avoid recursion through long logical chains.
+func (v *ParserVisitor) collectLogicalOperands(ctx antlr.ParseTree, op planpb.BinaryExpr_BinaryOp) []interface{} {
+	var operands []interface{}
+	stack := []antlr.ParseTree{ctx}
+	for len(stack) > 0 {
+		node := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		var exprs []parser.IExprContext
+		switch n := node.(type) {
+		case *parser.LogicalOrContext:
+			if op == planpb.BinaryExpr_LogicalOr {
+				exprs = n.AllExpr()
+			}
+		case *parser.LogicalAndContext:
+			if op == planpb.BinaryExpr_LogicalAnd {
+				exprs = n.AllExpr()
+			}
+		case *parser.ParensContext:
+			stack = append(stack, n.Expr())
+			continue
+		}
+		if exprs != nil {
+			for i := len(exprs) - 1; i >= 0; i-- {
+				stack = append(stack, exprs[i])
+			}
+			continue
+		}
+		operands = append(operands, node.Accept(v))
 	}
-	right := ctx.Expr(1).Accept(v)
-	if err := getError(right); err != nil {
+	return operands
+}
+
+// VisitLogicalOr applies logical OR to operands collected in source order.
+func (v *ParserVisitor) VisitLogicalOr(ctx *parser.LogicalOrContext) interface{} {
+	return v.foldOrOperands(v.collectLogicalOperands(ctx, planpb.BinaryExpr_LogicalOr))
+}
+
+// VisitLogicalAnd applies logical AND to operands collected in source order.
+func (v *ParserVisitor) VisitLogicalAnd(ctx *parser.LogicalAndContext) interface{} {
+	return v.foldAndOperands(v.collectLogicalOperands(ctx, planpb.BinaryExpr_LogicalAnd))
+}
+
+// foldAnd2 folds two operands after checking them with the shared logical rules.
+func (v *ParserVisitor) foldAnd2(left, right interface{}) interface{} {
+	if err := validateLogicalOperands([]interface{}{left, right}, planpb.BinaryExpr_LogicalAnd); err != nil {
 		return err
 	}
 
@@ -1942,11 +2282,8 @@ func (v *ParserVisitor) VisitLogicalAnd(ctx *parser.LogicalAndContext) interface
 			boolLiteral = rightValue
 			otherExpr = getExpr(left)
 		}
-		if !IsBool(boolLiteral) {
-			return merr.WrapErrQueryPlanMsg("'and' can only be used between boolean expressions")
-		}
 		if !boolLiteral.GetBoolVal() {
-			if otherExpr != nil && canBeExecuted(otherExpr) && otherExpr.expr.GetIsTemplate() {
+			if otherExpr.expr.GetIsTemplate() {
 				return newLogicalBinaryExpr(getExpr(left), getExpr(right), planpb.BinaryExpr_LogicalAnd)
 			}
 			// false and expr → always false
@@ -1956,38 +2293,20 @@ func (v *ParserVisitor) VisitLogicalAnd(ctx *parser.LogicalAndContext) interface
 			}
 		}
 		// true and expr → expr
-		if otherExpr == nil || !canBeExecuted(otherExpr) {
-			return merr.WrapErrQueryPlanMsg("'and' can only be used between boolean expressions")
-		}
 		return otherExpr
 	}
 
 	leftExpr, rightExpr := getExpr(left), getExpr(right)
-	if isRandomSampleExpr(leftExpr) {
-		return merr.WrapErrQueryPlanMsg("random sample expression can only be the last expression in the logical and expression")
-	}
-
-	if isElementFilterExpr(leftExpr) {
-		return merr.WrapErrQueryPlanMsg("element filter expression can only be the last expression in the logical and expression")
-	}
-
-	if !canBeExecuted(leftExpr) || !canBeExecuted(rightExpr) {
-		return merr.WrapErrQueryPlanMsg("'and' can only be used between boolean expressions")
-	}
-
 	if isRandomSampleExpr(rightExpr) {
 		randomSampleExpr := rightExpr.expr.GetRandomSampleExpr()
-		randomSampleExpr.Predicate = leftExpr.expr
+		predicate, isTemplate := andExistingPredicate(leftExpr, randomSampleExpr.GetPredicate(), rightExpr.expr.GetIsTemplate())
+		randomSampleExpr.Predicate = predicate
 		return &ExprWithType{
 			expr: &planpb.Expr{
 				Expr: &planpb.Expr_RandomSampleExpr{
 					RandomSampleExpr: randomSampleExpr,
 				},
-				// The wrapper must carry the predicate's template flag, or the
-				// top-level IsTemplate short-circuit skips FillExpressionValue and
-				// an unfilled placeholder (e.g. a deferred bloom_match) fans out
-				// to QueryNodes. Mirrors the element_filter branch below.
-				IsTemplate: leftExpr.expr.GetIsTemplate() || rightExpr.expr.GetIsTemplate(),
+				IsTemplate: isTemplate,
 			},
 			dataType: schemapb.DataType_Bool,
 		}
@@ -1995,13 +2314,14 @@ func (v *ParserVisitor) VisitLogicalAnd(ctx *parser.LogicalAndContext) interface
 	if isElementFilterExpr(rightExpr) {
 		// Similar to RandomSampleExpr, extract doc-level predicate
 		elementFilterExpr := rightExpr.expr.GetElementFilterExpr()
-		elementFilterExpr.Predicate = leftExpr.expr
+		predicate, isTemplate := andExistingPredicate(leftExpr, elementFilterExpr.GetPredicate(), rightExpr.expr.GetIsTemplate())
+		elementFilterExpr.Predicate = predicate
 		return &ExprWithType{
 			expr: &planpb.Expr{
 				Expr: &planpb.Expr_ElementFilterExpr{
 					ElementFilterExpr: elementFilterExpr,
 				},
-				IsTemplate: leftExpr.expr.GetIsTemplate() || rightExpr.expr.GetIsTemplate(),
+				IsTemplate: isTemplate,
 			},
 			dataType: schemapb.DataType_Bool,
 		}
@@ -2441,14 +2761,55 @@ func (v *ParserVisitor) VisitEmptyArray(ctx *parser.EmptyArrayContext) interface
 	}
 }
 
-func (v *ParserVisitor) VisitIsNotNull(ctx *parser.IsNotNullContext) interface{} {
-	column, err := v.getNullExprColumnInfo(ctx.Identifier(), ctx.JSONIdentifier())
+// checkStructSubFieldNullExpr rejects IS NULL / IS NOT NULL on a struct
+// sub-field (struct_array[sub] or struct_array[i][sub]).
+func checkStructSubFieldNullExpr(structField, structIndexField antlr.TerminalNode) error {
+	var identifier string
+	switch {
+	case structField != nil:
+		identifier = structField.GetText()
+	case structIndexField != nil:
+		identifier = structIndexField.GetText()
+	default:
+		return nil
+	}
+	structName, _, _ := strings.Cut(identifier, "[")
+	return merr.WrapErrParameterInvalidMsg(
+		"IS NULL / IS NOT NULL is not supported on struct sub-field %s; it can only be applied to the struct array field %s",
+		identifier, structName)
+}
+
+// visitElementNullExpr builds the element-level NullExpr for $[sub] IS NULL /
+// IS NOT NULL inside MATCH_* or element_filter. It accepts scalar, vector and
+// Array<T> sub-fields; outside an element context $[sub] is rejected.
+func (v *ParserVisitor) visitElementNullExpr(structSubField antlr.TerminalNode, op planpb.NullExpr_NullOp) interface{} {
+	column, err := v.getColumnInfoFromStructSubField(structSubField.GetText())
 	if err != nil {
 		return err
 	}
+	return &ExprWithType{
+		expr: &planpb.Expr{
+			Expr: &planpb.Expr_NullExpr{
+				NullExpr: &planpb.NullExpr{
+					ColumnInfo: column,
+					Op:         op,
+				},
+			},
+		},
+		dataType: schemapb.DataType_Bool,
+	}
+}
 
-	if isUnsupportedNullExprVectorType(column.DataType) {
-		return merr.WrapErrParameterInvalidMsg("IsNull/IsNotNull operations are not supported on vector fields")
+func (v *ParserVisitor) VisitIsNotNull(ctx *parser.IsNotNullContext) interface{} {
+	if err := checkStructSubFieldNullExpr(ctx.StructFieldIdentifier(), ctx.StructIndexFieldIdentifier()); err != nil {
+		return err
+	}
+	if structSubField := ctx.StructSubFieldIdentifier(); structSubField != nil {
+		return v.visitElementNullExpr(structSubField, planpb.NullExpr_IsNotNull)
+	}
+	column, err := v.getNullExprColumnInfo(ctx.FieldName(), ctx.JSONIdentifier())
+	if err != nil {
+		return err
 	}
 
 	if len(column.NestedPath) != 0 {
@@ -2489,13 +2850,15 @@ func (v *ParserVisitor) VisitIsNotNull(ctx *parser.IsNotNullContext) interface{}
 }
 
 func (v *ParserVisitor) VisitIsNull(ctx *parser.IsNullContext) interface{} {
-	column, err := v.getNullExprColumnInfo(ctx.Identifier(), ctx.JSONIdentifier())
-	if err != nil {
+	if err := checkStructSubFieldNullExpr(ctx.StructFieldIdentifier(), ctx.StructIndexFieldIdentifier()); err != nil {
 		return err
 	}
-
-	if isUnsupportedNullExprVectorType(column.DataType) {
-		return merr.WrapErrParameterInvalidMsg("IsNull/IsNotNull operations are not supported on vector fields")
+	if structSubField := ctx.StructSubFieldIdentifier(); structSubField != nil {
+		return v.visitElementNullExpr(structSubField, planpb.NullExpr_IsNull)
+	}
+	column, err := v.getNullExprColumnInfo(ctx.FieldName(), ctx.JSONIdentifier())
+	if err != nil {
+		return err
 	}
 
 	if len(column.NestedPath) != 0 {
@@ -2543,6 +2906,8 @@ func (v *ParserVisitor) VisitIsNull(ctx *parser.IsNullContext) interface{} {
 
 func (v *ParserVisitor) resolveContainsField(
 	field *ExprWithType,
+	funcName string,
+	operand string,
 ) (*planpb.ColumnInfo, error) {
 	columnInfo := toColumnInfo(field)
 	if columnInfo == nil {
@@ -2552,14 +2917,32 @@ func (v *ParserVisitor) resolveContainsField(
 		if !typeutil.IsArrayType(columnInfo.GetDataType()) {
 			return columnInfo, nil
 		}
+		// struct_array[i][sub] on an Array<T> sub-field is one Array<T> value.
+		leafType, ok, err := v.structIndexArrayLeafType(columnInfo)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			columnInfo.ElementType = leafType
+			return columnInfo, nil
+		}
 		fieldSchema, err := v.schema.GetFieldFromID(columnInfo.GetFieldId())
 		if err != nil {
 			return nil, err
 		}
 		if typeutil.IsNestedArrayTypeSchema(fieldSchema.GetTypeSchema()) {
+			if structName, subField, isSub := strings.Cut(fieldSchema.GetName(), "["); isSub && len(columnInfo.GetNestedPath()) == 0 {
+				subField = strings.TrimSuffix(subField, "]")
+				return nil, merr.WrapErrQueryPlanMsg(
+					"%s is not supported on the whole nested array struct sub-field %s; rewrite it as MATCH_ANY(%s, %s($[%s], ...))",
+					funcName, fieldSchema.GetName(), structName, funcName, subField)
+			}
 			return nil, merr.WrapErrQueryPlanMsg(
 				"contains operation is not supported on nested array field: %s",
 				fieldSchema.GetName())
+		}
+		if isScalarArrayElement(columnInfo) {
+			return nil, errArrayFuncOnScalarArrayElement(funcName, operand)
 		}
 		return columnInfo, nil
 	}
@@ -2606,7 +2989,7 @@ func (v *ParserVisitor) VisitJSONContains(ctx *parser.JSONContainsContext) inter
 	}
 
 	fieldExpr := field.(*ExprWithType)
-	columnInfo, err := v.resolveContainsField(fieldExpr)
+	columnInfo, err := v.resolveContainsField(fieldExpr, ctx.GetStart().GetText(), ctx.Expr(0).GetText())
 	if err != nil {
 		return err
 	}
@@ -2661,7 +3044,7 @@ func (v *ParserVisitor) VisitJSONContainsAll(ctx *parser.JSONContainsAllContext)
 	}
 
 	fieldExpr := field.(*ExprWithType)
-	columnInfo, err := v.resolveContainsField(fieldExpr)
+	columnInfo, err := v.resolveContainsField(fieldExpr, ctx.GetStart().GetText(), ctx.Expr(0).GetText())
 	if err != nil {
 		return err
 	}
@@ -2718,7 +3101,7 @@ func (v *ParserVisitor) VisitJSONContainsAny(ctx *parser.JSONContainsAnyContext)
 	}
 
 	fieldExpr := field.(*ExprWithType)
-	columnInfo, err := v.resolveContainsField(fieldExpr)
+	columnInfo, err := v.resolveContainsField(fieldExpr, ctx.GetStart().GetText(), ctx.Expr(0).GetText())
 	if err != nil {
 		return err
 	}
@@ -2784,16 +3167,31 @@ func (v *ParserVisitor) VisitArrayLength(ctx *parser.ArrayLengthContext) interfa
 			ElementType: field.GetElementType(),
 			Nullable:    field.GetNullable(),
 		}
+	} else if ctx.StructIndexFieldIdentifier() != nil {
+		// struct_array[i][sub]: only an Array<T> element has a length.
+		columnInfo, err = v.getColumnInfoFromStructIndexField(ctx.StructIndexFieldIdentifier().GetText())
+		if err != nil {
+			return err
+		}
+		leafType, ok, leafErr := v.structIndexArrayLeafType(columnInfo)
+		if leafErr != nil {
+			return leafErr
+		}
+		if !ok {
+			return merr.WrapErrParameterInvalidMsg(
+				"array_length on struct_array[index][sub_field] requires an Array<scalar> struct sub-field, got: %s", ctx.GetText())
+		}
+		columnInfo.ElementType = leafType
 	} else {
-		if ctx.Identifier() != nil {
-			if parentColumnInfo, ok, parentErr := v.getStructArrayParentColumnInfo(ctx.Identifier().GetText()); ok || parentErr != nil {
+		if ctx.FieldName() != nil {
+			if parentColumnInfo, ok, parentErr := v.getStructArrayParentColumnInfo(ctx.FieldName().GetText()); ok || parentErr != nil {
 				columnInfo = parentColumnInfo
 				err = parentErr
 			}
 		}
 		if columnInfo == nil && err == nil {
 			columnInfo, err = v.getChildColumnInfo(
-				ctx.Identifier(),
+				ctx.FieldName(),
 				ctx.JSONIdentifier(),
 				ctx.StructSubFieldIdentifier(),
 				nil,
@@ -2801,6 +3199,9 @@ func (v *ParserVisitor) VisitArrayLength(ctx *parser.ArrayLengthContext) interfa
 		}
 		if err != nil {
 			return err
+		}
+		if ctx.JSONIdentifier() != nil && isScalarArrayElement(columnInfo) {
+			return errArrayFuncOnScalarArrayElement(ctx.GetStart().GetText(), ctx.JSONIdentifier().GetText())
 		}
 	}
 	if columnInfo == nil ||
@@ -2839,7 +3240,7 @@ func (v *ParserVisitor) VisitTemplateVariable(ctx *parser.TemplateVariableContex
 			Expr: &planpb.Expr_ValueExpr{
 				ValueExpr: &planpb.ValueExpr{
 					Value:                nil,
-					TemplateVariableName: ctx.Identifier().GetText(),
+					TemplateVariableName: ctx.FieldName().GetText(),
 				},
 			},
 			IsTemplate: true,
@@ -2848,7 +3249,7 @@ func (v *ParserVisitor) VisitTemplateVariable(ctx *parser.TemplateVariableContex
 }
 
 func (v *ParserVisitor) VisitSpatialBinary(ctx *parser.SpatialBinaryContext) interface{} {
-	childExpr, err := v.translateIdentifier(ctx.Identifier().GetText())
+	childExpr, err := v.translateIdentifier(ctx.FieldName().GetText())
 	if err != nil {
 		return err
 	}
@@ -2908,7 +3309,7 @@ func (v *ParserVisitor) VisitSpatialBinary(ctx *parser.SpatialBinaryContext) int
 }
 
 func (v *ParserVisitor) VisitSTIsValid(ctx *parser.STIsValidContext) interface{} {
-	childExpr, err := v.translateIdentifier(ctx.Identifier().GetText())
+	childExpr, err := v.translateIdentifier(ctx.FieldName().GetText())
 	if err != nil {
 		return err
 	}
@@ -2934,7 +3335,7 @@ func (v *ParserVisitor) VisitSTIsValid(ctx *parser.STIsValidContext) interface{}
 
 func (v *ParserVisitor) VisitSTDWithin(ctx *parser.STDWithinContext) interface{} {
 	// Process the geometry field identifier
-	childExpr, err := v.translateIdentifier(ctx.Identifier().GetText())
+	childExpr, err := v.translateIdentifier(ctx.FieldName().GetText())
 	if err != nil {
 		return err
 	}
@@ -3018,8 +3419,8 @@ func (v *ParserVisitor) VisitSTDWithin(ctx *parser.STDWithinContext) interface{}
 //  2. Slow Path: If an INTERVAL exists, it generates a TimestamptzArithCompareExpr
 //     for specialized arithmetic evaluation.
 func (v *ParserVisitor) VisitTimestamptzCompareForward(ctx *parser.TimestamptzCompareForwardContext) interface{} {
-	colExpr, err := v.translateIdentifier(ctx.Identifier().GetText())
-	identifier := ctx.Identifier().Accept(v)
+	colExpr, err := v.translateIdentifier(ctx.FieldName().GetText())
+	identifier := ctx.FieldName().GetText()
 	if err != nil {
 		return merr.WrapErrParameterInvalidMsg("can not translate identifier: %s", identifier)
 	}
@@ -3092,8 +3493,8 @@ func (v *ParserVisitor) VisitTimestamptzCompareForward(ctx *parser.TimestamptzCo
 //  3. Slow Path: For complex expressions involving INTERVAL, it produces a
 //     TimestamptzArithCompareExpr with the reversed operator.
 func (v *ParserVisitor) VisitTimestamptzCompareReverse(ctx *parser.TimestamptzCompareReverseContext) interface{} {
-	colExpr, err := v.translateIdentifier(ctx.Identifier().GetText())
-	identifier := ctx.Identifier().GetText()
+	colExpr, err := v.translateIdentifier(ctx.FieldName().GetText())
+	identifier := ctx.FieldName().GetText()
 	if err != nil {
 		return merr.WrapErrParameterInvalidMsg("can not translate identifier: %s", identifier)
 	}
@@ -3209,7 +3610,7 @@ func (v *ParserVisitor) VisitElementFilter(ctx *parser.ElementFilterContext) int
 	}
 
 	// Get struct array field name (first parameter)
-	arrayFieldName := ctx.Identifier().GetText()
+	arrayFieldName := ctx.FieldName().GetText()
 
 	// Set current context for element expression parsing
 	v.currentStructArrayField = arrayFieldName
@@ -3279,10 +3680,6 @@ func (v *ParserVisitor) VisitStructSubField(ctx *parser.StructSubFieldContext) i
 
 	// In element-level context, use Array as storage type, element type for operations
 	elementType := field.GetElementType()
-	nullable := field.GetNullable()
-	if structField := v.schema.GetStructArrayFieldFromName(v.currentStructArrayField); structField != nil {
-		nullable = nullable || structField.GetNullable()
-	}
 
 	return &ExprWithType{
 		expr: &planpb.Expr{
@@ -3296,7 +3693,7 @@ func (v *ParserVisitor) VisitStructSubField(ctx *parser.StructSubFieldContext) i
 						IsPartitionKey:  field.IsPartitionKey,
 						IsClusteringKey: field.IsClusteringKey,
 						ElementType:     elementType, // Element type for operations
-						Nullable:        nullable,
+						Nullable:        v.structSubFieldElementNullable(field),
 						IsElementLevel:  true, // Mark as element-level access
 					},
 				},
@@ -3372,7 +3769,7 @@ func (v *ParserVisitor) parseMatchExpr(structArrayFieldName string, exprCtx pars
 // VisitMatchSimple handles MATCH_ALL and MATCH_ANY expressions
 // Syntax: MATCH_ALL/MATCH_ANY(structArrayField, $[intField] == 1 && $[strField] == "aaa")
 func (v *ParserVisitor) VisitMatchSimple(ctx *parser.MatchSimpleContext) interface{} {
-	structArrayFieldName := ctx.Identifier().GetText()
+	structArrayFieldName := ctx.FieldName().GetText()
 	var matchType planpb.MatchType
 	var opName string
 	switch ctx.GetOp().GetTokenType() {
@@ -3391,7 +3788,7 @@ func (v *ParserVisitor) VisitMatchSimple(ctx *parser.MatchSimpleContext) interfa
 // VisitMatchThreshold handles MATCH_LEAST, MATCH_MOST, and MATCH_EXACT expressions
 // Syntax: MATCH_LEAST/MATCH_MOST/MATCH_EXACT(structArrayField, $[intField] == 1, threshold=N)
 func (v *ParserVisitor) VisitMatchThreshold(ctx *parser.MatchThresholdContext) interface{} {
-	structArrayFieldName := ctx.Identifier().GetText()
+	structArrayFieldName := ctx.FieldName().GetText()
 
 	countStr := ctx.IntegerConstant().GetText()
 	count, err := strconv.ParseInt(countStr, 10, 64)

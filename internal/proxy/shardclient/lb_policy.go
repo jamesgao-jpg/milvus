@@ -54,13 +54,16 @@ type ChannelWorkload struct {
 	// ErrCollectionNotFullyLoaded (retriable), see selectNode. Empty is the
 	// absence of a scope and leaves routing exactly as before.
 	//
-	// EVERY construction site must carry it, and the way to do that is
-	// CollectionWorkLoad.ForChannel rather than a literal. Three paths build a
-	// ChannelWorkload directly instead of going through Execute -- the
-	// namespace single-shard fast paths in task_search.go, task_query.go and
-	// task_delete.go -- and one that forgets does not fail: it routes that
-	// subset of requests to another group's leader, silently, which is the
+	// A construction site does NOT have to set it. Every entry point of this
+	// package stamps the request's scope on from the context (see
+	// resource_group_scope.go), because a site that forgot would not fail - it would
+	// route that subset of requests to another group's leader, silently, the
 	// same wrong-routing-with-no-signal failure as filtering the channel map.
+	// Three paths build a ChannelWorkload directly rather than going through
+	// Execute - the namespace single-shard fast paths in task_search.go,
+	// task_query.go and task_delete.go - and they are covered by the stamp on
+	// ExecuteWithRetry. Setting it explicitly still wins, for a caller that
+	// names a scope the context does not carry.
 	ResourceGroup string
 }
 
@@ -107,8 +110,9 @@ type LBPolicy interface {
 }
 
 const (
-	RoundRobin = "round_robin"
-	LookAside  = "look_aside"
+	RoundRobin       = "round_robin"
+	LookAside        = "look_aside"
+	RefinedLookAside = "refined_look_aside"
 )
 
 type LBPolicyImpl struct {
@@ -122,6 +126,7 @@ type LBPolicyImpl struct {
 func NewLBPolicyImpl(clientMgr ShardClientMgr) *LBPolicyImpl {
 	balancerMap := make(map[string]LBBalancer)
 	balancerMap[LookAside] = NewLookAsideBalancer(clientMgr)
+	balancerMap[RefinedLookAside] = NewRefinedLookAsideBalancer(clientMgr)
 	balancerMap[RoundRobin] = NewRoundRobinBalancer()
 
 	balancePolicy := params.Params.ProxyCfg.ReplicaSelectionPolicy.GetValue()
@@ -344,6 +349,10 @@ func (lb *LBPolicyImpl) selectNode(ctx context.Context, balancer LBBalancer, wor
 
 // ExecuteWithRetry will choose a qn to execute the workload, and retry if failed, until reach the max retryTimes.
 func (lb *LBPolicyImpl) ExecuteWithRetry(ctx context.Context, workload ChannelWorkload) error {
+	// Extension seam, see resource_group_scope.go: the request's routing scope is
+	// stamped on here, at the load balancer's own entry, so that no call site
+	// can silently omit it. Empty with no provider installed.
+	workload = scopedChannelWorkload(ctx, workload)
 	log := mlog.With(
 		mlog.Int64("collectionID", workload.CollectionID),
 		mlog.String("channelName", workload.Channel),
@@ -437,6 +446,11 @@ func (lb *LBPolicyImpl) ExecuteWithRetry(ctx context.Context, workload ChannelWo
 			log.Warn(ctx, "search/query channel failed, node not available",
 				mlog.Int64("nodeID", targetNode.NodeID),
 				mlog.Err(err))
+			// Caller cancellation must not blacklist the node. Deadline expiry
+			// can indicate a stalled delegator and keeps the existing policy.
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return false, err
+			}
 			lb.blacklist.Add(workload.Channel, targetNode.NodeID)
 
 			lastErr = errors.Wrapf(err, "failed to get delegator %d for channel %s", targetNode.NodeID, workload.Channel)
@@ -448,11 +462,28 @@ func (lb *LBPolicyImpl) ExecuteWithRetry(ctx context.Context, workload ChannelWo
 			log.Warn(ctx, "search/query channel failed",
 				mlog.Int64("nodeID", targetNode.NodeID),
 				mlog.Err(err))
+			// Check the caller context: a gRPC cancellation error does not
+			// unwrap to context.Canceled. Internal cancellation and deadline
+			// expiry keep the existing blacklist policy.
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return false, err
+			}
 			// An input error is the request's own fault: re-dispatching it to
 			// other replicas cannot make it succeed, and blacklisting the
 			// (healthy) serving node would penalize it for a bad request. Abort
 			// immediately without retrying or touching the blacklist.
-			if merr.GetErrorType(err) == merr.InputError {
+			//
+			// ErrSegcoreUnsupported joins it for the same reason from the other
+			// direction: "unsupported" is a verdict about the binary's
+			// capabilities (an index_type x metric combination, a json cast type
+			// this build does not know), so every replica runs the same code and
+			// answers identically. Retrying elsewhere cannot help, and the
+			// blacklist -- which exists to route around a node that is
+			// misbehaving -- would sideline a node that did nothing wrong. It
+			// stays a system error on the wire: the cause may be a capability
+			// gap rather than the caller's request.
+			if merr.GetErrorType(err) == merr.InputError ||
+				errors.Is(err, merr.ErrSegcoreUnsupported) {
 				return false, err
 			}
 			if merr.IsRetryableErr(err) {
@@ -494,6 +525,8 @@ func (lb *LBPolicyImpl) ExecuteWithRetry(ctx context.Context, workload ChannelWo
 
 // Execute will execute collection workload in parallel
 func (lb *LBPolicyImpl) Execute(ctx context.Context, workload CollectionWorkLoad) error {
+	// Extension seam, see resource_group_scope.go.
+	workload = scopedCollectionWorkload(ctx, workload)
 	log := mlog.With(
 		mlog.Int64("collectionID", workload.CollectionID),
 	)
@@ -524,6 +557,8 @@ func (lb *LBPolicyImpl) Execute(ctx context.Context, workload CollectionWorkLoad
 
 // ExecuteOneChannel will execute at any one channel in collection
 func (lb *LBPolicyImpl) ExecuteOneChannel(ctx context.Context, workload CollectionWorkLoad) error {
+	// Extension seam, see resource_group_scope.go.
+	workload = scopedCollectionWorkload(ctx, workload)
 	// Unscoped: any one channel will do, so the first is taken. Scoped: the
 	// channel list is a map's key order, so the first channel may be one the
 	// group has no leader on; that refusal is the retriable

@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#include "common/ChunkWriter.h"
 #include "common/FieldData.h"
 #include "common/FieldDataInterface.h"
 #include "common/FieldMeta.h"
@@ -34,6 +35,7 @@
 #include "common/VirtualPK.h"
 #include "gtest/gtest.h"
 #include "knowhere/comp/index_param.h"
+#include "milvus-storage/filesystem/fs.h"
 #include "milvus-storage/lob_column/lob_reference.h"
 #include "milvus-storage/properties.h"
 #include "milvus-storage/reader.h"
@@ -44,8 +46,7 @@
 #include "storage/loon_ffi/external_spec_c.h"
 #include "storage/loon_ffi/property_singleton.h"
 #include "storage/loon_ffi/util.h"
-#include "test_utils/DataGen.h"
-#include "test_utils/storage_test_utils.h"
+#include "test_utils/cachinglayer_test_utils.h"
 
 using namespace milvus;
 using namespace milvus::segcore;
@@ -72,24 +73,6 @@ class ScopedRejectRemoteVectorOutput {
 
  private:
     bool old_value_;
-};
-
-class ScopedTakeForOutputResultCountLimit {
- public:
-    explicit ScopedTakeForOutputResultCountLimit(int64_t limit)
-        : old_value_(SegcoreConfig::default_config()
-                         .get_take_for_output_result_count_limit()) {
-        SegcoreConfig::default_config().set_take_for_output_result_count_limit(
-            limit);
-    }
-
-    ~ScopedTakeForOutputResultCountLimit() {
-        SegcoreConfig::default_config().set_take_for_output_result_count_limit(
-            old_value_);
-    }
-
- private:
-    int64_t old_value_;
 };
 
 class ScopedExternalIopsConfig {
@@ -180,11 +163,6 @@ class MockTakeReader : public milvus_storage::api::Reader {
         : table_(std::move(table)) {
     }
 
-    size_t
-    take_call_count() const {
-        return take_call_count_;
-    }
-
     std::shared_ptr<milvus_storage::api::ColumnGroups>
     get_column_groups() const override {
         return nullptr;
@@ -206,7 +184,6 @@ class MockTakeReader : public milvus_storage::api::Reader {
          size_t,
          const std::shared_ptr<std::vector<std::string>>& needed_columns)
         override {
-        ++take_call_count_;
         if (!table_) {
             return arrow::Status::Invalid("no table");
         }
@@ -235,8 +212,6 @@ class MockTakeReader : public milvus_storage::api::Reader {
     }
 
  private:
-    size_t take_call_count_{0};
-
     // Select rows from table at given indices using arrow::compute::Take.
     static arrow::Result<std::shared_ptr<arrow::Table>>
     SelectRows(const std::shared_ptr<arrow::Table>& table,
@@ -1059,6 +1034,58 @@ CreateExternalSegment(SegmentSealedUPtr& holder,
     return dynamic_cast<ChunkedSegmentSealedImpl*>(holder.get());
 }
 
+std::shared_ptr<ChunkedColumnInterface>
+BuildExternalTextColumn(const FieldMeta& field_meta) {
+    arrow::BinaryBuilder builder;
+    EXPECT_TRUE(builder.Append("external text 0").ok());
+    EXPECT_TRUE(builder.AppendNull().ok());
+    EXPECT_TRUE(builder.Append("external text 2").ok());
+    auto array = builder.Finish().ValueOrDie();
+
+    std::vector<std::unique_ptr<Chunk>> chunks;
+    chunks.push_back(
+        create_chunk(field_meta, arrow::ArrayVector{std::move(array)}));
+
+    auto translator = std::make_unique<TestChunkTranslator>(
+        std::vector<int64_t>{3}, "", std::move(chunks));
+    auto slot =
+        cachinglayer::Manager::GetInstance().CreateCacheSlot<milvus::Chunk>(
+            std::move(translator), nullptr);
+    return MakeChunkedColumnBase(DataType::TEXT, std::move(slot), field_meta);
+}
+
+void
+LoadExternalTextColumnForTesting(ChunkedSegmentSealedImpl* segment,
+                                 const SchemaPtr& schema,
+                                 FieldId field_id) {
+    auto current = segment->TestGetPublishedStateSnapshot();
+    auto runtime = segment->TestCloneMutableRuntimeResourceState();
+
+    ChunkedSegmentSealedImpl::StateDelta initial_delta;
+    initial_delta.fields = current->fields;
+    initial_delta.load_info = current->load_info;
+    initial_delta.runtime = segment->TestFreezeRuntimeResourceState(runtime);
+    initial_delta.commit_ts = current->commit_ts;
+    auto staged = segment->TestBuildNextPublishedState(current, initial_delta);
+
+    ChunkedSegmentSealedImpl::StateDelta final_delta;
+    final_delta.fields = current->fields;
+    final_delta.load_info = current->load_info;
+    final_delta.commit_ts = current->commit_ts;
+
+    auto column = BuildExternalTextColumn(schema->operator[](field_id));
+    segment->TestStageLoadFieldDataThenPublish(field_id,
+                                               column,
+                                               3,
+                                               DataType::TEXT,
+                                               schema,
+                                               runtime,
+                                               staged.get(),
+                                               current,
+                                               final_delta,
+                                               [] {});
+}
+
 // Mock Reader that always returns an error from take().
 class ErrorMockTakeReader : public milvus_storage::api::Reader {
  public:
@@ -1214,6 +1241,7 @@ BuildExternalSchemaWithArray() {
                                DataType::ARRAY,
                                DataType::INT32,
                                true,
+                               false,
                                std::optional<DefaultValueType>{std::nullopt},
                                "array_col"));
 
@@ -1729,7 +1757,9 @@ TEST(ExternalTakeTest, TryTakeForRetrieve_FallbackNonExternal) {
     EXPECT_FALSE(ok);
 }
 
-TEST(ExternalTakeTest, TryTakeForRetrieve_FallbackAboveResultCountLimit) {
+// Segment-local result size does not make a second policy decision. The
+// request gate is the only result-count policy input.
+TEST(ExternalTakeTest, TryTakeForRetrieve_LargeSegmentUsesRequestGate) {
     auto [schema,
           bool_id,
           int8_id,
@@ -1743,21 +1773,21 @@ TEST(ExternalTakeTest, TryTakeForRetrieve_FallbackAboveResultCountLimit) {
     auto table = BuildTestArrowTable();
     SegmentSealedUPtr holder;
     auto* segment = CreateExternalSegment(holder, schema);
-    auto reader = std::make_unique<MockTakeReader>(table);
-    auto* reader_ptr = reader.get();
-    segment->SetReaderForTesting(std::move(reader));
+    segment->SetReaderForTesting(std::make_unique<MockTakeReader>(table));
     segment->SetUseTakeForOutputForTesting(true);
 
     auto plan = std::make_unique<query::RetrievePlan>(schema);
     plan->field_ids_ = {int64_id};
+    plan->take_for_output_allowed_ = true;
 
-    ScopedTakeForOutputResultCountLimit scoped_limit(2);
     auto results = std::make_unique<proto::segcore::RetrieveResults>();
-    std::vector<int64_t> offsets = {0, 1, 2};
+    std::vector<int64_t> offsets(10001, 0);
     bool ok = segment->TryTakeForRetrieve(
-        plan.get(), results, offsets.data(), offsets.size(), false, false);
-    EXPECT_FALSE(ok);
-    EXPECT_EQ(reader_ptr->take_call_count(), 0);
+        plan.get(), results, offsets.data(), 10001, false, false);
+    EXPECT_TRUE(ok);
+    ASSERT_EQ(results->fields_data_size(), 1);
+    EXPECT_EQ(results->fields_data(0).scalars().long_data().data_size(),
+              offsets.size());
 }
 
 // Test fallback: returns false when reader is null
@@ -1950,6 +1980,164 @@ TEST(InternalTakeTest, TryTakeForRetrieve_ProjectsDynamicField) {
     ASSERT_EQ(dynamic_data.scalars().json_data().data_size(), 2);
     EXPECT_EQ(dynamic_data.scalars().json_data().data(0), R"({"foo":3})");
     EXPECT_EQ(dynamic_data.scalars().json_data().data(1), R"({"foo":1})");
+}
+
+// A VECTOR_ARRAY column taken from a manifest-backed sealed segment must carry
+// the collection-level element type and dim, which the Go reduce and the SDK
+// read to decode the rows.
+TEST(InternalTakeTest, TryTakeForRetrieve_VectorArraySetsElementTypeAndDim) {
+    constexpr int64_t kRows = 3;
+    constexpr int kWidth = kVecDim * sizeof(float);
+    const FieldId pk_id(100);
+    const FieldId dense_id(101);
+    const FieldId element_nullable_id(102);
+
+    auto schema = std::make_shared<Schema>();
+    schema->AddField(
+        FieldName("RowID"), RowFieldID, DataType::INT64, false, std::nullopt);
+    schema->AddField(FieldName("Timestamp"),
+                     TimestampFieldID,
+                     DataType::INT64,
+                     false,
+                     std::nullopt);
+    schema->AddField(FieldMeta(
+        FieldName("pk"), pk_id, DataType::INT64, false, std::nullopt));
+    schema->AddField(FieldMeta(FieldName("dense_vecs"),
+                               dense_id,
+                               DataType::VECTOR_ARRAY,
+                               DataType::VECTOR_FLOAT,
+                               kVecDim,
+                               knowhere::metric::L2,
+                               false,
+                               false));
+    schema->AddField(FieldMeta(FieldName("element_nullable_vecs"),
+                               element_nullable_id,
+                               DataType::VECTOR_ARRAY,
+                               DataType::VECTOR_FLOAT,
+                               kVecDim,
+                               knowhere::metric::L2,
+                               false,
+                               true));
+    schema->set_primary_field_id(pk_id);
+
+    auto vector_of = [](int64_t row, int64_t element) {
+        std::vector<float> v(kVecDim);
+        for (int64_t k = 0; k < kVecDim; ++k) {
+            v[k] = static_cast<float>(row * 100 + element * 10 + k);
+        }
+        return v;
+    };
+
+    // Row r of dense_vecs holds r + 1 vectors. Every row of
+    // element_nullable_vecs holds three elements, the middle one null.
+    arrow::Int64Builder pk_builder;
+    auto dense_builder = std::make_shared<arrow::ListBuilder>(
+        arrow::default_memory_pool(),
+        std::make_shared<arrow::FixedSizeBinaryBuilder>(
+            arrow::fixed_size_binary(kWidth)));
+    auto* dense_values = static_cast<arrow::FixedSizeBinaryBuilder*>(
+        dense_builder->value_builder());
+    auto nullable_builder = std::make_shared<arrow::ListBuilder>(
+        arrow::default_memory_pool(), std::make_shared<arrow::BinaryBuilder>());
+    auto* nullable_values =
+        static_cast<arrow::BinaryBuilder*>(nullable_builder->value_builder());
+    for (int64_t row = 0; row < kRows; ++row) {
+        ASSERT_TRUE(pk_builder.Append(row).ok());
+        ASSERT_TRUE(dense_builder->Append().ok());
+        for (int64_t j = 0; j <= row; ++j) {
+            auto v = vector_of(row, j);
+            ASSERT_TRUE(
+                dense_values->Append(reinterpret_cast<const uint8_t*>(v.data()))
+                    .ok());
+        }
+        ASSERT_TRUE(nullable_builder->Append().ok());
+        for (int64_t j = 0; j < 3; ++j) {
+            if (j == 1) {
+                ASSERT_TRUE(nullable_values->AppendNull().ok());
+                continue;
+            }
+            auto v = vector_of(row, j);
+            ASSERT_TRUE(
+                nullable_values
+                    ->Append(reinterpret_cast<const uint8_t*>(v.data()), kWidth)
+                    .ok());
+        }
+    }
+    auto table = arrow::Table::Make(
+        arrow::schema({
+            arrow::field(std::to_string(pk_id.get()), arrow::int64()),
+            arrow::field(std::to_string(dense_id.get()),
+                         arrow::list(arrow::fixed_size_binary(kWidth))),
+            arrow::field(std::to_string(element_nullable_id.get()),
+                         arrow::list(arrow::binary())),
+        }),
+        {pk_builder.Finish().ValueOrDie(),
+         dense_builder->Finish().ValueOrDie(),
+         nullable_builder->Finish().ValueOrDie()});
+
+    SegmentSealedUPtr holder;
+    auto* segment = CreateExternalSegment(holder, schema);
+    segment->SetReaderForTesting(std::make_unique<MockTakeReader>(table));
+    segment->SetUseTakeForOutputForTesting(true);
+
+    auto plan = std::make_unique<query::RetrievePlan>(schema);
+    plan->field_ids_ = {pk_id, dense_id, element_nullable_id};
+
+    auto results = std::make_unique<proto::segcore::RetrieveResults>();
+    std::vector<int64_t> offsets = {2, 0, 2};
+    ASSERT_TRUE(segment->TryTakeForRetrieve(
+        plan.get(), results, offsets.data(), offsets.size(), false, true));
+    ASSERT_EQ(results->fields_data_size(), 3);
+
+    auto assert_row = [&](const proto::schema::VectorField& row,
+                          int64_t source_row,
+                          const std::vector<int64_t>& elements) {
+        EXPECT_EQ(row.dim(), kVecDim);
+        ASSERT_EQ(row.float_vector().data_size(), elements.size() * kVecDim);
+        for (size_t j = 0; j < elements.size(); ++j) {
+            auto expected = vector_of(source_row, elements[j]);
+            for (int64_t k = 0; k < kVecDim; ++k) {
+                EXPECT_FLOAT_EQ(row.float_vector().data(j * kVecDim + k),
+                                expected[k]);
+            }
+        }
+    };
+
+    const auto& dense = results->fields_data(1);
+    ASSERT_EQ(dense.field_id(), dense_id.get());
+    ASSERT_EQ(dense.type(), proto::schema::DataType::ArrayOfVector);
+    EXPECT_EQ(dense.vectors().dim(), kVecDim);
+    const auto& dense_array = dense.vectors().vector_array();
+    EXPECT_EQ(dense_array.element_type(), proto::schema::DataType::FloatVector);
+    EXPECT_EQ(dense_array.dim(), kVecDim);
+    ASSERT_EQ(dense_array.data_size(), offsets.size());
+    for (size_t i = 0; i < offsets.size(); ++i) {
+        SCOPED_TRACE(i);
+        std::vector<int64_t> elements;
+        for (int64_t j = 0; j <= offsets[i]; ++j) {
+            elements.push_back(j);
+        }
+        assert_row(dense_array.data(i), offsets[i], elements);
+        EXPECT_EQ(dense_array.data(i).valid_data_size(), 0);
+    }
+
+    const auto& nullable = results->fields_data(2);
+    ASSERT_EQ(nullable.field_id(), element_nullable_id.get());
+    EXPECT_EQ(nullable.vectors().dim(), kVecDim);
+    const auto& nullable_array = nullable.vectors().vector_array();
+    EXPECT_EQ(nullable_array.element_type(),
+              proto::schema::DataType::FloatVector);
+    EXPECT_EQ(nullable_array.dim(), kVecDim);
+    ASSERT_EQ(nullable_array.data_size(), offsets.size());
+    for (size_t i = 0; i < offsets.size(); ++i) {
+        SCOPED_TRACE(i);
+        const auto& row = nullable_array.data(i);
+        assert_row(row, offsets[i], {0, 2});
+        ASSERT_EQ(row.valid_data_size(), 3);
+        EXPECT_TRUE(row.valid_data(0));
+        EXPECT_FALSE(row.valid_data(1));
+        EXPECT_TRUE(row.valid_data(2));
+    }
 }
 
 TEST(InternalTakeTest, TryTakeForSearch_ResolvesTextOutputField) {
@@ -2391,9 +2579,9 @@ TEST(ExternalTakeTest, TryTakeForSearch_FallbackNonExternal) {
     EXPECT_FALSE(ok);
 }
 
-// A large result size is not the search topK. This falls back only because
-// the reader is absent and the plan has no vector node with a topK value.
-TEST(ExternalTakeTest, TryTakeForSearch_LargeResultFallbackNullReader) {
+// Segment-local result size does not make a second policy decision. The
+// request gate is the only result-count policy input.
+TEST(ExternalTakeTest, TryTakeForSearch_LargeSegmentUsesRequestGate) {
     auto [schema,
           bool_id,
           int8_id,
@@ -2404,17 +2592,23 @@ TEST(ExternalTakeTest, TryTakeForSearch_LargeResultFallbackNullReader) {
           double_id,
           varchar_id,
           vec_id] = BuildExternalSchema();
+    auto table = BuildTestArrowTable();
     SegmentSealedUPtr holder;
     auto* segment = CreateExternalSegment(holder, schema);
+    segment->SetReaderForTesting(std::make_unique<MockTakeReader>(table));
+    segment->SetUseTakeForOutputForTesting(true);
 
     auto plan = std::make_unique<query::Plan>(schema);
     plan->target_entries_ = {int64_id};
+    plan->take_for_output_allowed_ = true;
 
     SearchResult results;
     std::vector<int64_t> offsets(10001, 0);
     bool ok = segment->TestTryTakeForSearch(
         plan.get(), offsets.data(), 10001, results);
-    EXPECT_FALSE(ok);
+    EXPECT_TRUE(ok);
+    auto& field_data = results.output_fields_data_.at(int64_id);
+    EXPECT_EQ(field_data->scalars().long_data().data_size(), offsets.size());
 }
 
 // Unsupported data type (ARRAY) in search → clears results, returns false
@@ -2435,7 +2629,7 @@ TEST(ExternalTakeTest, TryTakeForSearch_UnsupportedType) {
     EXPECT_TRUE(results.output_fields_data_.empty());
 }
 
-// ---------- Access mode threshold logic tests ----------
+// ---------- Access mode and request gate tests ----------
 
 // use_take_for_output=false: TryTakeForRetrieve returns false
 TEST(ExternalTakeAccessMode, RetrieveDisabledReturnsFalse) {
@@ -2496,7 +2690,7 @@ TEST(ExternalTakeAccessMode, RetrieveEnabledUsesTake) {
     EXPECT_EQ(results->fields_data(0).scalars().long_data().data_size(), size);
 }
 
-TEST(ExternalTakeAccessMode, RetrieveUsesTakeAtResultCountLimit) {
+TEST(ExternalTakeAccessMode, RetrieveRequestGateDisabledReturnsFalse) {
     auto [schema,
           bool_id,
           int8_id,
@@ -2510,88 +2704,85 @@ TEST(ExternalTakeAccessMode, RetrieveUsesTakeAtResultCountLimit) {
     auto table = BuildTestArrowTable();
     SegmentSealedUPtr holder;
     auto* segment = CreateExternalSegment(holder, schema);
-    auto reader = std::make_unique<MockTakeReader>(table);
-    auto* reader_ptr = reader.get();
-    segment->SetReaderForTesting(std::move(reader));
+    segment->SetReaderForTesting(std::make_unique<MockTakeReader>(table));
     segment->SetUseTakeForOutputForTesting(true);
 
     auto plan = std::make_unique<query::RetrievePlan>(schema);
     plan->field_ids_ = {int64_id};
+    plan->take_for_output_allowed_ = false;
 
-    ScopedTakeForOutputResultCountLimit scoped_limit(2);
     auto results = std::make_unique<proto::segcore::RetrieveResults>();
-    std::vector<int64_t> offsets = {0, 1};
+    int64_t offset = 0;
     bool ok = segment->TryTakeForRetrieve(
-        plan.get(), results, offsets.data(), offsets.size(), false, false);
-    EXPECT_TRUE(ok);
-    EXPECT_EQ(reader_ptr->take_call_count(), 1);
+        plan.get(), results, &offset, 1, false, false);
+    EXPECT_FALSE(ok);
+    EXPECT_EQ(results->fields_data_size(), 0);
 }
 
-TEST(ExternalTakeAccessMode,
-     RetrieveFallsBackToBulkSubscriptAboveResultCountLimit) {
-    auto schema = std::make_shared<Schema>();
-    auto pk_id = schema->AddDebugField("pk", DataType::INT64);
-    schema->set_primary_field_id(pk_id);
-    auto dataset = DataGen(schema, kTestRows);
-    auto holder = CreateSealedWithFieldDataLoaded(schema, dataset);
-    auto* segment = dynamic_cast<ChunkedSegmentSealedImpl*>(holder.get());
-    ASSERT_NE(segment, nullptr);
+TEST(ExternalTakeAccessMode, RequestGateDisabledFallsBackForExternalText) {
+    auto info = BuildExternalSchema();
+    auto text_id = FieldId(109);
+    info.schema->AddField(FieldMeta(FieldName("text_col"),
+                                    text_id,
+                                    DataType::TEXT,
+                                    65535,
+                                    true,
+                                    std::nullopt,
+                                    "text_col"));
 
-    auto reader = std::make_unique<MockTakeReader>(nullptr);
-    auto* reader_ptr = reader.get();
-    segment->SetReaderForTesting(std::move(reader));
-    segment->SetUseTakeForOutputForTesting(true);
-
-    auto plan = std::make_unique<query::RetrievePlan>(schema);
-    plan->field_ids_ = {pk_id};
-
-    ScopedTakeForOutputResultCountLimit scoped_limit(2);
-    std::vector<int64_t> offsets = {0, 1, 3};
-    auto results = segment->Retrieve(nullptr,
-                                     plan.get(),
-                                     offsets.data(),
-                                     offsets.size(),
-                                     folly::CancellationToken());
-
-    EXPECT_EQ(reader_ptr->take_call_count(), 0);
-    ASSERT_EQ(results->fields_data_size(), 1);
-    auto expected = dataset.get_col<int64_t>(pk_id);
-    auto& long_data = results->fields_data(0).scalars().long_data();
-    ASSERT_EQ(long_data.data_size(), 3);
-    EXPECT_EQ(long_data.data(0), expected[0]);
-    EXPECT_EQ(long_data.data(1), expected[1]);
-    EXPECT_EQ(long_data.data(2), expected[3]);
-}
-
-TEST(ExternalTakeAccessMode, RetrieveUsesTakeWhenResultCountLimitDisabled) {
-    auto [schema,
-          bool_id,
-          int8_id,
-          int16_id,
-          int32_id,
-          int64_id,
-          float_id,
-          double_id,
-          varchar_id,
-          vec_id] = BuildExternalSchema();
-    auto table = BuildTestArrowTable();
     SegmentSealedUPtr holder;
-    auto* segment = CreateExternalSegment(holder, schema);
-    auto reader = std::make_unique<MockTakeReader>(table);
-    auto* reader_ptr = reader.get();
-    segment->SetReaderForTesting(std::move(reader));
+    auto* segment = CreateExternalSegment(holder, info.schema);
     segment->SetUseTakeForOutputForTesting(true);
+    LoadExternalTextColumnForTesting(segment, info.schema, text_id);
 
-    auto plan = std::make_unique<query::RetrievePlan>(schema);
-    plan->field_ids_ = {int64_id};
+    auto retrieve_plan = std::make_unique<query::RetrievePlan>(info.schema);
+    retrieve_plan->field_ids_ = {text_id};
+    retrieve_plan->take_for_output_allowed_ = false;
 
-    ScopedTakeForOutputResultCountLimit scoped_limit(0);
-    auto results = std::make_unique<proto::segcore::RetrieveResults>();
+    auto retrieve_results = std::make_unique<proto::segcore::RetrieveResults>();
     std::vector<int64_t> offsets = {0, 1, 2};
-    bool ok = segment->TryTakeForRetrieve(
-        plan.get(), results, offsets.data(), offsets.size(), false, false);
-    EXPECT_TRUE(ok);
-    EXPECT_EQ(reader_ptr->take_call_count(), 1);
+    static_cast<SegmentInternalInterface*>(segment)->FillTargetEntry(
+        nullptr,
+        retrieve_plan.get(),
+        retrieve_results,
+        offsets.data(),
+        offsets.size(),
+        false,
+        false);
+
+    ASSERT_EQ(retrieve_results->fields_data_size(), 1);
+    const auto& retrieved = retrieve_results->fields_data(0);
+    EXPECT_EQ(retrieved.field_id(), text_id.get());
+    const auto& retrieve_valid = GetFieldDataRowValidData(retrieved);
+    ASSERT_EQ(retrieve_valid.size(), offsets.size());
+    EXPECT_TRUE(retrieve_valid[0]);
+    EXPECT_FALSE(retrieve_valid[1]);
+    EXPECT_TRUE(retrieve_valid[2]);
+    const auto& retrieve_text = retrieved.scalars().string_data().data();
+    ASSERT_EQ(retrieve_text.size(), offsets.size());
+    EXPECT_EQ(retrieve_text[0], "external text 0");
+    EXPECT_TRUE(retrieve_text[1].empty());
+    EXPECT_EQ(retrieve_text[2], "external text 2");
+
+    auto search_plan = std::make_unique<query::Plan>(info.schema);
+    search_plan->target_entries_ = {text_id};
+    search_plan->take_for_output_allowed_ = false;
+    SearchResult search_results;
+    search_results.seg_offsets_ = offsets;
+    search_results.distances_.resize(offsets.size());
+    segment->TestFillTargetEntry(search_plan.get(), search_results);
+
+    const auto& searched = *search_results.output_fields_data_.at(text_id);
+    const auto& search_valid = GetFieldDataRowValidData(searched);
+    ASSERT_EQ(search_valid.size(), offsets.size());
+    EXPECT_TRUE(search_valid[0]);
+    EXPECT_FALSE(search_valid[1]);
+    EXPECT_TRUE(search_valid[2]);
+    const auto& search_text = searched.scalars().string_data().data();
+    ASSERT_EQ(search_text.size(), offsets.size());
+    EXPECT_EQ(search_text[0], "external text 0");
+    EXPECT_TRUE(search_text[1].empty());
+    EXPECT_EQ(search_text[2], "external text 2");
 }
 
 TEST(ExternalTakeAccessMode, RetrieveRejectRemoteVectorOutputReturnsFalse) {
@@ -2686,7 +2877,7 @@ TEST(ExternalTakeAccessMode, SearchEnabledUsesTake) {
     EXPECT_EQ(int64_arr->scalars().long_data().data(2), 40000);
 }
 
-TEST(ExternalTakeAccessMode, SearchUsesTakeAtResultCountLimit) {
+TEST(ExternalTakeAccessMode, SearchRequestGateDisabledReturnsFalse) {
     auto [schema,
           bool_id,
           int8_id,
@@ -2700,122 +2891,18 @@ TEST(ExternalTakeAccessMode, SearchUsesTakeAtResultCountLimit) {
     auto table = BuildTestArrowTable();
     SegmentSealedUPtr holder;
     auto* segment = CreateExternalSegment(holder, schema);
-    auto reader = std::make_unique<MockTakeReader>(table);
-    auto* reader_ptr = reader.get();
-    segment->SetReaderForTesting(std::move(reader));
+    segment->SetReaderForTesting(std::make_unique<MockTakeReader>(table));
     segment->SetUseTakeForOutputForTesting(true);
 
     auto plan = std::make_unique<query::Plan>(schema);
-    plan->plan_node_ = std::make_unique<query::VectorPlanNode>();
-    plan->plan_node_->search_info_.topk_ = 2;
     plan->target_entries_ = {int64_id};
+    plan->take_for_output_allowed_ = false;
 
-    ScopedTakeForOutputResultCountLimit scoped_limit(2);
-    SearchResult results;
-    int64_t offset = 0;
-    bool ok = segment->TestTryTakeForSearch(plan.get(), &offset, 1, results);
-    EXPECT_TRUE(ok);
-    EXPECT_EQ(reader_ptr->take_call_count(), 1);
-}
-
-TEST(ExternalTakeAccessMode, SearchSkipsTakeAboveResultCountLimit) {
-    auto [schema,
-          bool_id,
-          int8_id,
-          int16_id,
-          int32_id,
-          int64_id,
-          float_id,
-          double_id,
-          varchar_id,
-          vec_id] = BuildExternalSchema();
-    auto table = BuildTestArrowTable();
-    SegmentSealedUPtr holder;
-    auto* segment = CreateExternalSegment(holder, schema);
-    auto reader = std::make_unique<MockTakeReader>(table);
-    auto* reader_ptr = reader.get();
-    segment->SetReaderForTesting(std::move(reader));
-    segment->SetUseTakeForOutputForTesting(true);
-
-    auto plan = std::make_unique<query::Plan>(schema);
-    plan->plan_node_ = std::make_unique<query::VectorPlanNode>();
-    plan->plan_node_->search_info_.topk_ = 3;
-    plan->target_entries_ = {int64_id};
-
-    ScopedTakeForOutputResultCountLimit scoped_limit(2);
     SearchResult results;
     int64_t offset = 0;
     bool ok = segment->TestTryTakeForSearch(plan.get(), &offset, 1, results);
     EXPECT_FALSE(ok);
-    EXPECT_EQ(reader_ptr->take_call_count(), 0);
-}
-
-TEST(ExternalTakeAccessMode,
-     FillTargetEntryFallsBackAboveUniqueOffsetCountLimit) {
-    auto schema = std::make_shared<Schema>();
-    auto pk_id = schema->AddDebugField("pk", DataType::INT64);
-    schema->set_primary_field_id(pk_id);
-    auto dataset = DataGen(schema, kTestRows);
-    auto holder = CreateSealedWithFieldDataLoaded(schema, dataset);
-    auto* segment = dynamic_cast<ChunkedSegmentSealedImpl*>(holder.get());
-    ASSERT_NE(segment, nullptr);
-
-    auto reader = std::make_unique<MockTakeReader>(nullptr);
-    auto* reader_ptr = reader.get();
-    segment->SetReaderForTesting(std::move(reader));
-    segment->SetUseTakeForOutputForTesting(true);
-
-    auto plan = std::make_unique<query::Plan>(schema);
-    plan->plan_node_ = std::make_unique<query::VectorPlanNode>();
-    plan->plan_node_->search_info_.topk_ = 2;
-    plan->target_entries_ = {pk_id};
-
-    ScopedTakeForOutputResultCountLimit scoped_limit(2);
-    SearchResult results;
-    results.distances_ = {0.1F, 0.2F, 0.3F};
-    results.seg_offsets_ = {0, 1, 3};
-
-    segment->TestFillTargetEntry(plan.get(), results);
-
-    EXPECT_EQ(reader_ptr->take_call_count(), 0);
-    auto& field_data = results.output_fields_data_.at(pk_id);
-    auto expected = dataset.get_col<int64_t>(pk_id);
-    ASSERT_EQ(field_data->scalars().long_data().data_size(), 3);
-    EXPECT_EQ(field_data->scalars().long_data().data(0), expected[0]);
-    EXPECT_EQ(field_data->scalars().long_data().data(1), expected[1]);
-    EXPECT_EQ(field_data->scalars().long_data().data(2), expected[3]);
-}
-
-TEST(ExternalTakeAccessMode, SearchUsesTakeWhenResultCountLimitDisabled) {
-    auto [schema,
-          bool_id,
-          int8_id,
-          int16_id,
-          int32_id,
-          int64_id,
-          float_id,
-          double_id,
-          varchar_id,
-          vec_id] = BuildExternalSchema();
-    auto table = BuildTestArrowTable();
-    SegmentSealedUPtr holder;
-    auto* segment = CreateExternalSegment(holder, schema);
-    auto reader = std::make_unique<MockTakeReader>(table);
-    auto* reader_ptr = reader.get();
-    segment->SetReaderForTesting(std::move(reader));
-    segment->SetUseTakeForOutputForTesting(true);
-
-    auto plan = std::make_unique<query::Plan>(schema);
-    plan->plan_node_ = std::make_unique<query::VectorPlanNode>();
-    plan->plan_node_->search_info_.topk_ = 10001;
-    plan->target_entries_ = {int64_id};
-
-    ScopedTakeForOutputResultCountLimit scoped_limit(0);
-    SearchResult results;
-    int64_t offset = 0;
-    bool ok = segment->TestTryTakeForSearch(plan.get(), &offset, 1, results);
-    EXPECT_TRUE(ok);
-    EXPECT_EQ(reader_ptr->take_call_count(), 1);
+    EXPECT_TRUE(results.output_fields_data_.empty());
 }
 
 TEST(ExternalTakeAccessMode, SearchRejectRemoteVectorOutputReturnsFalse) {
@@ -3122,6 +3209,89 @@ TEST(InjectExtfsAllowlist, AllowlistedKeyIsApplied) {
     // (presence alone would be trivially satisfied by Layer 0).
     EXPECT_EQ(std::get<std::string>(props.at("extfs.42.region")), "us-west-2");
     EXPECT_EQ(std::get<std::string>(props.at("extfs.42.use_ssl")), "true");
+}
+
+TEST(InjectExtfsAllowlist, EndpointURLSelectsExplicitEndpointMode) {
+    struct Case {
+        std::string endpoint_url;
+        std::string expected_address;
+        std::string expected_use_ssl;
+    };
+    std::vector<Case> cases = {
+        {"http://rook-ceph-rgw.storage.svc:80",
+         "http://rook-ceph-rgw.storage.svc:80",
+         "false"},
+        {"HTTPS://s3.example.com/", "https://s3.example.com", "true"},
+    };
+
+    for (const auto& c : cases) {
+        milvus_storage::api::Properties props;
+        const int64_t coll_id = 42;
+        std::string spec =
+            R"({"format":"parquet","extfs":{"access_key_id":"AK","access_key_value":"SK","cloud_provider":"aws","region":"us-west-2","endpoint_url":")" +
+            c.endpoint_url + R"("}})";
+
+        ::InjectExternalSpecProperties(
+            props, coll_id, "s3://my-bucket/object", spec);
+
+        EXPECT_EQ(std::get<std::string>(props.at("extfs.42.address")),
+                  c.expected_address);
+        EXPECT_EQ(std::get<std::string>(props.at("extfs.42.bucket_name")),
+                  "my-bucket");
+        EXPECT_EQ(std::get<std::string>(props.at("extfs.42.use_ssl")),
+                  c.expected_use_ssl);
+        // endpoint_url is a public alias for address, not a milvus-storage
+        // property. It must never be forwarded under the extfs namespace.
+        EXPECT_EQ(props.count("extfs.42.endpoint_url"), 0u);
+    }
+}
+
+TEST(InjectExtfsAllowlist, EndpointURLRejectsFragments) {
+    const std::vector<std::string> endpoint_urls = {
+        "http://host#", "http://host/#", "http://host#fragment"};
+
+    for (const auto& endpoint_url : endpoint_urls) {
+        SCOPED_TRACE(endpoint_url);
+        milvus_storage::api::Properties props;
+        std::string spec = R"({"format":"parquet","extfs":{"endpoint_url":")" +
+                           endpoint_url + R"("}})";
+
+        EXPECT_THROW(::InjectExternalSpecProperties(
+                         props, 42, "s3://my-bucket/object", spec),
+                     milvus::SegcoreError);
+    }
+}
+
+TEST(InjectExtfsAllowlist, EndpointURLErrorsRedactRawValue) {
+    const std::string marker = "endpoint-credential-marker";
+    const std::vector<std::string> endpoint_urls = {
+        marker, "ftp://" + marker, "http://user:" + marker + "@host"};
+
+    for (const auto& endpoint_url : endpoint_urls) {
+        SCOPED_TRACE(endpoint_url);
+        milvus_storage::api::Properties props;
+        std::string spec = R"({"format":"parquet","extfs":{"endpoint_url":")" +
+                           endpoint_url + R"("}})";
+
+        try {
+            ::InjectExternalSpecProperties(
+                props, 42, "s3://my-bucket/object", spec);
+            FAIL() << "expected invalid endpoint URL to be rejected";
+        } catch (const milvus::SegcoreError& error) {
+            EXPECT_EQ(std::string(error.what()).find(marker),
+                      std::string::npos);
+        }
+    }
+}
+
+TEST(InjectExtfsAllowlist, EndpointURLRejectsEndpointFormSource) {
+    milvus_storage::api::Properties props;
+    std::string spec =
+        R"({"format":"parquet","extfs":{"endpoint_url":"http://rook-ceph-rgw:80"}})";
+
+    EXPECT_THROW(::InjectExternalSpecProperties(
+                     props, 42, "s3://localhost:9000/my-bucket/object", spec),
+                 milvus::SegcoreError);
 }
 
 TEST(InjectExtfsAllowlist, UnknownKeyIsDropped) {
@@ -3432,6 +3602,13 @@ TEST(InjectExtfsAllowlist, AzureCredentialBrokerProperties) {
     ::InjectExternalSpecProperties(
         props, coll_id, "azure://core.windows.net/container/path", spec);
 
+    auto config = milvus_storage::FilesystemCache::resolve_config(
+        props, "azure://core.windows.net/container/path");
+    ASSERT_TRUE(config.ok()) << config.status().ToString();
+    EXPECT_EQ(config->credential_endpoint,
+              "https://broker.example.com/v1/credentials/assume-role");
+    EXPECT_TRUE(config->IsAzureCredentialBrokerEnabled());
+
     EXPECT_EQ(std::get<std::string>(props.at("extfs.42.address")),
               "core.windows.net");
     EXPECT_EQ(std::get<std::string>(props.at("extfs.42.bucket_name")),
@@ -3442,9 +3619,9 @@ TEST(InjectExtfsAllowlist, AzureCredentialBrokerProperties) {
               "client");
     EXPECT_EQ(std::get<std::string>(props.at("extfs.42.azure_tenant_id")),
               "tenant");
-    EXPECT_EQ(
-        std::get<std::string>(props.at("extfs.42.azure_credential_endpoint")),
-        "https://broker.example.com/v1/credentials/assume-role");
+    EXPECT_EQ(std::get<std::string>(props.at("extfs.42.credential_endpoint")),
+              "https://broker.example.com/v1/credentials/assume-role");
+    EXPECT_EQ(props.count("extfs.42.azure_credential_endpoint"), 0u);
     EXPECT_EQ(props.count("extfs.42.access_key_value"), 0u);
     EXPECT_EQ(props.count("extfs.42.request_timeout_ms"), 0u);
 }
@@ -3744,6 +3921,7 @@ MakeExternalFieldMetaForNormalizeTest(DataType data_type,
                          dim,
                          std::nullopt,
                          nullable,
+                         false,
                          external_field);
     }
     if (IsVectorDataType(data_type)) {
@@ -3771,6 +3949,7 @@ MakeExternalFieldMetaForNormalizeTest(DataType data_type,
                          data_type,
                          element_type,
                          nullable,
+                         false,
                          std::optional<DefaultValueType>{std::nullopt},
                          external_field);
     }

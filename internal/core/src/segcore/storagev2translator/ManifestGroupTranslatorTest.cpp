@@ -318,6 +318,17 @@ class ManifestGroupTranslatorTest : public ::testing::TestWithParam<bool> {
         }
     }
 
+    std::unordered_map<std::string, std::vector<FieldId>>
+    GetPhysicalColumnFieldIds(
+        const std::unordered_map<FieldId, FieldMeta>& field_metas) const {
+        std::unordered_map<std::string, std::vector<FieldId>> result;
+        for (const auto& [field_id, _] : field_metas) {
+            result[schema_->get_storage_column_name(field_id)].push_back(
+                field_id);
+        }
+        return result;
+    }
+
     // Helper to create a ManifestGroupTranslator for a given column group
     std::unique_ptr<ManifestGroupTranslator>
     MakeTranslator(int64_t cg_index,
@@ -335,6 +346,7 @@ class ManifestGroupTranslatorTest : public ::testing::TestWithParam<bool> {
             cg_index,
             std::move(chunk_reader),
             field_metas,
+            GetPhysicalColumnFieldIds(field_metas),
             test_data_->GetColumnGroups()->at(cg_index)->columns,
             test_data_->GetColumnGroups()->at(cg_index)->columns,
             use_mmap,
@@ -372,10 +384,9 @@ TEST_P(ManifestGroupTranslatorTest, TestScalarColumnGroup) {
     auto use_mmap = GetParam();
     auto translator = MakeTranslator(/*cg_index=*/0, use_mmap);
 
-    auto executor_workers = milvus::ThreadPools::GetLoadExecutorWorkers();
     auto memory_group =
         milvus::storage::LoadMemoryOverheadController::GetInstance()
-            .GetOrCreate(executor_workers);
+            .GetOrCreate();
     ASSERT_TRUE(translator->meta()->loading_overhead_config.has_value());
     ASSERT_TRUE(
         translator->meta()->loading_overhead_config->memory.has_value());
@@ -392,7 +403,7 @@ TEST_P(ManifestGroupTranslatorTest, TestScalarColumnGroup) {
             translator->meta()->loading_overhead_config->file.has_value());
         EXPECT_EQ(translator->meta()->loading_overhead_config->file->group,
                   milvus::storage::LoadFileOverheadController::GetInstance()
-                      .GetOrCreate(executor_workers));
+                      .GetOrCreate());
         ASSERT_TRUE(
             translator->meta()
                 ->loading_overhead_config->file->max_runtime_unit.has_value());
@@ -433,7 +444,9 @@ TEST_P(ManifestGroupTranslatorTest, TestScalarColumnGroup) {
 
     // estimated byte size
     for (size_t i = 0; i < num_cells; ++i) {
-        auto [loading, storage] = translator->estimated_byte_size_of_cell(i);
+        auto [loading, private_overhead, shared_overhead] =
+            translator->estimated_loading_usage({i});
+        const auto storage = private_overhead + shared_overhead;
         if (use_mmap) {
             EXPECT_GT(loading.file_bytes, 0) << "cid=" << i;
             EXPECT_GT(storage.file_bytes, 0) << "cid=" << i;
@@ -442,6 +455,34 @@ TEST_P(ManifestGroupTranslatorTest, TestScalarColumnGroup) {
             EXPECT_GT(storage.memory_bytes, 0) << "cid=" << i;
         }
     }
+
+    std::vector<cachinglayer::cid_t> estimate_cids{0};
+    if (translator->num_cells() > 1) {
+        estimate_cids.push_back(translator->num_cells() - 1);
+    }
+    int64_t expected_batch_bytes = 0;
+    for (const auto cid : estimate_cids) {
+        expected_batch_bytes += static_cast<GroupCTMeta*>(translator->meta())
+                                    ->chunk_memory_size_[cid];
+    }
+    const auto batch = translator->estimated_loading_usage(estimate_cids);
+    EXPECT_EQ(
+        batch.resident,
+        (use_mmap ? cachinglayer::ResourceUsage{0, expected_batch_bytes}
+                  : cachinglayer::ResourceUsage{expected_batch_bytes, 0}));
+    // The scalar group contains ARRAY fields, whose memory scratch is doubled.
+    const cachinglayer::ResourceUsage expected_overhead{
+        2 * expected_batch_bytes, use_mmap ? expected_batch_bytes : 0};
+    EXPECT_EQ(batch.private_overhead + batch.shared_overhead,
+              expected_overhead);
+    EXPECT_EQ(batch.shared_overhead,
+              translator->meta()->loading_overhead_config
+                  ? expected_overhead
+                  : cachinglayer::ResourceUsage{});
+    const auto empty = translator->estimated_loading_usage({});
+    EXPECT_EQ(empty.resident, cachinglayer::ResourceUsage{});
+    EXPECT_EQ(empty.private_overhead, cachinglayer::ResourceUsage{});
+    EXPECT_EQ(empty.shared_overhead, cachinglayer::ResourceUsage{});
 
     // get_cells — load all cells
     std::vector<cachinglayer::cid_t> cids;
@@ -508,7 +549,9 @@ TEST_P(ManifestGroupTranslatorTest, TestVectorColumnGroup) {
 
     // estimated byte size
     for (size_t i = 0; i < num_cells; ++i) {
-        auto [loading, storage] = translator->estimated_byte_size_of_cell(i);
+        auto [loading, private_overhead, shared_overhead] =
+            translator->estimated_loading_usage({i});
+        const auto storage = private_overhead + shared_overhead;
         if (use_mmap) {
             EXPECT_GT(loading.file_bytes, 0) << "cid=" << i;
         } else {
@@ -599,6 +642,7 @@ TEST_P(ManifestGroupTranslatorTest,
         /*column_group_index=*/0,
         std::move(chunk_reader),
         field_metas,
+        GetPhysicalColumnFieldIds(field_metas),
         column_group->columns,
         *needed_columns,
         GetParam(),
@@ -653,6 +697,7 @@ TEST_P(ManifestGroupTranslatorTest,
         /*column_group_index=*/0,
         std::move(chunk_reader),
         field_metas,
+        GetPhysicalColumnFieldIds(field_metas),
         column_group->columns,
         *needed_columns,
         GetParam(),
@@ -700,6 +745,7 @@ TEST_P(ManifestGroupTranslatorTest, TestPrecomputedColumnEstimatesAreReused) {
             /*column_group_index=*/0,
             std::move(chunk_reader),
             field_metas,
+            GetPhysicalColumnFieldIds(field_metas),
             column_group->columns,
             *needed_columns,
             GetParam(),
@@ -765,6 +811,7 @@ TEST_P(ManifestGroupTranslatorTest,
         /*column_group_index=*/0,
         std::move(chunk_reader),
         projected_field_metas,
+        GetPhysicalColumnFieldIds(projected_field_metas),
         column_group->columns,
         *needed_columns,
         GetParam(),
@@ -838,6 +885,7 @@ TEST_P(ManifestGroupTranslatorTest,
         /*column_group_index=*/0,
         std::move(chunk_reader),
         projected_field_metas,
+        GetPhysicalColumnFieldIds(projected_field_metas),
         column_group->columns,
         *needed_columns,
         GetParam(),
@@ -887,6 +935,7 @@ TEST_P(ManifestGroupTranslatorTest,
         /*column_group_index=*/0,
         std::move(chunk_reader),
         projected_field_metas,
+        GetPhysicalColumnFieldIds(projected_field_metas),
         column_group->columns,
         *needed_columns,
         GetParam(),
@@ -926,6 +975,7 @@ TEST_P(ManifestGroupTranslatorTest,
         /*column_group_index=*/0,
         std::move(chunk_reader),
         field_metas,
+        GetPhysicalColumnFieldIds(field_metas),
         column_group->columns,
         column_group->columns,
         GetParam(),
@@ -1008,6 +1058,7 @@ TEST_P(ManifestGroupTranslatorTest,
         /*column_group_index=*/0,
         std::move(chunk_reader),
         projected_field_metas,
+        GetPhysicalColumnFieldIds(projected_field_metas),
         column_group->columns,
         *needed_columns,
         GetParam(),
@@ -1075,6 +1126,7 @@ TEST_P(ManifestGroupTranslatorTest,
         /*column_group_index=*/0,
         std::move(chunk_reader),
         projected_field_metas,
+        GetPhysicalColumnFieldIds(projected_field_metas),
         column_group->columns,
         *needed_columns,
         GetParam(),
@@ -1132,6 +1184,7 @@ TEST_P(ManifestGroupTranslatorTest,
         /*column_group_index=*/0,
         std::move(chunk_reader),
         projected_field_metas,
+        GetPhysicalColumnFieldIds(projected_field_metas),
         column_group->columns,
         *needed_columns,
         GetParam(),
@@ -1185,6 +1238,7 @@ TEST_P(ManifestGroupTranslatorTest,
         /*column_group_index=*/0,
         std::move(chunk_reader),
         projected_field_metas,
+        GetPhysicalColumnFieldIds(projected_field_metas),
         column_group->columns,
         *needed_columns,
         GetParam(),
@@ -1245,6 +1299,21 @@ TEST_P(ManifestGroupTranslatorTest, TestAsyncLoadParity) {
     };
     auto sync_translator = MakeTranslator(0, use_mmap, false);
     auto async_translator = MakeTranslator(0, use_mmap, true);
+    ASSERT_TRUE(sync_translator->meta()->loading_overhead_config.has_value());
+    ASSERT_TRUE(async_translator->meta()->loading_overhead_config.has_value());
+    EXPECT_EQ(sync_translator->meta()->loading_overhead_config->memory->group,
+              async_translator->meta()->loading_overhead_config->memory->group);
+    EXPECT_EQ(
+        async_translator->meta()->loading_overhead_config->memory->group,
+        storage::LoadMemoryOverheadController::GetInstance().GetOrCreate());
+    if (use_mmap) {
+        EXPECT_EQ(
+            sync_translator->meta()->loading_overhead_config->file->group,
+            async_translator->meta()->loading_overhead_config->file->group);
+        EXPECT_EQ(
+            async_translator->meta()->loading_overhead_config->file->group,
+            storage::LoadFileOverheadController::GetInstance().GetOrCreate());
+    }
     ASSERT_EQ(sync_translator->num_cells(), async_translator->num_cells());
 
     std::vector<milvus::cachinglayer::cid_t> cids(sync_translator->num_cells());
@@ -1287,7 +1356,49 @@ TEST_P(ManifestGroupTranslatorTest, TestAsyncLoadParity) {
     }
 }
 
-TEST_P(ManifestGroupTranslatorTest, AsyncReadWindowConfigControlsReadBatching) {
+TEST_P(ManifestGroupTranslatorTest, AsyncOverheadBoundsWholeWindows) {
+    const auto previous_window = StorageV2AsyncLoadReadWindowSizeBytes();
+    const auto previous_cell_target = GetCellTargetSizeBytes();
+    auto restore = folly::makeGuard([&] {
+        SetStorageV2AsyncLoadReadWindowSizeBytes(previous_window);
+        SetCellTargetSizeBytes(previous_cell_target);
+    });
+    SetCellTargetSizeBytes(1);
+    const int64_t wide_window = 4 * FieldDataLoadBatchTargetBytes();
+    for (const int64_t window :
+         {int64_t{1}, wide_window, std::numeric_limits<int64_t>::max()}) {
+        SetStorageV2AsyncLoadReadWindowSizeBytes(window);
+        // Group 0 contains arrays; group 1 contains only a vector field.
+        for (const int64_t group : {int64_t{0}, int64_t{1}}) {
+            auto translator = MakeTranslator(group, GetParam(), true);
+            const auto* meta = static_cast<GroupCTMeta*>(translator->meta());
+            ASSERT_GT(meta->chunk_memory_size_.size(), 1);
+            const auto largest_cell =
+                *std::max_element(meta->chunk_memory_size_.begin(),
+                                  meta->chunk_memory_size_.end());
+            if (window == wide_window) {
+                ASSERT_LT(largest_cell, window);
+            }
+            const auto data_bound = std::max(window, largest_cell);
+            const auto memory_bound =
+                group == 0
+                    ? (data_bound > std::numeric_limits<int64_t>::max() / 2
+                           ? std::numeric_limits<int64_t>::max()
+                           : 2 * data_bound)
+                    : data_bound;
+            ASSERT_TRUE(meta->loading_overhead_config.has_value());
+            const auto& config = *meta->loading_overhead_config;
+            ASSERT_TRUE(config.memory.has_value());
+            EXPECT_EQ(config.memory->max_runtime_unit, memory_bound);
+            if (GetParam()) {
+                ASSERT_TRUE(config.file.has_value());
+                EXPECT_EQ(config.file->max_runtime_unit, data_bound);
+            }
+        }
+    }
+}
+
+TEST_P(ManifestGroupTranslatorTest, AsyncReadWindowIsCapturedForReloads) {
     auto previous = StorageV2AsyncLoadReadWindowSizeBytes();
     auto restore = folly::makeGuard(
         [previous]() { SetStorageV2AsyncLoadReadWindowSizeBytes(previous); });
@@ -1313,9 +1424,22 @@ TEST_P(ManifestGroupTranslatorTest, AsyncReadWindowConfigControlsReadBatching) {
     EXPECT_EQ(wide_window_reader->AsyncCalls(), 1);
 
     SetStorageV2AsyncLoadReadWindowSizeBytes(1);
-    auto limited_cells = wide_window_translator->get_cells(nullptr, cids);
+    auto reloaded_cells = wide_window_translator->get_cells(nullptr, cids);
+    EXPECT_EQ(reloaded_cells.size(), num_cells);
+    EXPECT_EQ(wide_window_reader->AsyncCalls(), 2);
+
+    auto limited_reader =
+        std::make_shared<CountingChunkReader>(test_data_->CreateChunkReader(0));
+    auto limited_translator = MakeTranslator(0, use_mmap, true, limited_reader);
+    auto limited_cells = limited_translator->get_cells(nullptr, cids);
     EXPECT_EQ(limited_cells.size(), num_cells);
-    EXPECT_EQ(wide_window_reader->AsyncCalls(), 1 + num_cells);
+    EXPECT_EQ(limited_reader->AsyncCalls(), num_cells);
+
+    SetStorageV2AsyncLoadReadWindowSizeBytes(
+        std::numeric_limits<int64_t>::max());
+    auto limited_reload = limited_translator->get_cells(nullptr, cids);
+    EXPECT_EQ(limited_reload.size(), num_cells);
+    EXPECT_EQ(limited_reader->AsyncCalls(), 2 * num_cells);
 }
 
 TEST_P(ManifestGroupTranslatorTest, RoutesAsyncFinalizationByMmapMode) {

@@ -41,9 +41,11 @@
 #include "segcore/Utils.h"
 #include "segcore/memory_planner.h"
 #include "storage/KeyRetriever.h"
+#include "storage/StatusToErrorCode.h"
 #include "storage/ThreadPool.h"
 #include "storage/ThreadPools.h"
 #include "storage/LoadAdmissionController.h"
+#include "storage/Util.h"
 
 namespace milvus::segcore {
 
@@ -200,6 +202,7 @@ LoadWithStrategy(const std::vector<std::string>& remote_files,
                  const milvus_storage::ArrowFileSystemPtr& fs,
                  const std::shared_ptr<arrow::Schema> schema,
                  milvus::proto::common::LoadPriority priority) {
+    auto close_channel = folly::makeGuard([&channel] { channel->close(); });
     try {
         AssertInfo(remote_files.size() == row_group_lists.size(),
                    "[StorageV2] Number of remote files must match number of "
@@ -226,6 +229,10 @@ LoadWithStrategy(const std::vector<std::string>& remote_files,
             std::vector<std::future<std::shared_ptr<milvus::ArrowDataWrapper>>>
                 futures;
             futures.reserve(blocks.size());
+            // A failed submit/read/get must not leave sibling readers running
+            // after the producer future completes or closes its channel.
+            auto join_readers = folly::makeGuard(
+                [&futures] { milvus::storage::DrainFutures(futures); });
 
             auto reader_memory_limit = std::max<int64_t>(
                 memory_limit / blocks.size(), FILE_SLICE_SIZE.load());
@@ -242,10 +249,13 @@ LoadWithStrategy(const std::vector<std::string>& remote_files,
                             reader_memory_limit,
                             milvus::storage::GetReaderProperties(),
                             milvus::storage::GetArrowReaderProperties());
-                        AssertInfo(
-                            result.ok(),
-                            "[StorageV2] Failed to create row group reader: {}",
-                            result.status().ToString());
+                        if (!result.ok()) {
+                            ThrowInfo(milvus::storage::ArrowStatusToErrorCode(
+                                          result.status()),
+                                      "[StorageV2] Failed to create row group "
+                                      "reader: {}",
+                                      result.status().ToString());
+                        }
                         auto row_group_reader = result.ValueOrDie();
                         auto close_guard =
                             folly::makeGuard([&row_group_reader]() {
@@ -254,23 +264,30 @@ LoadWithStrategy(const std::vector<std::string>& remote_files,
                         auto status =
                             row_group_reader->SetRowGroupOffsetAndCount(
                                 block.offset, block.count);
-                        AssertInfo(status.ok(),
-                                   "[StorageV2] Failed to set row group offset "
-                                   "and count {} and {} with error {}",
-                                   block.offset,
-                                   block.count,
-                                   status.ToString());
+                        if (!status.ok()) {
+                            ThrowInfo(
+                                milvus::storage::ArrowStatusToErrorCode(status),
+                                "[StorageV2] Failed to set row group offset "
+                                "and count {} and {} with error {}",
+                                block.offset,
+                                block.count,
+                                status.ToString());
+                        }
                         auto ret = std::make_shared<ArrowDataWrapper>();
                         for (int64_t i = 0; i < block.count; ++i) {
                             std::shared_ptr<arrow::Table> table;
                             auto status =
                                 row_group_reader->ReadNextRowGroup(&table);
-                            AssertInfo(status.ok(),
-                                       "[StorageV2] Failed to read row group "
-                                       "{} from file {} with error {}",
-                                       block.offset + i,
-                                       file,
-                                       status.ToString());
+                            if (!status.ok()) {
+                                ThrowInfo(
+                                    milvus::storage::ArrowStatusToErrorCode(
+                                        status),
+                                    "[StorageV2] Failed to read row group "
+                                    "{} from file {} with error {}",
+                                    block.offset + i,
+                                    file,
+                                    status.ToString());
+                            }
                             ret->arrow_tables.push_back(
                                 {file_idx,
                                  static_cast<size_t>(block.offset + i),
@@ -285,12 +302,13 @@ LoadWithStrategy(const std::vector<std::string>& remote_files,
                 channel->push(field_data);
             }
         }
-
-        channel->close();
     } catch (std::exception& e) {
         LOG_INFO("[StorageV2] failed to load data from remote: {}", e.what());
-        channel->close();
-        throw e;
+        // Rethrow the original exception object: `throw e;` would copy-construct
+        // a plain std::exception (slicing off SegcoreError and its error code),
+        // so the cgo boundary's dynamic_cast could no longer recover the typed
+        // code and every failure here would collapse to UnexpectedError.
+        throw;
     }
 }
 
@@ -376,7 +394,7 @@ LoadCellBatchAsync(milvus::OpContext* op_ctx,
         return {};
     }
 
-    LOG_INFO(
+    LOG_DEBUG(
         "[StorageV2] LoadCellBatchAsync: {} cells -> {} batches "
         "(memory_limit={}MB, budget_capacity={}MB, read_window={}MB)",
         cell_specs.size(),

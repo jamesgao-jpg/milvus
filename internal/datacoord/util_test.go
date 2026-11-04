@@ -22,9 +22,16 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/internal/metastore/model"
+	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/indexparamcheck"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
@@ -36,6 +43,58 @@ import (
 
 type UtilSuite struct {
 	suite.Suite
+}
+
+func (suite *UtilSuite) TestCompactionMergeInfoEnums() {
+	types := map[datapb.CompactionType]commonpb.CompactionType{
+		datapb.CompactionType_UndefinedCompaction:                  commonpb.CompactionType_CompactionTypeUndefined,
+		datapb.CompactionType_MergeCompaction:                      commonpb.CompactionType_CompactionTypeMerge,
+		datapb.CompactionType_MixCompaction:                        commonpb.CompactionType_CompactionTypeMix,
+		datapb.CompactionType_SingleCompaction:                     commonpb.CompactionType_CompactionTypeSingle,
+		datapb.CompactionType_MinorCompaction:                      commonpb.CompactionType_CompactionTypeMinor,
+		datapb.CompactionType_MajorCompaction:                      commonpb.CompactionType_CompactionTypeMajor,
+		datapb.CompactionType_Level0DeleteCompaction:               commonpb.CompactionType_CompactionTypeLevel0Delete,
+		datapb.CompactionType_ClusteringCompaction:                 commonpb.CompactionType_CompactionTypeClustering,
+		datapb.CompactionType_SortCompaction:                       commonpb.CompactionType_CompactionTypeSort,
+		datapb.CompactionType_PartitionKeySortCompaction:           commonpb.CompactionType_CompactionTypePartitionKeySort,
+		datapb.CompactionType_ClusteringPartitionKeySortCompaction: commonpb.CompactionType_CompactionTypeClusteringPartitionKeySort,
+		datapb.CompactionType_BumpSchemaVersionCompaction:          commonpb.CompactionType_CompactionTypeBumpSchemaVersion,
+	}
+	states := map[datapb.CompactionTaskState]commonpb.CompactionTaskState{
+		datapb.CompactionTaskState_unknown:    commonpb.CompactionTaskState_CompactionTaskStateUnknown,
+		datapb.CompactionTaskState_executing:  commonpb.CompactionTaskState_CompactionTaskStateExecuting,
+		datapb.CompactionTaskState_pipelining: commonpb.CompactionTaskState_CompactionTaskStatePipelining,
+		datapb.CompactionTaskState_completed:  commonpb.CompactionTaskState_CompactionTaskStateCompleted,
+		datapb.CompactionTaskState_failed:     commonpb.CompactionTaskState_CompactionTaskStateFailed,
+		datapb.CompactionTaskState_timeout:    commonpb.CompactionTaskState_CompactionTaskStateTimeout,
+		datapb.CompactionTaskState_analyzing:  commonpb.CompactionTaskState_CompactionTaskStateAnalyzing,
+		datapb.CompactionTaskState_indexing:   commonpb.CompactionTaskState_CompactionTaskStateIndexing,
+		datapb.CompactionTaskState_cleaned:    commonpb.CompactionTaskState_CompactionTaskStateCleaned,
+		datapb.CompactionTaskState_meta_saved: commonpb.CompactionTaskState_CompactionTaskStateMetaSaved,
+		datapb.CompactionTaskState_statistic:  commonpb.CompactionTaskState_CompactionTaskStateStatistic,
+	}
+	// Adding an internal enum requires verifying its public wire equivalent.
+	suite.Len(types, len(datapb.CompactionType_name))
+	suite.Len(states, len(datapb.CompactionTaskState_name))
+	for internalType, publicType := range types {
+		for internalState, publicState := range states {
+			info := getCompactionMergeInfo(&datapb.CompactionTask{
+				Type: internalType, State: internalState,
+				InputSegments: []int64{1, 2}, ResultSegments: []int64{3, 4},
+				FailReason: "retained failure reason",
+			})
+			wire, err := proto.Marshal(info)
+			suite.Require().NoError(err)
+			decoded := &milvuspb.CompactionMergeInfo{}
+			suite.Require().NoError(proto.Unmarshal(wire, decoded))
+			suite.Equal(publicType, decoded.GetType(), internalType.String())
+			suite.Equal(publicState, decoded.GetState(), internalState.String())
+			suite.Equal([]int64{1, 2}, decoded.GetSources())
+			suite.Equal([]int64{3, 4}, decoded.GetTargets())
+			suite.Equal(int64(3), decoded.GetTarget())
+			suite.Equal("retained failure reason", decoded.GetFailureReason())
+		}
+	}
 }
 
 func (suite *UtilSuite) TestVerifyResponse() {
@@ -123,6 +182,438 @@ func (suite *UtilSuite) TestVerifyResponse() {
 
 func TestUtil(t *testing.T) {
 	suite.Run(t, new(UtilSuite))
+}
+
+func (suite *UtilSuite) TestEstimateFieldsReadSize() {
+	const (
+		numRows          = int64(1000)
+		pkField          = int64(100)
+		vecField         = int64(101)
+		jsonField        = int64(102)
+		varcharField     = int64(103)
+		badField         = int64(104)
+		nullableVecField = int64(105)
+	)
+	schema := &schemapb.CollectionSchema{
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: pkField, Name: "pk", DataType: schemapb.DataType_Int64},
+			{
+				FieldID:  vecField,
+				Name:     "vec",
+				DataType: schemapb.DataType_FloatVector,
+				TypeParams: []*commonpb.KeyValuePair{
+					{Key: common.DimKey, Value: "128"},
+				},
+			},
+			{FieldID: jsonField, Name: "json", DataType: schemapb.DataType_JSON},
+			{
+				FieldID:  varcharField,
+				Name:     "var",
+				DataType: schemapb.DataType_VarChar,
+				TypeParams: []*commonpb.KeyValuePair{
+					{Key: common.MaxLengthKey, Value: "256"},
+				},
+			},
+			// VarChar without max_length cannot be estimated
+			{FieldID: badField, Name: "bad", DataType: schemapb.DataType_VarChar},
+			{
+				FieldID:  nullableVecField,
+				Name:     "nullable_vec",
+				DataType: schemapb.DataType_FloatVector,
+				Nullable: true,
+				TypeParams: []*commonpb.KeyValuePair{
+					{Key: common.DimKey, Value: "128"},
+				},
+			},
+		},
+	}
+
+	// per row schema estimates
+	vecSize := int64(128 * 4)
+	pkSize := int64(8)
+	jsonEstimate, err := typeutil.EstimateSizePerRecord(&schemapb.CollectionSchema{
+		Fields: []*schemapb.FieldSchema{schema.Fields[2]},
+	})
+	suite.NoError(err)
+	jsonSize := int64(jsonEstimate)
+	varcharEstimate, err := typeutil.EstimateSizePerRecord(&schemapb.CollectionSchema{
+		Fields: []*schemapb.FieldSchema{schema.Fields[3]},
+	})
+	suite.NoError(err)
+	varcharSize := int64(varcharEstimate)
+
+	newSegment := func(groups ...*datapb.FieldBinlog) *SegmentInfo {
+		return &SegmentInfo{
+			SegmentInfo: &datapb.SegmentInfo{
+				ID:             1,
+				NumOfRows:      numRows,
+				StorageVersion: storage.StorageV3,
+				ManifestPath:   "manifest.json",
+				Binlogs:        groups,
+			},
+		}
+	}
+	group := func(size int64, fields ...int64) *datapb.FieldBinlog {
+		fieldBinlog := &datapb.FieldBinlog{
+			FieldID: fields[0],
+			Binlogs: []*datapb.Binlog{{EntriesNum: numRows, MemorySize: size}},
+		}
+		if len(fields) > 1 {
+			fieldBinlog.FieldID = 0
+			fieldBinlog.ChildFields = fields
+		}
+		return fieldBinlog
+	}
+
+	suite.Run("single field group is measured", func() {
+		// a field owning its column group, e.g. a vector in storage v3
+		segment := newSegment(group(vecSize*numRows, vecField))
+		size, err := estimateFieldsReadSize(schema, segment, []int64{vecField})
+		suite.NoError(err)
+		suite.Equal(vecSize*numRows, size)
+	})
+
+	suite.Run("fixed width field of a shared group takes its exact size", func() {
+		groupSize := (pkSize + vecSize + jsonSize) * numRows
+		segment := newSegment(group(groupSize, pkField, vecField, jsonField))
+
+		size, err := estimateFieldsReadSize(schema, segment, []int64{vecField})
+		suite.NoError(err)
+		suite.Equal(vecSize*numRows, size)
+		suite.Less(size, groupSize)
+	})
+
+	suite.Run("variable width field takes the residual of the group", func() {
+		// json rows are 10x bigger than the schema guesses, the residual of the
+		// measured group size must land on the json column, not on the vector
+		measuredJSONSize := jsonSize * 10
+		groupSize := (pkSize + vecSize + measuredJSONSize) * numRows
+		segment := newSegment(group(groupSize, pkField, vecField, jsonField))
+
+		size, err := estimateFieldsReadSize(schema, segment, []int64{jsonField})
+		suite.NoError(err)
+		suite.Equal(measuredJSONSize*numRows, size)
+
+		size, err = estimateFieldsReadSize(schema, segment, []int64{vecField})
+		suite.NoError(err)
+		suite.Equal(vecSize*numRows, size)
+	})
+
+	suite.Run("every variable width field is charged the whole residual", func() {
+		// the schema weights are guesses, so a single variable width column is
+		// charged all the measured variable bytes of its group instead of a
+		// share of them: under-charging a fat column would over-admit tasks
+		residualPerRow := (jsonSize + varcharSize) * 4
+		groupSize := (pkSize + residualPerRow) * numRows
+		segment := newSegment(group(groupSize, pkField, jsonField, varcharField))
+
+		jsonRead, err := estimateFieldsReadSize(schema, segment, []int64{jsonField})
+		suite.NoError(err)
+		suite.Equal(residualPerRow*numRows, jsonRead)
+
+		varcharRead, err := estimateFieldsReadSize(schema, segment, []int64{varcharField})
+		suite.NoError(err)
+		suite.Equal(residualPerRow*numRows, varcharRead)
+
+		// requesting both does not charge the residual twice
+		bothRead, err := estimateFieldsReadSize(schema, segment, []int64{jsonField, varcharField})
+		suite.NoError(err)
+		suite.Equal(residualPerRow*numRows, bothRead)
+
+		// and the fixed width column of the same group is unaffected
+		pkRead, err := estimateFieldsReadSize(schema, segment, []int64{pkField})
+		suite.NoError(err)
+		suite.Equal(pkSize*numRows, pkRead)
+	})
+
+	suite.Run("residual keeps sub-row remainder bytes", func() {
+		// a group size that is not a multiple of the row count must not lose
+		// its remainder to a per-record truncation: near a slot bucket
+		// boundary that loss could drop the task into a lower bucket
+		jsonBytes := jsonSize*numRows + 777
+		segment := newSegment(group(vecSize*numRows+jsonBytes, vecField, jsonField))
+		size, err := estimateFieldsReadSize(schema, segment, []int64{jsonField})
+		suite.NoError(err)
+		suite.Equal(jsonBytes, size)
+	})
+
+	suite.Run("bool group member does not reduce the measured residual", func() {
+		// bool is measured bit-packed (~1/8 B per row) but the schema charges
+		// 1 B per row: treating it as exact would over-deduct from the
+		// variable width columns of its group
+		boolSchema := &schemapb.CollectionSchema{
+			Fields: append([]*schemapb.FieldSchema{
+				{FieldID: 106, Name: "flag", DataType: schemapb.DataType_Bool},
+			}, schema.Fields...),
+		}
+		boolBytes := numRows / 8
+		jsonBytes := jsonSize * numRows
+		segment := newSegment(group(pkSize*numRows+boolBytes+jsonBytes, 106, pkField, jsonField))
+
+		size, err := estimateFieldsReadSize(boolSchema, segment, []int64{jsonField})
+		suite.NoError(err)
+		suite.Equal(boolBytes+jsonBytes, size)
+	})
+
+	suite.Run("nullable fixed width field is charged its bounded width", func() {
+		// a nullable vector is stored with a variable length encoding and rows
+		// holding null store less than the full width, so the schema size is
+		// not exact. It is still bounded above by the width plus the nullable
+		// encoding overhead, and by the measured residual of its group —
+		// whichever is smaller.
+
+		// half the rows are null: the measured residual is the tighter bound
+		nullableVecBytes := vecSize * numRows / 2
+		segment := newSegment(group(pkSize*numRows+nullableVecBytes, pkField, nullableVecField))
+
+		size, err := estimateFieldsReadSize(schema, segment, []int64{nullableVecField})
+		suite.NoError(err)
+		suite.Equal(nullableVecBytes, size)
+
+		// and it does not consume the fixed width budget of the group
+		size, err = estimateFieldsReadSize(schema, segment, []int64{pkField})
+		suite.NoError(err)
+		suite.Equal(pkSize*numRows, size)
+
+		// no nulls and a fat neighbor: the width bound is the tighter one, the
+		// nullable vector must not absorb the whole residual
+		fatGroupSize := (pkSize+vecSize)*numRows + 10*vecSize*numRows
+		segment = newSegment(group(fatGroupSize, pkField, nullableVecField, jsonField))
+		size, err = estimateFieldsReadSize(schema, segment, []int64{nullableVecField})
+		suite.NoError(err)
+		suite.Equal((vecSize+nullableFixedWidthPadPerRow)*numRows, size)
+	})
+
+	suite.Run("all nullable external group still attributes fixed width columns", func() {
+		// A non milvus-table external collection forces every user field
+		// nullable at create time (Pass 2 of
+		// NormalizeAndValidateExternalCollectionSchema), so nothing in its one
+		// synthetic column group is exact. The indexed vector must still be
+		// charged its bounded width, not the whole 100x bigger group.
+		externalSchema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: pkField, Name: "pk", DataType: schemapb.DataType_Int64, Nullable: true, ExternalField: "pk_col"},
+				{
+					FieldID:       vecField,
+					Name:          "vec",
+					DataType:      schemapb.DataType_FloatVector,
+					Nullable:      true,
+					ExternalField: "vec_col",
+					TypeParams: []*commonpb.KeyValuePair{
+						{Key: common.DimKey, Value: "128"},
+					},
+				},
+				{FieldID: jsonField, Name: "json", DataType: schemapb.DataType_JSON, Nullable: true, ExternalField: "json_col"},
+			},
+		}
+		groupSize := 100 * vecSize * numRows
+		segment := newSegment(group(groupSize, pkField, vecField, jsonField))
+
+		size, err := estimateFieldsReadSize(externalSchema, segment, []int64{vecField})
+		suite.NoError(err)
+		suite.Equal((vecSize+nullableFixedWidthPadPerRow)*numRows, size)
+
+		// a variable length column has no schema bound and nothing exact is
+		// deductible, so it conservatively keeps the whole group
+		size, err = estimateFieldsReadSize(externalSchema, segment, []int64{jsonField})
+		suite.NoError(err)
+		suite.Equal(groupSize, size)
+	})
+
+	suite.Run("schema estimate is used when the group has no residual", func() {
+		// measured data smaller than the fixed width fields alone
+		segment := newSegment(group(pkSize*numRows/2, pkField, jsonField))
+		size, err := estimateFieldsReadSize(schema, segment, []int64{jsonField})
+		suite.NoError(err)
+		// bounded by the group size
+		suite.Equal(pkSize*numRows/2, size)
+	})
+
+	suite.Run("fields of several groups are summed", func() {
+		segment := newSegment(
+			group(vecSize*numRows, vecField),
+			group((pkSize+jsonSize)*numRows, pkField, jsonField),
+		)
+		size, err := estimateFieldsReadSize(schema, segment, []int64{vecField, pkField})
+		suite.NoError(err)
+		suite.Equal((vecSize+pkSize)*numRows, size)
+	})
+
+	suite.Run("segment without a projecting reader is rejected", func() {
+		for name, configure := range map[string]func(*SegmentInfo){
+			"storage v2": func(segment *SegmentInfo) {
+				segment.StorageVersion = storage.StorageV2
+				segment.ManifestPath = ""
+			},
+			"storage v3 without manifest": func(segment *SegmentInfo) {
+				segment.StorageVersion = storage.StorageV3
+				segment.ManifestPath = ""
+			},
+		} {
+			suite.Run(name, func() {
+				segment := newSegment(group((pkSize+jsonSize)*numRows, pkField, jsonField))
+				configure(segment)
+				_, err := estimateFieldsReadSize(schema, segment, []int64{jsonField})
+				suite.Error(err)
+			})
+		}
+	})
+
+	suite.Run("empty segment", func() {
+		segment := newSegment(group(vecSize*numRows, vecField))
+		segment.NumOfRows = 0
+		size, err := estimateFieldsReadSize(schema, segment, []int64{vecField})
+		suite.NoError(err)
+		suite.Equal(int64(0), size)
+	})
+
+	suite.Run("column group without recorded size", func() {
+		segment := newSegment(group(0, vecField))
+		_, err := estimateFieldsReadSize(schema, segment, []int64{vecField})
+		suite.Error(err)
+	})
+
+	suite.Run("no field requested", func() {
+		segment := newSegment(group(vecSize*numRows, vecField))
+		_, err := estimateFieldsReadSize(schema, segment, nil)
+		suite.Error(err)
+	})
+
+	suite.Run("field without binlog", func() {
+		segment := newSegment(group(vecSize*numRows, vecField))
+		_, err := estimateFieldsReadSize(schema, segment, []int64{pkField})
+		suite.Error(err)
+	})
+
+	suite.Run("requested field missing from schema", func() {
+		segment := newSegment(group(vecSize*numRows, vecField, 999))
+		_, err := estimateFieldsReadSize(schema, segment, []int64{999})
+		suite.Error(err)
+	})
+
+	suite.Run("requested field size not estimable", func() {
+		segment := newSegment(group(vecSize*numRows, vecField, badField))
+		_, err := estimateFieldsReadSize(schema, segment, []int64{badField})
+		suite.Error(err)
+	})
+
+	suite.Run("group member missing from schema is skipped", func() {
+		// a field dropped after the segment was flushed still shows up in
+		// ChildFields until compaction rewrites the segment: its bytes stay in
+		// the residual instead of aborting the whole group
+		groupSize := (pkSize + vecSize + jsonSize) * numRows
+		segment := newSegment(group(groupSize, pkField, vecField, jsonField, 999))
+		size, err := estimateFieldsReadSize(schema, segment, []int64{vecField})
+		suite.NoError(err)
+		suite.Equal(vecSize*numRows, size)
+	})
+
+	suite.Run("group member of unestimable size is skipped", func() {
+		groupSize := (pkSize + vecSize + jsonSize) * numRows
+		segment := newSegment(group(groupSize, pkField, vecField, jsonField, badField))
+		size, err := estimateFieldsReadSize(schema, segment, []int64{vecField})
+		suite.NoError(err)
+		suite.Equal(vecSize*numRows, size)
+	})
+
+	suite.Run("regular system fields of a group are charged as fixed width", func() {
+		sysSchema := &schemapb.CollectionSchema{
+			Fields: append([]*schemapb.FieldSchema{
+				{FieldID: 0, Name: common.RowIDFieldName, DataType: schemapb.DataType_Int64},
+				{FieldID: 1, Name: common.TimeStampFieldName, DataType: schemapb.DataType_Int64},
+			}, schema.Fields...),
+		}
+		residualPerRow := jsonSize * 4
+		groupSize := (8 + 8 + pkSize + residualPerRow) * numRows
+		segment := newSegment(group(groupSize, 0, 1, pkField, jsonField))
+
+		size, err := estimateFieldsReadSize(sysSchema, segment, []int64{0})
+		suite.NoError(err)
+		suite.Equal(int64(8)*numRows, size)
+
+		// Regular StorageV3 manifests measure these materialized columns, so
+		// they consume 16B/row of the group budget.
+		size, err = estimateFieldsReadSize(sysSchema, segment, []int64{jsonField})
+		suite.NoError(err)
+		suite.Equal(residualPerRow*numRows, size)
+	})
+
+	suite.Run("external system and virtual fields do not reduce measured residual", func() {
+		const (
+			virtualPKField      = int64(105)
+			functionOutputField = int64(106)
+		)
+		// production shape: user fields mapped from the source are nullable
+		// (Pass 2 of NormalizeAndValidateExternalCollectionSchema), while
+		// system, virtual, and function output fields keep Nullable=false
+		externalSchema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 0, Name: common.RowIDFieldName, DataType: schemapb.DataType_Int64},
+				{FieldID: 1, Name: common.TimeStampFieldName, DataType: schemapb.DataType_Int64},
+				{FieldID: virtualPKField, Name: common.VirtualPKFieldName, DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+				{FieldID: pkField, Name: "pk", DataType: schemapb.DataType_Int64, Nullable: true, ExternalField: "pk_col"},
+				{FieldID: functionOutputField, Name: "generated", DataType: schemapb.DataType_Int64, IsFunctionOutput: true},
+				{FieldID: jsonField, Name: "json", DataType: schemapb.DataType_JSON, Nullable: true, ExternalField: "json_col"},
+			},
+			Functions: []*schemapb.FunctionSchema{
+				{OutputFieldIds: []int64{functionOutputField}},
+			},
+		}
+		residualPerRow := jsonSize * 4
+		// External refresh samples pk_col and json_col, then explicitly adds
+		// generated function outputs. RowID, Timestamp, and VirtualPK still
+		// appear in ChildFields but are absent from the measured group size.
+		groupSize := (pkSize + 8 + residualPerRow) * numRows
+		segment := newSegment(group(groupSize, 0, 1, virtualPKField, pkField, functionOutputField, jsonField))
+
+		// only the function output is deductible; the nullable pk stays in
+		// the residual the json column is charged with
+		size, err := estimateFieldsReadSize(externalSchema, segment, []int64{jsonField})
+		suite.NoError(err)
+		suite.Equal((pkSize+residualPerRow)*numRows, size)
+
+		// the nullable pk itself is charged its bounded width
+		size, err = estimateFieldsReadSize(externalSchema, segment, []int64{pkField})
+		suite.NoError(err)
+		suite.Equal((pkSize+nullableFixedWidthPadPerRow)*numRows, size)
+
+		// Unmeasured generated fields retain their schema-derived estimate when
+		// requested, but do not consume the sampled source-column budget.
+		size, err = estimateFieldsReadSize(externalSchema, segment, []int64{virtualPKField})
+		suite.NoError(err)
+		suite.Equal(int64(8)*numRows, size)
+	})
+
+	suite.Run("unrecognized data type", func() {
+		unknownSchema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: pkField, Name: "pk", DataType: schemapb.DataType_Int64},
+				{FieldID: vecField, Name: "unknown", DataType: schemapb.DataType_None},
+			},
+		}
+		segment := newSegment(group(pkSize*numRows, pkField, vecField))
+		_, err := estimateFieldsReadSize(unknownSchema, segment, []int64{vecField})
+		suite.Error(err)
+	})
+}
+
+func (suite *UtilSuite) TestIsFixedWidthType() {
+	for _, dataType := range []schemapb.DataType{
+		schemapb.DataType_Int64, schemapb.DataType_Double,
+		schemapb.DataType_FloatVector, schemapb.DataType_Int8Vector,
+	} {
+		suite.True(isFixedWidthType(dataType), dataType.String())
+	}
+	for _, dataType := range []schemapb.DataType{
+		// Bool is stored bit-packed, so the 1 byte per row schema estimate is
+		// not exact and it must be attributed from the measured residual
+		schemapb.DataType_Bool,
+		schemapb.DataType_VarChar, schemapb.DataType_Text, schemapb.DataType_JSON,
+		schemapb.DataType_Array, schemapb.DataType_Geometry,
+		schemapb.DataType_SparseFloatVector, schemapb.DataType_ArrayOfVector,
+	} {
+		suite.False(isFixedWidthType(dataType), dataType.String())
+	}
 }
 
 type fixedTSOAllocator struct {
@@ -218,15 +709,12 @@ func (suite *UtilSuite) TestCalculateL0SegmentSize() {
 
 func (suite *UtilSuite) TestCalculateIndexTaskSlot() {
 	pt := paramtable.Get()
-	heavyKey := pt.DataCoordCfg.IndexTaskSlotUsage.Key
 	scalarKey := pt.DataCoordCfg.ScalarIndexTaskSlotUsage.Key
 	workerSlotKey := pt.DataNodeCfg.WorkerSlotUnit.Key
 	buildParallelKey := pt.DataNodeCfg.BuildParallel.Key
-	suite.NoError(pt.Save(heavyKey, "64"))
 	suite.NoError(pt.Save(scalarKey, "16"))
 	suite.NoError(pt.Save(workerSlotKey, "16"))
 	suite.NoError(pt.Save(buildParallelKey, "1"))
-	defer pt.Reset(heavyKey)
 	defer pt.Reset(scalarKey)
 	defer pt.Reset(workerSlotKey)
 	defer pt.Reset(buildParallelKey)
@@ -254,11 +742,48 @@ func (suite *UtilSuite) TestCalculateIndexTaskSlot() {
 			suite.Equal(tc.wantInverted, calculateIndexTaskSlot(tc.fieldSize, 1, invertedParams))
 		})
 	}
+}
 
-	// Existing vector indexes must keep using the same heavy curve after the
-	// helper started accepting the complete parameter set.
-	hnswParams := []*commonpb.KeyValuePair{{Key: common.IndexTypeKey, Value: "HNSW"}}
-	suite.Equal(int64(16), calculateIndexTaskSlot(200*mib, 1, hnswParams))
+func (suite *UtilSuite) TestCalculateVectorIndexTaskSlot() {
+	pt := paramtable.Get()
+	workerSlotKey := pt.DataNodeCfg.WorkerSlotUnit.Key
+	buildParallelKey := pt.DataNodeCfg.BuildParallel.Key
+	suite.NoError(pt.Save(workerSlotKey, "16"))
+	suite.NoError(pt.Save(buildParallelKey, "1"))
+	defer pt.Reset(workerSlotKey)
+	defer pt.Reset(buildParallelKey)
+
+	const mib = int64(1 << 20)
+	for _, gpuBuild := range []string{"", "false", "true", "invalid"} {
+		params := []*commonpb.KeyValuePair{
+			{Key: common.IndexTypeKey, Value: "HNSW"},
+			{Key: "gpu_build", Value: gpuBuild},
+		}
+		for _, tc := range []struct {
+			bytes int64
+			slots int64
+		}{
+			{0, 1},
+			{10 * mib, 1},
+			{128 * mib, 1},
+			{128*mib + 1, 2},
+			{200 * mib, 2},
+			{256 * mib, 2},
+			{512 * mib, 4},
+			{512*mib + 1, 5},
+			{1024 * mib, 8},
+			{6 * 1024 * mib, 48},
+		} {
+			suite.Equal(tc.slots, calculateIndexTaskSlot(tc.bytes, 1, params))
+		}
+	}
+
+	params := []*commonpb.KeyValuePair{{Key: common.IndexTypeKey, Value: "HNSW"}}
+	suite.NoError(pt.Save(workerSlotKey, "32"))
+	suite.Equal(int64(16), calculateIndexTaskSlot(1024*mib, 1, params))
+	suite.NoError(pt.Save(workerSlotKey, "16"))
+	suite.NoError(pt.Save(buildParallelKey, "2"))
+	suite.Equal(int64(16), calculateIndexTaskSlot(1024*mib, 1, params))
 }
 
 func (suite *UtilSuite) TestEstimateFMIndexBuildPeakBytes() {
@@ -427,4 +952,111 @@ func (suite *UtilSuite) TestMergeFieldBinlogsPreservesColumnGroupMetadata() {
 	suite.Equal([]int64{102, 103}, result[0].GetChildFields())
 	suite.Equal("parquet", result[0].GetFormat())
 	suite.Len(result[0].GetBinlogs(), 2)
+}
+
+// TestFilterInIndexedSegmentsStructVector: a segment is indexed only when the
+// index of every vector field is Finished, struct vector sub-fields included.
+// A fake-finished build (too few vectors, e.g. all null) is Finished too.
+func TestFilterInIndexedSegmentsStructVector(t *testing.T) {
+	const (
+		collectionID   = int64(1)
+		subVecFieldID  = int64(102)
+		topVecFieldID  = int64(104)
+		subVecIndexID  = int64(1002)
+		topVecIndexID  = int64(1004)
+		fakeFinishedOK = "fake finished index success"
+	)
+	structField := &schemapb.StructArrayFieldSchema{FieldID: 101, Name: "items", Fields: []*schemapb.FieldSchema{
+		{FieldID: subVecFieldID, Name: "items[vec]", DataType: schemapb.DataType_ArrayOfVector, ElementType: schemapb.DataType_FloatVector},
+		{FieldID: 103, Name: "items[ints]", DataType: schemapb.DataType_Array, ElementType: schemapb.DataType_Int64},
+	}}
+	pk := &schemapb.FieldSchema{FieldID: 100, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true}
+
+	type segIndex struct {
+		indexID int64
+		state   commonpb.IndexState
+		reason  string
+	}
+	run := func(t *testing.T, schema *schemapb.CollectionSchema, indexedFields []int64, segments map[int64][]segIndex, want []int64) {
+		handler := NewNMockHandler(t)
+		handler.EXPECT().GetCollection(mock.Anything, collectionID).Return(&collectionInfo{ID: collectionID, Schema: schema}, nil)
+		indexes := make(map[UniqueID]*model.Index)
+		for _, fieldID := range indexedFields {
+			indexID := subVecIndexID
+			if fieldID == topVecFieldID {
+				indexID = topVecIndexID
+			}
+			indexes[indexID] = &model.Index{CollectionID: collectionID, FieldID: fieldID, IndexID: indexID}
+		}
+		im := &indexMeta{
+			indexes:        map[UniqueID]map[UniqueID]*model.Index{collectionID: indexes},
+			segmentIndexes: typeutil.NewConcurrentMap[UniqueID, *typeutil.ConcurrentMap[UniqueID, *model.SegmentIndex]](),
+		}
+		var infos []*SegmentInfo
+		for segmentID := int64(1); segmentID <= int64(len(segments)); segmentID++ {
+			infos = append(infos, NewSegmentInfo(&datapb.SegmentInfo{
+				ID: segmentID, CollectionID: collectionID, State: commonpb.SegmentState_Flushed, NumOfRows: 10,
+			}))
+			if len(segments[segmentID]) == 0 {
+				continue
+			}
+			byIndex := typeutil.NewConcurrentMap[UniqueID, *model.SegmentIndex]()
+			for _, idx := range segments[segmentID] {
+				byIndex.Insert(idx.indexID, &model.SegmentIndex{
+					CollectionID: collectionID, SegmentID: segmentID, IndexID: idx.indexID,
+					IndexState: idx.state, FailReason: idx.reason,
+				})
+			}
+			im.segmentIndexes.Insert(segmentID, byIndex)
+		}
+		got := FilterInIndexedSegments(context.Background(), handler, &meta{indexMeta: im}, false, infos...)
+		gotIDs := make([]int64, 0, len(got))
+		for _, segment := range got {
+			gotIDs = append(gotIDs, segment.GetID())
+		}
+		require.ElementsMatch(t, want, gotIDs)
+	}
+
+	t.Run("struct_vector_only", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{pk}, StructArrayFields: []*schemapb.StructArrayFieldSchema{structField}}
+		run(t, schema, []int64{subVecFieldID}, map[int64][]segIndex{
+			1: {{subVecIndexID, commonpb.IndexState_Unissued, ""}},
+			2: {{subVecIndexID, commonpb.IndexState_InProgress, ""}},
+			3: {{subVecIndexID, commonpb.IndexState_Failed, "build failed"}},
+			4: {{subVecIndexID, commonpb.IndexState_Finished, ""}},
+			5: {{subVecIndexID, commonpb.IndexState_Finished, fakeFinishedOK}},
+			6: nil, // no index task yet
+		}, []int64{4, 5})
+	})
+
+	t.Run("struct_vector_without_index", func(t *testing.T) {
+		schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{pk}, StructArrayFields: []*schemapb.StructArrayFieldSchema{structField}}
+		run(t, schema, nil, map[int64][]segIndex{1: nil}, nil)
+	})
+
+	t.Run("top_level_and_struct_vector", func(t *testing.T) {
+		top := &schemapb.FieldSchema{FieldID: topVecFieldID, Name: "embedding", DataType: schemapb.DataType_FloatVector}
+		schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{pk, top}, StructArrayFields: []*schemapb.StructArrayFieldSchema{structField}}
+		run(t, schema, []int64{topVecFieldID, subVecFieldID}, map[int64][]segIndex{
+			1: {{topVecIndexID, commonpb.IndexState_Finished, ""}, {subVecIndexID, commonpb.IndexState_Finished, fakeFinishedOK}},
+			2: {{topVecIndexID, commonpb.IndexState_Finished, ""}, {subVecIndexID, commonpb.IndexState_InProgress, ""}},
+			3: {{topVecIndexID, commonpb.IndexState_InProgress, ""}, {subVecIndexID, commonpb.IndexState_Finished, ""}},
+			4: {{topVecIndexID, commonpb.IndexState_Finished, ""}, {subVecIndexID, commonpb.IndexState_Failed, "build failed"}},
+			5: {{topVecIndexID, commonpb.IndexState_Finished, ""}},
+		}, []int64{1})
+		// A struct vector without any index keeps every segment unindexed, as
+		// for a top-level vector without an index.
+		run(t, schema, []int64{topVecFieldID}, map[int64][]segIndex{
+			1: {{topVecIndexID, commonpb.IndexState_Finished, ""}},
+		}, nil)
+	})
+
+	t.Run("top_level_vector_only", func(t *testing.T) {
+		top := &schemapb.FieldSchema{FieldID: topVecFieldID, Name: "embedding", DataType: schemapb.DataType_FloatVector}
+		schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{pk, top}}
+		run(t, schema, []int64{topVecFieldID}, map[int64][]segIndex{
+			1: {{topVecIndexID, commonpb.IndexState_Finished, ""}},
+			2: {{topVecIndexID, commonpb.IndexState_InProgress, ""}},
+		}, []int64{1})
+	})
 }

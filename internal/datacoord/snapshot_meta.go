@@ -808,7 +808,7 @@ func (sm *snapshotMeta) DropSnapshotsByCollection(ctx context.Context, collectio
 	return dropped, nil
 }
 
-// ListSnapshots returns snapshot names filtered by collection and/or partition.
+// ListSnapshots returns detached summaries filtered by collection and/or partition.
 //
 // This provides fast snapshot listing by querying the in-memory cache without
 // accessing catalog or S3. Supports flexible filtering:
@@ -826,10 +826,10 @@ func (sm *snapshotMeta) DropSnapshotsByCollection(ctx context.Context, collectio
 //   - partitionID: Filter by partition ID, or <= 0 for all partitions
 //
 // Returns:
-//   - []string: List of snapshot names matching the filter criteria
+//   - []*datapb.SnapshotSummary: Detached summaries matching the filter criteria
 //   - error: Always returns nil (reserved for future error handling)
-func (sm *snapshotMeta) ListSnapshots(ctx context.Context, collectionID int64, partitionID int64) ([]string, error) {
-	ret := make([]string, 0)
+func (sm *snapshotMeta) ListSnapshots(ctx context.Context, collectionID int64, partitionID int64) ([]*datapb.SnapshotSummary, error) {
+	ret := make([]*datapb.SnapshotSummary, 0)
 
 	// If collectionID is specified, use index for O(M) lookup instead of O(N)
 	if collectionID > 0 {
@@ -850,7 +850,11 @@ func (sm *snapshotMeta) ListSnapshots(ctx context.Context, collectionID int64, p
 
 			// Check partition filter
 			if partitionID <= 0 || slices.Contains(info.GetPartitionIds(), partitionID) {
-				ret = append(ret, info.GetName())
+				ret = append(ret, &datapb.SnapshotSummary{
+					Name:        info.GetName(),
+					CreateTs:    info.GetCreateTs(),
+					Description: info.GetDescription(),
+				})
 			}
 			return true
 		})
@@ -864,7 +868,11 @@ func (sm *snapshotMeta) ListSnapshots(ctx context.Context, collectionID int64, p
 		partitionMatch := partitionID <= 0 || slices.Contains(info.GetPartitionIds(), partitionID)
 
 		if partitionMatch {
-			ret = append(ret, info.GetName())
+			ret = append(ret, &datapb.SnapshotSummary{
+				Name:        info.GetName(),
+				CreateTs:    info.GetCreateTs(),
+				Description: info.GetDescription(),
+			})
 		}
 		return true // Continue iteration
 	})
@@ -938,6 +946,23 @@ func (sm *snapshotMeta) ReadSnapshotData(ctx context.Context, collectionID int64
 	if err != nil {
 		mlog.Error(context.TODO(), "failed to read snapshot data from S3", mlog.Err(err))
 		return nil, err
+	}
+	// Named, referenced snapshots point at this instance's storage. Older
+	// snapshots retain relative V3 manifest bases whose files remain under the
+	// legacy local prefix. Resolve only the returned view to their absolute paths;
+	// the stored snapshot is immutable, and foreign/self-contained layouts use other roots.
+	if local, ok := sm.chunkManager.(*storage.LocalChunkManager); ok && snapshotData.Layout == datapb.SnapshotLayout_SnapshotLayoutReferenced {
+		for _, segment := range snapshotData.Segments {
+			if segment.GetStorageVersion() != storage.StorageV3 || segment.GetManifestPath() == "" {
+				continue
+			}
+			manifestPath, err := normalizeLocalManifestPath(segment.GetManifestPath(), local.RootPath(),
+				Params.MinioCfg.RootPath.GetValue(), collectionID, segment.GetPartitionId(), segment.GetSegmentId())
+			if err != nil {
+				return nil, merr.Wrapf(err, "normalize local snapshot %d segment %d manifest", snapshotInfo.GetId(), segment.GetSegmentId())
+			}
+			segment.ManifestPath = manifestPath
+		}
 	}
 
 	// Step 3: Merge S3 location from memory into returned data

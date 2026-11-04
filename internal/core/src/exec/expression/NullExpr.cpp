@@ -16,10 +16,12 @@
 
 #include "NullExpr.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "common/Array.h"
 #include "common/EasyAssert.h"
@@ -43,11 +45,12 @@ PhyNullExpr::Eval(EvalCtx& context, VectorPtr& result) {
     span.SetAttribute("data_type", static_cast<int>(expr_->column_.data_type_));
 
     auto input = context.get_offset_input();
-    auto data_type = expr_->column_.data_type_;
+    SetHasOffsetInput(input != nullptr);
     if (expr_->column_.element_level_) {
-        data_type = expr_->column_.element_type_;
+        result = ExecElementLevelNull(input);
+        return;
     }
-    switch (data_type) {
+    switch (expr_->column_.data_type_) {
         case DataType::BOOL: {
             result = ExecVisitorImpl<bool>(input);
             break;
@@ -114,6 +117,15 @@ PhyNullExpr::Eval(EvalCtx& context, VectorPtr& result) {
             }
             break;
         }
+        case DataType::VECTOR_FLOAT:
+        case DataType::VECTOR_BINARY:
+        case DataType::VECTOR_FLOAT16:
+        case DataType::VECTOR_BFLOAT16:
+        case DataType::VECTOR_SPARSE_U32_F32:
+        case DataType::VECTOR_INT8: {
+            result = ExecVectorNull(input);
+            break;
+        }
         default:
             ThrowInfo(UnexpectedError,
                       "unsupported data type: {}",
@@ -123,17 +135,116 @@ PhyNullExpr::Eval(EvalCtx& context, VectorPtr& result) {
 
 void
 PhyNullExpr::DetermineExecPath() {
-    if (expr_->column_.data_type_ == DataType::VECTOR_ARRAY) {
+    // Element validity is read from raw data; a field without null elements
+    // is not read at all.
+    if (expr_->column_.element_level_ ||
+        IsVectorDataType(expr_->column_.data_type_)) {
         exec_path_ = ExprExecPath::RawData;
         return;
     }
 
-    SegmentExpr::DetermineExecPath();
+    auto req = MakeIndexRequirement(RequiredReader::Null);
+    req.value_type = expr_->column_.data_type_;
+    SelectAndPinIndex(req);
     if (PinnedIndexIsNested()) {
+        ClearSelectedIndex();
         exec_path_ = ExprExecPath::RawData;
-        pinned_index_.clear();
-        num_index_chunk_ = 0;
     }
+}
+
+void
+PhyNullExpr::MoveCursor() {
+    if (!expr_->column_.element_level_ &&
+        IsOrdinaryVectorDataType(expr_->column_.data_type_)) {
+        if (!has_offset_input_ && !execute_all_at_once_) {
+            current_data_global_pos_ +=
+                std::min(batch_size_, active_count_ - current_data_global_pos_);
+        }
+        return;
+    }
+
+    if (!expr_->column_.element_level_ && !expr_->column_.nullable_ &&
+        !has_offset_input_ && !execute_all_at_once_) {
+        // Constant scalar results use a separate cursor in PreCheckNullable.
+        precheck_pos_ += std::min(batch_size_, active_count_ - precheck_pos_);
+    }
+    SegmentExpr::MoveCursor();
+}
+
+bool
+PhyNullExpr::CanExecuteAllAtOnce() const {
+    if (expr_->column_.element_level_ ||
+        IsOrdinaryVectorDataType(expr_->column_.data_type_)) {
+        return false;
+    }
+    return SegmentExpr::CanExecuteAllAtOnce();
+}
+
+void
+PhyNullExpr::PrefetchRawData() {
+    if (expr_->column_.element_level_) {
+        if (is_element_nullable_) {
+            SegmentExpr::PrefetchRawData();
+        }
+        return;
+    }
+    if (IsOrdinaryVectorDataType(expr_->column_.data_type_)) {
+        return;
+    }
+    SegmentExpr::PrefetchRawData();
+}
+
+// `$[x] IS NULL` / `IS NOT NULL` on one struct element: true or false from
+// the element's own validity, never UNKNOWN. Elements of a NULL struct row
+// do not exist, so row validity plays no part.
+VectorPtr
+PhyNullExpr::ExecElementLevelNull(OffsetVector* input) {
+    auto next_batch_size = GetNextRealBatchSize(input, true);
+    if (!next_batch_size.has_value()) {
+        return nullptr;
+    }
+    const auto elem_count = *next_batch_size;
+    if (auto res = AdvanceEmptyElementBatch(input, true, elem_count)) {
+        return res;
+    }
+    return BuildNullResult(ProcessElementValidity(input, elem_count));
+}
+
+VectorPtr
+PhyNullExpr::ExecVectorNull(OffsetVector* input) {
+    if (!expr_->column_.nullable_) {
+        const auto batch_size =
+            input != nullptr
+                ? static_cast<int64_t>(input->size())
+                : std::min(batch_size_,
+                           active_count_ - current_data_global_pos_);
+        if (input == nullptr) {
+            current_data_global_pos_ += batch_size;
+        }
+        return BuildNullResult(TargetBitmap(batch_size, true));
+    }
+
+    if (input != nullptr) {
+        TargetBitmap valid_res(input->size(), true);
+        std::vector<int64_t> offsets(input->begin(), input->end());
+        segment_->ApplyFieldValidDataByOffsets(op_ctx_,
+                                               field_id_,
+                                               offsets.data(),
+                                               offsets.size(),
+                                               TargetBitmapView(valid_res));
+        return BuildNullResult(std::move(valid_res));
+    }
+
+    const auto batch_size =
+        std::min(batch_size_, active_count_ - current_data_global_pos_);
+    TargetBitmap valid_res(batch_size, true);
+    segment_->ApplyFieldValidDataByRange(op_ctx_,
+                                         field_id_,
+                                         current_data_global_pos_,
+                                         batch_size,
+                                         TargetBitmapView(valid_res));
+    current_data_global_pos_ += batch_size;
+    return BuildNullResult(std::move(valid_res));
 }
 
 template <typename T>
@@ -146,13 +257,7 @@ PhyNullExpr::ExecVisitorImpl(OffsetVector* input) {
         (input != nullptr)
             ? ProcessChunksForValidByOffsets<T>(UseIndexCursor(), *input)
             : ProcessChunksForValid<T>(UseIndexCursor());
-    TargetBitmap res = valid_res.clone();
-    if (expr_->op_ == proto::plan::NullExpr_NullOp_IsNull) {
-        res.flip();
-    }
-    auto res_vec = std::make_shared<ColumnVector>(
-        std::move(res), TargetBitmap(valid_res.size(), true));
-    return res_vec;
+    return BuildNullResult(std::move(valid_res));
 }
 
 // if nullable is false, no need to process chunks
@@ -173,18 +278,18 @@ PhyNullExpr::PreCheckNullable(OffsetVector* input) {
         precheck_pos_ += batch_size;
     }
 
-    auto res_vec = std::make_shared<ColumnVector>(TargetBitmap(batch_size),
-                                                  TargetBitmap(batch_size));
-    TargetBitmapView res(res_vec->GetRawData(), batch_size);
-    TargetBitmapView valid_res(res_vec->GetValidRawData(), batch_size);
-    valid_res.set();
+    return BuildNullResult(TargetBitmap(batch_size, true));
+}
+
+ColumnVectorPtr
+PhyNullExpr::BuildNullResult(TargetBitmap&& field_valid) const {
+    auto size = field_valid.size();
     switch (expr_->op_) {
         case proto::plan::NullExpr_NullOp_IsNull: {
-            res.reset();
+            field_valid.flip();
             break;
         }
         case proto::plan::NullExpr_NullOp_IsNotNull: {
-            res.set();
             break;
         }
         default:
@@ -192,7 +297,8 @@ PhyNullExpr::PreCheckNullable(OffsetVector* input) {
                       "unsupported null expr type {}",
                       proto::plan::NullExpr_NullOp_Name(expr_->op_));
     }
-    return res_vec;
+    return std::make_shared<ColumnVector>(std::move(field_valid),
+                                          TargetBitmap(size, true));
 }
 
 }  //namespace exec

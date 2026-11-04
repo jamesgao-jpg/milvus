@@ -29,13 +29,13 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus/internal/datacoord/allocator"
 	"github.com/milvus-io/milvus/internal/datacoord/session"
+	"github.com/milvus-io/milvus/internal/metacache"
 	"github.com/milvus-io/milvus/internal/metastore/mocks"
 	"github.com/milvus-io/milvus/internal/util/importutilv2"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v3/taskcommon"
 	"github.com/milvus-io/milvus/pkg/v3/util/timerecord"
-	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 func TestImportTask_TaskTime(t *testing.T) {
@@ -71,8 +71,11 @@ func TestImportTask_GetNodeID(t *testing.T) {
 func TestImportTask_CreateTaskOnWorker(t *testing.T) {
 	t.Run("AssembleImportRequest failed", func(t *testing.T) {
 		catalog := mocks.NewDataCoordCatalog(t)
+		catalog.EXPECT().ListReshardTasks(mock.Anything).Return(nil, nil).Maybe()
+		catalog.EXPECT().ListImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportJobs(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().ListPreImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListPreImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportTasks(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().SaveImportTask(mock.Anything, mock.Anything).Return(nil)
 		catalog.EXPECT().SaveImportJob(mock.Anything, mock.Anything).Return(nil)
@@ -99,7 +102,7 @@ func TestImportTask_CreateTaskOnWorker(t *testing.T) {
 		}
 		task := &importTask{
 			alloc:      alloc,
-			meta:       &meta{collections: typeutil.NewConcurrentMap[UniqueID, *collectionInfo]()},
+			meta:       newEmptyTestMeta(),
 			importMeta: im,
 			tr:         timerecord.NewTimeRecorder(""),
 		}
@@ -112,10 +115,79 @@ func TestImportTask_CreateTaskOnWorker(t *testing.T) {
 		assert.Equal(t, datapb.ImportTaskStateV2_Pending, task.GetState())
 	})
 
-	t.Run("CreateImport rpc failed", func(t *testing.T) {
+	t.Run("ErrIDRangeTooSmall fails the job terminally", func(t *testing.T) {
 		catalog := mocks.NewDataCoordCatalog(t)
 		catalog.EXPECT().ListImportJobs(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListReshardTasks(mock.Anything).Return(nil, nil).Maybe()
+		catalog.EXPECT().ListImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListPreImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListPreImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
+		catalog.EXPECT().ListImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().SaveImportTask(mock.Anything, mock.Anything).Return(nil)
+		catalog.EXPECT().SaveImportJob(mock.Anything, mock.Anything).Return(nil)
+
+		im, err := NewImportMeta(context.TODO(), catalog, nil, nil)
+		assert.NoError(t, err)
+
+		var job ImportJob = &importJob{
+			ImportJob: &datapb.ImportJob{
+				JobID: 1,
+			},
+		}
+		err = im.AddJob(context.TODO(), job)
+		assert.NoError(t, err)
+
+		alloc := allocator.NewMockAllocator(t)
+		alloc.EXPECT().AllocTimestamp(mock.Anything).Return(1000, nil).Maybe()
+		alloc.EXPECT().AllocN(mock.Anything).Return(int64(1000), int64(2000), nil).Maybe()
+
+		// 101 local rows, only 100 ids reserved: the cursor cannot cover the file, and
+		// no retry changes either number, so the job must fail now with the reason.
+		taskProto := &datapb.ImportTaskV2{
+			JobID:        1,
+			TaskID:       2,
+			CollectionID: 3,
+			State:        datapb.ImportTaskStateV2_Pending,
+			FileStats: []*datapb.ImportFileStats{
+				{
+					ImportFile: &internalpb.ImportFile{
+						Id:      1,
+						Paths:   []string{"f1"},
+						IdRange: &commonpb.IDRange{Begin: 5000, End: 5100},
+					},
+					TotalRows: 101,
+				},
+			},
+		}
+		task := &importTask{
+			alloc:      alloc,
+			meta:       newEmptyTestMeta(),
+			importMeta: im,
+			tr:         timerecord.NewTimeRecorder(""),
+		}
+		task.task.Store(taskProto)
+		err = im.AddTask(context.TODO(), task)
+		assert.NoError(t, err)
+
+		// No CreateImport expectation: the mock fails the test if the RPC is attempted.
+		cluster := session.NewMockCluster(t)
+		task.CreateTaskOnWorker(1, cluster)
+
+		got := im.GetJob(context.TODO(), 1)
+		assert.Equal(t, internalpb.ImportJobState_Failed, got.GetState())
+		assert.Contains(t, got.GetReason(), "does not match the exactly reserved ID range")
+		assert.Contains(t, got.GetReason(), "101 rows, 100 ids reserved")
+		assert.Equal(t, int64(0), task.GetTaskVersion(),
+			"a terminal assemble failure must not consume a retry budget")
+	})
+
+	t.Run("CreateImport rpc failed", func(t *testing.T) {
+		catalog := mocks.NewDataCoordCatalog(t)
+		catalog.EXPECT().ListReshardTasks(mock.Anything).Return(nil, nil).Maybe()
+		catalog.EXPECT().ListImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
+		catalog.EXPECT().ListImportJobs(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListPreImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListPreImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportTasks(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().SaveImportTask(mock.Anything, mock.Anything).Return(nil)
 		catalog.EXPECT().SaveImportJob(mock.Anything, mock.Anything).Return(nil)
@@ -143,7 +215,7 @@ func TestImportTask_CreateTaskOnWorker(t *testing.T) {
 		}
 		task := &importTask{
 			alloc:      alloc,
-			meta:       &meta{collections: typeutil.NewConcurrentMap[UniqueID, *collectionInfo]()},
+			meta:       newEmptyTestMeta(),
 			importMeta: im,
 			tr:         timerecord.NewTimeRecorder(""),
 		}
@@ -159,8 +231,11 @@ func TestImportTask_CreateTaskOnWorker(t *testing.T) {
 
 	t.Run("UpdateTask failed", func(t *testing.T) {
 		catalog := mocks.NewDataCoordCatalog(t)
+		catalog.EXPECT().ListReshardTasks(mock.Anything).Return(nil, nil).Maybe()
+		catalog.EXPECT().ListImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportJobs(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().ListPreImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListPreImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportTasks(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().SaveImportTask(mock.Anything, mock.Anything).Return(nil)
 		catalog.EXPECT().SaveImportJob(mock.Anything, mock.Anything).Return(nil)
@@ -188,7 +263,7 @@ func TestImportTask_CreateTaskOnWorker(t *testing.T) {
 		}
 		task := &importTask{
 			alloc:      alloc,
-			meta:       &meta{collections: typeutil.NewConcurrentMap[UniqueID, *collectionInfo]()},
+			meta:       newEmptyTestMeta(),
 			importMeta: im,
 			tr:         timerecord.NewTimeRecorder(""),
 		}
@@ -209,8 +284,11 @@ func TestImportTask_CreateTaskOnWorker(t *testing.T) {
 
 	t.Run("normal", func(t *testing.T) {
 		catalog := mocks.NewDataCoordCatalog(t)
+		catalog.EXPECT().ListReshardTasks(mock.Anything).Return(nil, nil).Maybe()
+		catalog.EXPECT().ListImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportJobs(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().ListPreImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListPreImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportTasks(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().SaveImportTask(mock.Anything, mock.Anything).Return(nil)
 		catalog.EXPECT().SaveImportJob(mock.Anything, mock.Anything).Return(nil)
@@ -238,7 +316,7 @@ func TestImportTask_CreateTaskOnWorker(t *testing.T) {
 		}
 		task := &importTask{
 			alloc:      alloc,
-			meta:       &meta{collections: typeutil.NewConcurrentMap[UniqueID, *collectionInfo]()},
+			meta:       newEmptyTestMeta(),
 			importMeta: im,
 			tr:         timerecord.NewTimeRecorder(""),
 		}
@@ -256,8 +334,11 @@ func TestImportTask_CreateTaskOnWorker(t *testing.T) {
 func TestImportTask_QueryTaskOnWorker(t *testing.T) {
 	t.Run("QueryImport rpc failed", func(t *testing.T) {
 		catalog := mocks.NewDataCoordCatalog(t)
+		catalog.EXPECT().ListReshardTasks(mock.Anything).Return(nil, nil).Maybe()
+		catalog.EXPECT().ListImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportJobs(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().ListPreImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListPreImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportTasks(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().SaveImportTask(mock.Anything, mock.Anything).Return(nil)
 
@@ -273,11 +354,8 @@ func TestImportTask_QueryTaskOnWorker(t *testing.T) {
 			State:        datapb.ImportTaskStateV2_InProgress,
 		}
 		task := &importTask{
-			alloc: nil,
-			meta: &meta{
-				collections: typeutil.NewConcurrentMap[UniqueID, *collectionInfo](),
-				segments:    NewSegmentsInfo(),
-			},
+			alloc:      nil,
+			meta:       newEmptyTestMeta(),
 			importMeta: im,
 			tr:         timerecord.NewTimeRecorder(""),
 		}
@@ -296,8 +374,11 @@ func TestImportTask_QueryTaskOnWorker(t *testing.T) {
 
 	t.Run("QueryImport rpc failed resets NumOfRows", func(t *testing.T) {
 		catalog := mocks.NewDataCoordCatalog(t)
+		catalog.EXPECT().ListReshardTasks(mock.Anything).Return(nil, nil).Maybe()
+		catalog.EXPECT().ListImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportJobs(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().ListPreImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListPreImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportTasks(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().SaveImportTask(mock.Anything, mock.Anything).Return(nil)
 
@@ -314,12 +395,13 @@ func TestImportTask_QueryTaskOnWorker(t *testing.T) {
 		}
 		segCatalog := mocks.NewDataCoordCatalog(t)
 		segCatalog.EXPECT().AlterSegments(mock.Anything, mock.Anything).Return(nil)
+		ms := metacache.NewMetaStore(segCatalog)
 		task := &importTask{
 			alloc: nil,
 			meta: &meta{
-				catalog:     segCatalog,
-				collections: typeutil.NewConcurrentMap[UniqueID, *collectionInfo](),
-				segments:    NewSegmentsInfo(),
+				catalog:   segCatalog,
+				metaStore: ms,
+				segments:  NewSegmentsInfo(ms),
 			},
 			importMeta: im,
 			tr:         timerecord.NewTimeRecorder(""),
@@ -356,8 +438,11 @@ func TestImportTask_QueryTaskOnWorker(t *testing.T) {
 
 	t.Run("import failed", func(t *testing.T) {
 		catalog := mocks.NewDataCoordCatalog(t)
+		catalog.EXPECT().ListReshardTasks(mock.Anything).Return(nil, nil).Maybe()
+		catalog.EXPECT().ListImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportJobs(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().ListPreImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListPreImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportTasks(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().SaveImportTask(mock.Anything, mock.Anything).Return(nil)
 		catalog.EXPECT().SaveImportJob(mock.Anything, mock.Anything).Return(nil)
@@ -382,11 +467,12 @@ func TestImportTask_QueryTaskOnWorker(t *testing.T) {
 			NodeID:       7,
 			State:        datapb.ImportTaskStateV2_InProgress,
 		}
+		importStore := metacache.NewMetaStore(nil)
 		task := &importTask{
 			alloc: nil,
 			meta: &meta{
-				collections: typeutil.NewConcurrentMap[UniqueID, *collectionInfo](),
-				segments:    NewSegmentsInfo(),
+				metaStore: importStore,
+				segments:  NewSegmentsInfo(importStore),
 			},
 			importMeta: im,
 			tr:         timerecord.NewTimeRecorder(""),
@@ -407,8 +493,11 @@ func TestImportTask_QueryTaskOnWorker(t *testing.T) {
 
 	t.Run("normal, task in-progress", func(t *testing.T) {
 		catalog := mocks.NewDataCoordCatalog(t)
+		catalog.EXPECT().ListReshardTasks(mock.Anything).Return(nil, nil).Maybe()
+		catalog.EXPECT().ListImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportJobs(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().ListPreImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListPreImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportTasks(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().SaveImportTask(mock.Anything, mock.Anything).Return(nil)
 
@@ -423,11 +512,12 @@ func TestImportTask_QueryTaskOnWorker(t *testing.T) {
 			NodeID:       7,
 			State:        datapb.ImportTaskStateV2_InProgress,
 		}
+		importStore := metacache.NewMetaStore(nil)
 		task := &importTask{
 			alloc: nil,
 			meta: &meta{
-				collections: typeutil.NewConcurrentMap[UniqueID, *collectionInfo](),
-				segments:    NewSegmentsInfo(),
+				metaStore: importStore,
+				segments:  NewSegmentsInfo(importStore),
 			},
 			importMeta: im,
 			tr:         timerecord.NewTimeRecorder(""),
@@ -475,8 +565,11 @@ func TestImportTask_QueryTaskOnWorker(t *testing.T) {
 
 	t.Run("normal, task completed", func(t *testing.T) {
 		catalog := mocks.NewDataCoordCatalog(t)
+		catalog.EXPECT().ListReshardTasks(mock.Anything).Return(nil, nil).Maybe()
+		catalog.EXPECT().ListImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportJobs(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().ListPreImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListPreImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportTasks(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().SaveImportTask(mock.Anything, mock.Anything).Return(nil)
 		catalog.EXPECT().SaveImportJob(mock.Anything, mock.Anything).Return(nil)
@@ -500,11 +593,12 @@ func TestImportTask_QueryTaskOnWorker(t *testing.T) {
 			NodeID:       7,
 			State:        datapb.ImportTaskStateV2_InProgress,
 		}
+		importStore := metacache.NewMetaStore(nil)
 		task := &importTask{
 			alloc: nil,
 			meta: &meta{
-				collections: typeutil.NewConcurrentMap[UniqueID, *collectionInfo](),
-				segments:    NewSegmentsInfo(),
+				metaStore: importStore,
+				segments:  NewSegmentsInfo(importStore),
 			},
 			importMeta: im,
 			tr:         timerecord.NewTimeRecorder(""),
@@ -516,12 +610,14 @@ func TestImportTask_QueryTaskOnWorker(t *testing.T) {
 		task.meta.segments.SetSegment(5, &SegmentInfo{
 			SegmentInfo: &datapb.SegmentInfo{
 				ID:        5,
+				State:     commonpb.SegmentState_Importing,
 				NumOfRows: 100,
 			},
 		})
 		task.meta.segments.SetSegment(6, &SegmentInfo{
 			SegmentInfo: &datapb.SegmentInfo{
 				ID:        6,
+				State:     commonpb.SegmentState_Importing,
 				NumOfRows: 100,
 			},
 		})
@@ -554,6 +650,75 @@ func TestImportTask_QueryTaskOnWorker(t *testing.T) {
 		assert.EqualValues(t, 333, seg6Stats.GetStatsBinlogSize())
 	})
 
+	// DropCollection marks the preallocated import segments Dropped while the
+	// task is still running on the DataNode. The late result must fail the
+	// job instead of writing the segments back to Flushed.
+	t.Run("completed result for dropped segments fails the job", func(t *testing.T) {
+		catalog := mocks.NewDataCoordCatalog(t)
+		catalog.EXPECT().ListReshardTasks(mock.Anything).Return(nil, nil).Maybe()
+		catalog.EXPECT().ListImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
+		catalog.EXPECT().ListImportJobs(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListPreImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListPreImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
+		catalog.EXPECT().ListImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().SaveImportTask(mock.Anything, mock.Anything).Return(nil)
+		catalog.EXPECT().SaveImportJob(mock.Anything, mock.Anything).Return(nil)
+		catalog.EXPECT().AlterSegments(mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+
+		im, err := NewImportMeta(context.TODO(), catalog, nil, nil)
+		require.NoError(t, err)
+		require.NoError(t, im.AddJob(context.TODO(), &importJob{
+			ImportJob: &datapb.ImportJob{
+				JobID: 1,
+				State: internalpb.ImportJobState_Importing,
+			},
+		}))
+
+		taskProto := &datapb.ImportTaskV2{
+			JobID:        1,
+			TaskID:       2,
+			CollectionID: 3,
+			SegmentIDs:   []int64{5},
+			NodeID:       7,
+			State:        datapb.ImportTaskStateV2_InProgress,
+		}
+		importStore := metacache.NewMetaStore(catalog)
+		task := &importTask{
+			meta: &meta{
+				catalog:   catalog,
+				metaStore: importStore,
+				segments:  NewSegmentsInfo(importStore),
+			},
+			importMeta: im,
+			tr:         timerecord.NewTimeRecorder(""),
+		}
+		task.task.Store(taskProto)
+		require.NoError(t, im.AddTask(context.TODO(), task))
+
+		task.meta.segments.SetSegment(5, &SegmentInfo{
+			SegmentInfo: &datapb.SegmentInfo{
+				ID:           5,
+				CollectionID: 3,
+				State:        commonpb.SegmentState_Dropped,
+				IsImporting:  true,
+			},
+		})
+
+		cluster := session.NewMockCluster(t)
+		cluster.EXPECT().QueryImport(mock.Anything, mock.Anything).Return(&datapb.QueryImportResponse{
+			State: datapb.ImportTaskStateV2_Completed,
+			ImportSegmentsInfo: []*datapb.ImportSegmentInfo{
+				{SegmentID: 5, ImportedRows: 100},
+			},
+		}, nil)
+
+		task.QueryTaskOnWorker(cluster)
+
+		assert.Equal(t, datapb.ImportTaskStateV2_InProgress, task.GetState())
+		assert.Equal(t, internalpb.ImportJobState_Failed, im.GetJob(context.TODO(), 1).GetState())
+		assert.Equal(t, commonpb.SegmentState_Dropped, task.meta.segments.GetSegment(5).GetState())
+	})
+
 	// Replaces the removed TestExtractTimestampFromBinlogs coverage. The
 	// helper extractTimestampFromBinlogs was inlined into the Completed
 	// branch and now reuses storage.BuildStatsFromFieldBinlogs. Verify
@@ -562,8 +727,11 @@ func TestImportTask_QueryTaskOnWorker(t *testing.T) {
 	//   L0 import     → StartPosition/DmlPosition derived from Deltalogs
 	t.Run("completed non-L0 plumbs binlog timestamps into positions", func(t *testing.T) {
 		catalog := mocks.NewDataCoordCatalog(t)
+		catalog.EXPECT().ListReshardTasks(mock.Anything).Return(nil, nil).Maybe()
+		catalog.EXPECT().ListImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportJobs(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().ListPreImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListPreImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportTasks(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().SaveImportTask(mock.Anything, mock.Anything).Return(nil)
 		catalog.EXPECT().SaveImportJob(mock.Anything, mock.Anything).Return(nil)
@@ -588,11 +756,12 @@ func TestImportTask_QueryTaskOnWorker(t *testing.T) {
 			NodeID:       7,
 			State:        datapb.ImportTaskStateV2_InProgress,
 		}
+		ms := metacache.NewMetaStore(nil)
 		task := &importTask{
 			alloc: nil,
 			meta: &meta{
-				collections: typeutil.NewConcurrentMap[UniqueID, *collectionInfo](),
-				segments:    NewSegmentsInfo(),
+				metaStore: ms,
+				segments:  NewSegmentsInfo(ms),
 			},
 			importMeta: im,
 			tr:         timerecord.NewTimeRecorder(""),
@@ -604,6 +773,7 @@ func TestImportTask_QueryTaskOnWorker(t *testing.T) {
 		task.meta.segments.SetSegment(42, &SegmentInfo{
 			SegmentInfo: &datapb.SegmentInfo{
 				ID:        42,
+				State:     commonpb.SegmentState_Importing,
 				NumOfRows: 0,
 			},
 		})
@@ -644,8 +814,11 @@ func TestImportTask_QueryTaskOnWorker(t *testing.T) {
 
 	t.Run("completed L0 plumbs deltalog timestamps into positions", func(t *testing.T) {
 		catalog := mocks.NewDataCoordCatalog(t)
+		catalog.EXPECT().ListReshardTasks(mock.Anything).Return(nil, nil).Maybe()
+		catalog.EXPECT().ListImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportJobs(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().ListPreImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListPreImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportTasks(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().SaveImportTask(mock.Anything, mock.Anything).Return(nil)
 		catalog.EXPECT().SaveImportJob(mock.Anything, mock.Anything).Return(nil)
@@ -672,11 +845,12 @@ func TestImportTask_QueryTaskOnWorker(t *testing.T) {
 			NodeID:       7,
 			State:        datapb.ImportTaskStateV2_InProgress,
 		}
+		ms := metacache.NewMetaStore(nil)
 		task := &importTask{
 			alloc: nil,
 			meta: &meta{
-				collections: typeutil.NewConcurrentMap[UniqueID, *collectionInfo](),
-				segments:    NewSegmentsInfo(),
+				metaStore: ms,
+				segments:  NewSegmentsInfo(ms),
 			},
 			importMeta: im,
 			tr:         timerecord.NewTimeRecorder(""),
@@ -688,6 +862,7 @@ func TestImportTask_QueryTaskOnWorker(t *testing.T) {
 		task.meta.segments.SetSegment(43, &SegmentInfo{
 			SegmentInfo: &datapb.SegmentInfo{
 				ID:        43,
+				State:     commonpb.SegmentState_Importing,
 				NumOfRows: 0,
 				Level:     datapb.SegmentLevel_L0,
 			},
@@ -739,8 +914,11 @@ func TestImportTask_QueryTaskOnWorker(t *testing.T) {
 func TestImportTask_DropTaskOnWorker(t *testing.T) {
 	t.Run("DropImport rpc failed", func(t *testing.T) {
 		catalog := mocks.NewDataCoordCatalog(t)
+		catalog.EXPECT().ListReshardTasks(mock.Anything).Return(nil, nil).Maybe()
+		catalog.EXPECT().ListImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportJobs(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().ListPreImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListPreImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportTasks(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().SaveImportTask(mock.Anything, mock.Anything).Return(nil)
 
@@ -773,8 +951,11 @@ func TestImportTask_DropTaskOnWorker(t *testing.T) {
 
 	t.Run("normal", func(t *testing.T) {
 		catalog := mocks.NewDataCoordCatalog(t)
+		catalog.EXPECT().ListReshardTasks(mock.Anything).Return(nil, nil).Maybe()
+		catalog.EXPECT().ListImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportJobs(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().ListPreImportTasks(mock.Anything).Return(nil, nil)
+		catalog.EXPECT().ListPreImportTasksV3(mock.Anything).Return(nil, nil).Maybe()
 		catalog.EXPECT().ListImportTasks(mock.Anything).Return(nil, nil)
 		catalog.EXPECT().SaveImportTask(mock.Anything, mock.Anything).Return(nil)
 

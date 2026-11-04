@@ -210,8 +210,123 @@ const (
 	// JSONStatsPath storage path const for json stats
 	JSONStatsPath = "json_stats"
 
+	// SnapshotRootPath storage path const for snapshot metadata and manifests.
+	// Layout: {rootPath}/snapshots/{collection_id}/{metadata|manifests}/...
+	SnapshotRootPath = "snapshots"
+
+	// WoodpeckerRootPath storage path const for the Woodpecker WAL, written
+	// under both minio.rootPath and localStorage.path.
+	WoodpeckerRootPath = "wp"
+
+	// LocalCacheRootPath storage path const for node-local caches (growing mmap,
+	// local chunk cache, bm25, file resources, expr cache), written under
+	// localStorage.path. Under common.storageType=local that path is also the
+	// ChunkManager root, which is why this is a top-level segment there.
+	// Layout: {localStorage.path}/cache/{nodeID}/{growing_mmap|local_chunk|...}/...
+	//
+	// This entry also covers everything segcore writes, which is why the C++
+	// segment names (raw_datas, ngram_log, tmp, rtree-index) are NOT listed
+	// separately: segcore's ChunkManager is initialized with
+	// pathutil.GetPath(LocalChunkPath, nodeID), i.e.
+	// {localStorage.path}/cache/{nodeID}/local_chunk (see
+	// internal/util/initcore/query_node.go and
+	// internal/datanode/index/init_segcore.go), so those directories sit under
+	// this subtree rather than at the storage root. Registering them at the root
+	// would deny paths Milvus never writes.
+	LocalCacheRootPath = "cache"
+
+	// ExploreTempRootPath storage path const for Explore planning manifests.
+	// Layout: {localStorage.path}/__explore_temp__/coord_{jobID}/attempt_{n}/...
+	// Under a remote root these manifests live at the bucket root, outside
+	// minio.rootPath, which is why this is a local-only segment.
+	ExploreTempRootPath = "__explore_temp__"
+
+	// ExternalRefreshResultsRootPath storage path const for external collection
+	// refresh task results, written under the ChunkManager root on every
+	// storage type.
+	// Layout: {rootPath}/external_refresh_results/{collectionID}/{jobID}/{taskID}/{version}/{checksum}.pb
+	ExternalRefreshResultsRootPath = "external_refresh_results"
+
+	// WalSummaryRootPath storage path const for WAL summary chunks and
+	// manifests, written under the ChunkManager root on every storage type.
+	// Layout: {rootPath}/walsummary/{pchannel}/{chunk|manifest}/...
+	WalSummaryRootPath = "walsummary"
+
+	// PKIndexPath storage path const for primary key index manifests and SSTs.
+	// Layout: {rootPath}/pk_index/{collectionID}/{vchannel}/{manifest|sst}/...
+	PKIndexPath = "pk_index"
+
 	DefaultResourceGroupName = "__default_resource_group"
 )
+
+// InternalStorageRootSegments lists the top-level directories that Milvus
+// creates directly under the storage root path (ChunkManager.RootPath())
+// regardless of storage type. Segments that are rooted at localStorage.path
+// only live in LocalOnlyStorageRootSegments below.
+//
+// Import path validation in datacoord refuses ordinary imports that point into
+// any of these, so a directory missing from this list is a directory that bulk
+// import can read. When adding a new storage path constant above, add it here
+// too -- TestInternalStorageRootSegmentsIsExhaustive fails otherwise.
+//
+// Constants that are NOT top-level directories (leaf file names, sub-paths)
+// must be listed in that test's nonTopLevelSegments instead.
+//
+// Scope limit, deliberately stated: the guard test enforces that every storage
+// path constant declared in THIS file is classified. It cannot see a writer in
+// another package -- still less one in another language -- that joins a bare
+// string literal onto the storage root. Every omission found so far came from
+// human review, not from the guard: "wp" (Go, pkg/streaming), "cache" (Go,
+// internal/util/pathutil), and the four C++ segments (raw_datas, ngram_log, tmp,
+// rtree-index), which turned out to sit under the "cache" subtree rather than at
+// the root -- see LocalCacheRootPath above (milvus#51894 review). A green guard
+// is evidence that this file is self-consistent, NOT
+// that the registry is complete; a new writer under the shared root must add
+// its segment here by hand.
+var InternalStorageRootSegments = []string{
+	SegmentInsertLogPath,
+	SegmentDeltaLogPath,
+	SegmentStatslogPath,
+	SegmentIndexV0Path,
+	SegmentIndexV1Path,
+	SegmentBm25LogPath,
+	PartitionStatsPath,
+	AnalyzeStatsPath,
+	TextIndexPath,
+	JSONIndexPath,
+	JSONStatsPath,
+	SnapshotRootPath,
+	WoodpeckerRootPath,
+	ExternalRefreshResultsRootPath,
+	WalSummaryRootPath,
+	PKIndexPath,
+}
+
+// LocalOnlyStorageRootSegments lists top-level directories that are rooted at
+// localStorage.path rather than at the ChunkManager root.
+//
+// They coincide with the ChunkManager root only under common.storageType=local,
+// where datacoord's root IS localStorage.path. Under a remote (MinIO/S3) root
+// Milvus never writes these keys, so denying them there would reject caller
+// paths for no benefit. Consumers must therefore append this list only when the
+// storage type is local; see ValidateImportFilePaths.
+//
+// Woodpecker is deliberately NOT here: it writes under both minio.rootPath and
+// localStorage.path (pkg/streaming/walimpls/impls/wp/builder.go), so it belongs
+// in the unconditional list above.
+//
+// "mmap" is deliberately NOT here either, even though queryNode.mmap.mmapDirPath
+// formats to {localStorage.path}/mmap by default -- a sibling of "cache". The
+// directory is deprecated and nothing writes it: the value reaches segcore only
+// as CMmapConfig.json_stats_mmap_path (internal/util/initcore/init_core.go), and
+// the terminal consumer JsonKeyStats::Load ignores it, taking the local
+// ChunkManager root instead, i.e. {localStorage.path}/cache/{nodeID}/local_chunk,
+// which the "cache" entry already covers. Registering it would deny a path
+// Milvus never writes.
+var LocalOnlyStorageRootSegments = []string{
+	LocalCacheRootPath,
+	ExploreTempRootPath,
+}
 
 const (
 	// Version 3: metadata moved to separate meta.json file (instead of parquet metadata)
@@ -220,28 +335,31 @@ const (
 
 // Search, Index parameter keys
 const (
-	TopKKey                           = "topk"
-	SearchParamKey                    = "search_param"
-	SegmentNumKey                     = "segment_num"
-	WithFilterKey                     = "with_filter"
-	DataTypeKey                       = "data_type"
-	ChannelNumKey                     = "channel_num"
-	WithOptimizeKey                   = "with_optimize"
-	CollectionKey                     = "collection"
-	RecallEvalKey                     = "recall_eval"
-	StrictGroupAcceptanceThresholdKey = "strict_group_acceptance_threshold"
-	StrictGroupProbeCandidatesKey     = "strict_group_probe_candidates"
+	TopKKey                             = "topk"
+	SearchParamKey                      = "search_param"
+	SegmentNumKey                       = "segment_num"
+	WithFilterKey                       = "with_filter"
+	DataTypeKey                         = "data_type"
+	ChannelNumKey                       = "channel_num"
+	WithOptimizeKey                     = "with_optimize"
+	CollectionKey                       = "collection"
+	RecallEvalKey                       = "recall_eval"
+	StrictGroupStrategyKey              = "strict_group_strategy"
+	StrictGroupPhase1CandidateWeightKey = "strict_group_phase1_candidate_weight"
+	StrictGroupSkipRefineKey            = "strict_group_skip_refine"
 
 	GlobalRefineKey    = "global_refine"
 	SearchTopkRatioKey = "search_topk_ratio"
 	RefineTopkRatioKey = "refine_topk_ratio"
 
-	ParamsKey      = "params"
-	IndexTypeKey   = "index_type"
-	MetricTypeKey  = "metric_type"
-	DimKey         = "dim"
-	MaxLengthKey   = "max_length"
-	MaxCapacityKey = "max_capacity"
+	ParamsKey        = "params"
+	IndexTypeKey     = "index_type"
+	MetricTypeKey    = "metric_type"
+	DimKey           = "dim"
+	MRLDimKey        = "mrl_dim"
+	WithMRLRefineKey = "with_mrl_refine"
+	MaxLengthKey     = "max_length"
+	MaxCapacityKey   = "max_capacity"
 
 	DropRatioBuildKey = "drop_ratio_build"
 
@@ -274,6 +392,7 @@ const (
 const (
 	EnableAnalyzerKey = `enable_analyzer`
 	AnalyzerParamKey  = `analyzer_params`
+	EnableMatchKey    = `enable_match`
 )
 
 //  Collection properties key
@@ -364,6 +483,13 @@ const (
 	DisableFuncRuntimeCheck = "disable_func_runtime_check"
 	MaxFieldIDKey           = "max_field_id"
 
+	// StructSubFieldAddedKey is an internal type param of a struct sub-field
+	// that was added after its struct appeared (AlterCollectionSchema with a
+	// field named s[b]). Rootcoord writes it; users cannot set or delete
+	// it, and DescribeCollection does not return it. See
+	// internal/util/schemautil/struct_subfield_origin.go.
+	StructSubFieldAddedKey = "__struct_sub_field_added__"
+
 	// query mode
 	QueryModeKey       = "query_mode"
 	QueryModeLargeTopK = "large_topk"
@@ -371,10 +497,6 @@ const (
 
 	// namespace sharding
 	NamespaceShardingEnabledKey = "namespace.sharding.enabled"
-
-	// row level security
-	RLSEnabledKey = "rls.enabled"
-	RLSForceKey   = "rls.force"
 
 	// warmup related
 	WarmupKey            = "warmup"
@@ -680,56 +802,6 @@ func ValidateNamespaceShardingEnabledNotAltered(properties []*commonpb.KeyValueP
 	return nil
 }
 
-// ValidateRLSEnabledNotAltered rejects attempts to update or delete
-// rls.enabled after collection creation.
-func ValidateRLSEnabledNotAltered(properties []*commonpb.KeyValuePair, deleteKeys []string) error {
-	for _, property := range properties {
-		if property.GetKey() == RLSEnabledKey {
-			return merr.WrapErrParameterInvalidMsg("cannot alter %s after collection creation", RLSEnabledKey)
-		}
-		if strings.EqualFold(property.GetKey(), RLSEnabledKey) {
-			return merr.WrapErrParameterInvalidMsg("invalid property key %q, did you mean %q?", property.GetKey(), RLSEnabledKey)
-		}
-	}
-	for _, key := range deleteKeys {
-		if key == RLSEnabledKey {
-			return merr.WrapErrParameterInvalidMsg("cannot delete %s after collection creation", RLSEnabledKey)
-		}
-		if strings.EqualFold(key, RLSEnabledKey) {
-			return merr.WrapErrParameterInvalidMsg("invalid property key %q, did you mean %q?", key, RLSEnabledKey)
-		}
-	}
-	return nil
-}
-
-// IsRLSEnabled extracts rls.enabled from collection properties.
-// Returns false if not set.
-func IsRLSEnabled(kvs ...*commonpb.KeyValuePair) (bool, error) {
-	value, ok := getProperty(kvs, RLSEnabledKey)
-	if !ok {
-		return false, nil
-	}
-	enabled, err := strconv.ParseBool(value)
-	if err != nil {
-		return false, merr.WrapErrParameterInvalidMsg("invalid %s value %q", RLSEnabledKey, value)
-	}
-	return enabled, nil
-}
-
-// IsRLSForce extracts rls.force from collection properties.
-// Returns false if not set.
-func IsRLSForce(kvs ...*commonpb.KeyValuePair) (bool, error) {
-	value, ok := getProperty(kvs, RLSForceKey)
-	if !ok {
-		return false, nil
-	}
-	force, err := strconv.ParseBool(value)
-	if err != nil {
-		return false, merr.WrapErrParameterInvalidMsg("invalid %s value %q", RLSForceKey, value)
-	}
-	return force, nil
-}
-
 func getProperty(kvs []*commonpb.KeyValuePair, key string) (string, bool) {
 	var value string
 	found := false
@@ -740,53 +812,6 @@ func getProperty(kvs []*commonpb.KeyValuePair, key string) (string, bool) {
 		}
 	}
 	return value, found
-}
-
-// ValidateRLSProperties validates collection-level RLS properties.
-// Returns nil if the values are valid or if RLS properties are not set. Also
-// rejects case-variant keys that would be silently ignored.
-func ValidateRLSProperties(kvs ...*commonpb.KeyValuePair) error {
-	seen := make(map[string]struct{}, 2)
-	for _, kv := range kvs {
-		switch kv.GetKey() {
-		case RLSEnabledKey:
-			if _, ok := seen[RLSEnabledKey]; ok {
-				return merr.WrapErrParameterInvalidMsg("duplicated collection property %q", RLSEnabledKey)
-			}
-			seen[RLSEnabledKey] = struct{}{}
-			enabled, err := IsRLSEnabled(kv)
-			if err != nil {
-				return err
-			}
-			// The management plane lands before the data-plane enforcement in
-			// the stacked rollout. Keep the public switch fail-closed until the
-			// enforcement slice removes this temporary gate.
-			if enabled {
-				return merr.WrapErrParameterInvalidMsg("RLS runtime enforcement is not available yet; %s cannot be enabled", RLSEnabledKey)
-			}
-		case RLSForceKey:
-			if _, ok := seen[RLSForceKey]; ok {
-				return merr.WrapErrParameterInvalidMsg("duplicated collection property %q", RLSForceKey)
-			}
-			seen[RLSForceKey] = struct{}{}
-			force, err := IsRLSForce(kv)
-			if err != nil {
-				return err
-			}
-			// rls.force only affects runtime enforcement. Reject it together
-			// with rls.enabled while the enforcement slice is not available.
-			if force {
-				return merr.WrapErrParameterInvalidMsg("RLS runtime enforcement is not available yet; %s cannot be enabled", RLSForceKey)
-			}
-		default:
-			for _, key := range []string{RLSEnabledKey, RLSForceKey} {
-				if strings.EqualFold(kv.GetKey(), key) {
-					return merr.WrapErrParameterInvalidMsg("invalid property key %q, did you mean %q?", kv.GetKey(), key)
-				}
-			}
-		}
-	}
-	return nil
 }
 
 func IsDisableFuncRuntimeCheck(kvs ...*commonpb.KeyValuePair) (bool, error) {

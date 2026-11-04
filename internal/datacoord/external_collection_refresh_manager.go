@@ -19,6 +19,8 @@ package datacoord
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"path"
 	"sync"
 	"time"
 
@@ -30,6 +32,7 @@ import (
 	"github.com/milvus-io/milvus/internal/datacoord/task"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/storagev2/packed"
+	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
@@ -62,13 +65,26 @@ const externalRefreshManifestReadConcurrency = 16
 // exploreTempDirForJob returns the root directory for every Explore attempt of
 // one refresh job. Terminal cleanup removes this root and all attempt manifests.
 func exploreTempDirForJob(jobID int64) string {
-	return fmt.Sprintf("__explore_temp__/coord_%d", jobID)
+	return fmt.Sprintf("%s/coord_%d", common.ExploreTempRootPath, jobID)
 }
 
 // exploreTempDirForAttempt isolates manifests produced by retried planning
 // attempts while keeping the parent job directory as the cleanup boundary.
 func exploreTempDirForAttempt(jobID, attemptID int64) string {
 	return fmt.Sprintf("%s/attempt_%d", exploreTempDirForJob(jobID), attemptID)
+}
+
+// exploreDirForChunkManager turns an explore temp dir into the complete key
+// for the primary chunk manager. On remote storage explore manifests have
+// always lived at the bucket root, outside minio.rootPath, so the key is the
+// dir itself. On local storage every key is a complete filesystem path, so the
+// dir is placed under localStorage.path. Producer (explore) and cleanup must
+// agree on this or cleanup silently misses the files.
+func (m *externalCollectionRefreshManager) exploreDirForChunkManager(dir string) string {
+	if _, local := m.chunkManager.(*storage.LocalChunkManager); local {
+		return path.Join(m.chunkManager.RootPath(), dir)
+	}
+	return dir
 }
 
 // External Collection Refresh Manager
@@ -152,6 +168,10 @@ type externalCollectionRefreshManager struct {
 	// same physical location the FFI wrote to.
 	chunkManager storage.ChunkManager
 
+	// notifyIndexChan asks the index inspector to enqueue a collection's
+	// unindexed segments once a refresh's source/spec is visible.
+	notifyIndexChan chan<- UniqueID
+
 	// Internal components (private, composed)
 	inspector *externalCollectionRefreshInspector
 	checker   *externalCollectionRefreshChecker
@@ -207,6 +227,7 @@ func NewExternalCollectionRefreshManager(
 	collectionGetter func(ctx context.Context, collectionID int64) (*collectionInfo, error),
 	schemaUpdater func(ctx context.Context, collectionID int64, externalSource, externalSpec string) error,
 	chunkManager storage.ChunkManager,
+	notifyIndexChan chan<- UniqueID,
 ) ExternalCollectionRefreshManager {
 	closeChan := make(chan struct{})
 
@@ -220,6 +241,7 @@ func NewExternalCollectionRefreshManager(
 		collectionGetter: collectionGetter,
 		schemaUpdater:    schemaUpdater,
 		chunkManager:     chunkManager,
+		notifyIndexChan:  notifyIndexChan,
 		closeChan:        closeChan,
 		notifiedJobs:     make(map[int64]struct{}),
 		cleanedJobs:      make(map[int64]struct{}),
@@ -317,7 +339,7 @@ func (m *externalCollectionRefreshManager) cleanupExploreTempForJob(jobID int64)
 	if m.chunkManager == nil {
 		return
 	}
-	exploreBaseDir := exploreTempDirForJob(jobID)
+	exploreBaseDir := m.exploreDirForChunkManager(exploreTempDirForJob(jobID))
 	explorePrefix := exploreBaseDir + "/"
 	// Derive from m.ctx so shutdown cancels in-flight cleanup instead of
 	// blocking Stop() on a slow object-store call.
@@ -492,7 +514,7 @@ func (m *externalCollectionRefreshManager) applyFinishedJobSegments(ctx context.
 	// self-heals them. Segment-level validation still rejects schema-version
 	// rollback, but drop, rename, or type changes need a schema gate or lock
 	// before they are supported.
-	return applyExternalCollectionSegmentUpdateForBaseline(
+	if err := applyExternalCollectionSegmentUpdateForBaseline(
 		ctx,
 		m.mt,
 		job.GetCollectionId(),
@@ -500,7 +522,18 @@ func (m *externalCollectionRefreshManager) applyFinishedJobSegments(ctx context.
 		keptSegments,
 		updatedSegments,
 		mlog.FieldJobID(job.GetJobId()),
-	)
+	); err != nil {
+		return err
+	}
+	// A stats task reads the external source/spec at dispatch. While this
+	// refresh's are still being published, wait for that publish: its
+	// BroadcastAlteredCollection notifies the whole collection.
+	if externalRefreshSchemaVisible(m.mt, job) {
+		for _, segment := range updatedSegments {
+			notifySegmentStatsBuild(segment.GetID())
+		}
+	}
+	return nil
 }
 
 // wrapTask builds a scheduler-facing task wrapper around a persisted proto
@@ -629,8 +662,11 @@ func (m *externalCollectionRefreshManager) handleJobFinished(ctx context.Context
 
 	if currentSource == newSource && currentSpec == newSpec {
 		// Nothing to deliver - the collection already describes this refresh.
-		// That is a delivered publish, so keep the key.
+		// That is a delivered publish, so keep the key. The source/spec is already
+		// visible, so the applied segments can be indexed now; otherwise
+		// BroadcastAlteredCollection enqueues them when the publish lands.
 		published = true
+		notifyCollectionIndexBuild(m.notifyIndexChan, job.GetCollectionId())
 		return
 	}
 
@@ -896,6 +932,17 @@ func (m *externalCollectionRefreshManager) createTasksForJob(
 	// in the resulting plan can read their assigned ranges.
 	allFiles, manifestPath, err := m.exploreExternalFiles(ctx, job)
 	if err != nil {
+		if errors.Is(err, merr.ErrDataIntegrity) || errors.Is(err, merr.ErrOperationNotSupported) {
+			// Include only the object path: source URLs can carry credentials
+			// in user info or query parameters, which must not enter job reasons.
+			objectPath := "<invalid>"
+			if sourceURL, parseErr := url.Parse(job.GetExternalSource()); parseErr == nil {
+				objectPath = sourceURL.EscapedPath()
+			}
+			return nil, newNonRetriableJobError(
+				"cannot explore external collection %d, object=%q: %s",
+				job.GetCollectionId(), objectPath, err.Error())
+		}
 		// Hard explore failures are terminal for this job: the source is
 		// unreachable, denied, malformed, absent, or its snapshot metadata
 		// is incompatible with the requested external format. Surface them
@@ -906,6 +953,7 @@ func (m *externalCollectionRefreshManager) createTasksForJob(
 		if merr.GetErrorType(err) == merr.InputError ||
 			errors.Is(err, errMilvusTableRefreshSchemaInvalid) ||
 			errors.Is(err, packed.ErrLoonTransient) ||
+			errors.Is(err, packed.ErrLoonPermanent) ||
 			packed.IsMilvusTableStorageV2ManifestListMissing(err) {
 			return nil, newNonRetriableJobError("explore external files failed: %v", err)
 		}
@@ -1056,6 +1104,13 @@ func normalizeRefreshJobProgress(job *datapb.ExternalCollectionRefreshJob, state
 		return
 	}
 
+	if state == indexpb.JobState_JobStateFailed {
+		// The checker publishes State, FailReason and EndTime together. Keep
+		// the job snapshot until that write succeeds so clients cannot observe
+		// a terminal failure without its details and stop polling too early.
+		return
+	}
+
 	if state == indexpb.JobState_JobStateFinished {
 		job.State = indexpb.JobState_JobStateInProgress
 		// A job in the index wait has every task Finished, so the task
@@ -1168,7 +1223,7 @@ func (m *externalCollectionRefreshManager) exploreExternalFiles(
 	if err != nil {
 		return nil, "", merr.Wrap(err, "allocate external refresh Explore attempt ID")
 	}
-	exploreBaseDir := exploreTempDirForAttempt(job.GetJobId(), attemptID)
+	exploreBaseDir := m.exploreDirForChunkManager(exploreTempDirForAttempt(job.GetJobId(), attemptID))
 	fileInfos, manifestPath, err := packed.ExploreFilesReturnManifestPath(
 		columns,
 		spec.Format,
@@ -1178,7 +1233,7 @@ func (m *externalCollectionRefreshManager) exploreExternalFiles(
 		extfs,
 	)
 	if err != nil {
-		return nil, "", merr.WrapErrServiceInternalErr(err, "failed to explore files returning manifest path")
+		return nil, "", merr.Wrap(err, "failed to explore files returning manifest path")
 	}
 
 	// Convert to proto type

@@ -22,10 +22,10 @@
 #include "knowhere/comp/index_param.h"
 
 const int64_t INVALID_FIELD_ID = -1;
-inline constexpr char kStrictGroupAcceptanceThreshold[] =
-    "strict_group_acceptance_threshold";
-inline constexpr char kStrictGroupProbeCandidates[] =
-    "strict_group_probe_candidates";
+inline constexpr char kStrictGroupStrategy[] = "strict_group_strategy";
+inline constexpr char kStrictGroupPhase1CandidateWeight[] =
+    "strict_group_phase1_candidate_weight";
+inline constexpr char kStrictGroupSkipRefine[] = "strict_group_skip_refine";
 const int64_t INVALID_SEG_OFFSET = -1;
 const int64_t INVALID_ARRAY_INDEX = -1;
 const milvus::PkType INVALID_PK;  // of std::monostate if not set.
@@ -119,7 +119,7 @@ const bool DEFAULT_ENABLE_DRIVER_PREFETCH = true;
 const bool DEFAULT_JSON_KEY_STATS_ENABLED = true;
 const bool DEFAULT_GROWING_JSON_KEY_STATS_ENABLED = false;
 const bool DEFAULT_CONFIG_PARAM_TYPE_CHECK_ENABLED = true;
-const bool DEFAULT_ENABLE_PARQUET_STATS_SKIP_INDEX = false;
+const bool DEFAULT_ENABLE_PARQUET_STATS_SKIP_INDEX = true;
 
 // skipindex stats related
 const double DEFAULT_BLOOM_FILTER_FALSE_POSITIVE_RATE = 0.01;
@@ -131,6 +131,8 @@ const std::string INSERT_FILES_KEY = "insert_files";
 const std::string PARTITION_KEY_ISOLATION_KEY = "partition_key_isolation";
 const std::string STORAGE_VERSION_KEY = "storage_version";
 const std::string DIM_KEY = "dim";
+const std::string MRL_DIM_KEY = "mrl_dim";
+const std::string WITH_MRL_REFINE_KEY = "with_mrl_refine";
 const std::string DATA_TYPE_KEY = "data_type";
 const std::string ELEMENT_TYPE_KEY = "element_type";
 const std::string INDEX_NUM_ROWS_KEY = "index_num_rows";
@@ -150,8 +152,6 @@ const int64_t DEFAULT_SHORT_COLUMN_GROUP_ID = 0;
 
 // VectorArray related, used for fetch metadata from Arrow schema
 const std::string ELEMENT_TYPE_KEY_FOR_ARROW = "elementType";
-// EPSILON value for comparing float numbers
-const float EPSILON = 0.0000000119;
 const std::string NAMESPACE_FIELD_NAME = "$namespace_id";
 const std::string MMAP_ENABLED_KEY = "mmap.enabled";
 constexpr const char* LOCAL_FORMAT_KEY = "local_format";
@@ -179,3 +179,6 @@ constexpr int32_t kLastVersionWithoutHybridIndexConfig = 2;
 // an older reader's ScalarIndexSort predates nested-index support and cannot
 // load a nested STL_SORT physical index.
 constexpr int32_t kNestedHybridStlSortMinVersion = 4;
+// Ordinary ARRAY HYBRID indexes select STL_SORT at the existing version 5.
+// Earlier build targets retain their previous INVERTED selection.
+constexpr int32_t kArrayHybridStlSortMinVersion = 5;

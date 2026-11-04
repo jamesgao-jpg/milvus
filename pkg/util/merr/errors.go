@@ -18,6 +18,7 @@ package merr
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/markers"
@@ -123,6 +124,11 @@ var (
 	// stale shard-map at the caller (proxy). Retryable so the caller can
 	// re-resolve the shard map and dispatch to the correct node.
 	ErrChannelMisrouted = newMilvusError("channel misrouted: not owned by this node", 507, true)
+	// A primary key index flush adds an SST whose ID is not above the
+	// reclaimed SST ID of the manifest pointer: garbage collection may have
+	// deleted that SST. The flush did not take effect. A retry with the same
+	// request fails again; the caller must use new SST IDs.
+	ErrChannelPKIndexSSTReclaimed = newMilvusError("primary key index sst may be reclaimed", 508, false)
 
 	// Segment related
 	ErrSegmentNotFound    = newMilvusError("segment not found", 600, false)
@@ -222,7 +228,7 @@ var (
 
 	// field related
 	ErrFieldNotFound    = newMilvusError("field not found", 1700, false) // SystemError by default; proxy boundaries stamp InputError where the field name is user-supplied (e.g. group_by/anns field), while result-assembly lookups stay system.
-	ErrFieldInvalidName = newMilvusError("field name invalid", 1701, false)
+	ErrFieldInvalidName = newMilvusError("field name invalid", 1701, false, WithErrorType(InputError))
 
 	// high-level restful api related
 	ErrNeedAuthenticate          = newMilvusError("user hasn't authenticated", 1800, false, WithErrorType(InputError))
@@ -241,9 +247,14 @@ var (
 	ErrInvalidStreamObj     = newMilvusError("invalid stream object", 1903, false)
 
 	// Segcore related
-	ErrSegcore                    = newMilvusError("segcore error", 2000, false)
-	ErrSegcoreUnsupported         = newMilvusError("segcore unsupported error", 2001, false)
-	ErrSegcorePretendFinished     = newMilvusError("segcore pretend finished", 2002, false)
+	ErrSegcore = newMilvusError("segcore error", 2000, false)
+	// The named segcore sentinels carry the SAME numeric value as the C++
+	// ErrorCode they represent (EasyAssert.h), so the wire pass-through in
+	// classifySegcoreError and code-based errors.Is agree. 2001/2002 are NOT
+	// usable here: C++ 2001/2002 are UnexpectedError/NotImplemented, and a
+	// sentinel squatting on those values would false-match them.
+	ErrSegcoreUnsupported         = newMilvusError("segcore unsupported error", 2003, false)
+	ErrSegcorePretendFinished     = newMilvusError("segcore pretend finished", 2033, false)
 	ErrSegcoreFollyOtherException = newMilvusError("segcore folly other exception", 2037, false) // throw from segcore.
 	ErrSegcoreFollyCancel         = newMilvusError("segcore Future was canceled", 2038, false)   // throw from segcore.
 	ErrSegcoreOutOfRange          = newMilvusError("segcore out of range", 2039, false)          // throw from segcore.
@@ -271,6 +282,10 @@ var (
 	// Search/Query related
 	ErrInconsistentRequery = newMilvusError("inconsistent requery result", 2200, true)
 	ErrQueryPlan           = newMilvusError("query plan failed", 2201, false, WithErrorType(InputError))
+
+	// ErrQueryViewNotReady asks the query owner to replan after its view was
+	// retired or became unavailable. It does not imply collection release.
+	ErrQueryViewNotReady = newMilvusError("query view not ready", 2202, true)
 
 	// Compaction
 	ErrCompactionReadDeltaLogErr                  = newMilvusError("fail to read delta log", 2300, false)
@@ -397,6 +412,17 @@ func (e milvusError) code() int32 {
 
 func (e milvusError) Error() string {
 	if e.inner != nil {
+		// A relabeled error (the segcore pass-through) keeps the family
+		// sentinel as inner purely so errors.Is still matches the umbrella;
+		// both carry the same msg, so rendering the chain would repeat it
+		// ("segcore error[segcoreCode=2028]: segcore error") in Status.Reason
+		// and Detail. Skip only that exact shape -- identical msg, or ours is
+		// the inner's msg plus wrapFields' "[k=v]" decorations -- so ordinary
+		// wrapped chains keep rendering in full.
+		if inner, ok := e.inner.(milvusError); ok &&
+			(inner.msg == e.msg || strings.HasPrefix(e.msg, inner.msg+"[")) {
+			return e.msg
+		}
 		return e.msg + ": " + e.inner.Error()
 	}
 	return e.msg

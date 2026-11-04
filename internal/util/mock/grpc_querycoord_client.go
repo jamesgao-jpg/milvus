@@ -209,3 +209,11 @@ func (m *GrpcQueryCoordClient) ComputePhraseMatchSlop(ctx context.Context, req *
 func (m *GrpcQueryCoordClient) ValidateAnalyzer(ctx context.Context, req *querypb.ValidateAnalyzerRequest, opts ...grpc.CallOption) (*querypb.ValidateAnalyzerResponse, error) {
 	return &querypb.ValidateAnalyzerResponse{}, m.Err
 }
+
+func (m *GrpcQueryCoordClient) GetQueryViewLoadInfo(context.Context, *querypb.GetQueryViewLoadInfoRequest, ...grpc.CallOption) (*querypb.GetQueryViewLoadInfoResponse, error) {
+	return &querypb.GetQueryViewLoadInfoResponse{}, m.Err
+}
+
+func (c *GrpcQueryCoordClient) GetQueryViewSegmentLoadInfo(ctx context.Context, req *querypb.GetQueryViewSegmentLoadInfoRequest, opts ...grpc.CallOption) (*querypb.GetQueryViewSegmentLoadInfoResponse, error) {
+	panic("patch GetQueryViewSegmentLoadInfo with mockey")
+}

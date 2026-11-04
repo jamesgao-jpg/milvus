@@ -55,7 +55,6 @@
 #include "milvus-storage/common/extend_status.h"
 #include "milvus-storage/reader.h"
 #include "segcore/storagev2translator/AsyncChunkReader.h"
-#include "segcore/storagev2translator/AsyncLoadExecutor.h"
 #include "segcore/storagev2translator/StorageV2Config.h"
 #include "storage/EntryStreamUtils.h"
 #include "storage/FileWriter.h"
@@ -862,6 +861,106 @@ TEST_F(AsyncLoadPipelineTest, LimitsConcurrentChunkReaderOpens) {
     }
 }
 
+TEST_F(AsyncLoadPipelineTest, ChunkReaderBatchesShareSlotsWithDataLoads) {
+    budget_.SetCapacitySlots(2);
+    // Fill the byte budget: opening readers only needs the remaining slot.
+    ASSERT_TRUE(
+        budget_.TryAcquire({1024, 1}, storage::LoadAdmissionPriority::High));
+    auto release = folly::makeGuard([&] { budget_.Release({1024, 1}); });
+    auto first = std::make_shared<FakeReader>(&executor_);
+    auto second = std::make_shared<FakeReader>(&executor_);
+    auto a = Start(OpenChunkReadersAsync(nullptr,
+                                         kTestSegmentId,
+                                         first,
+                                         MakeChunkReaderOpenSpecs(2),
+                                         OpenOptions()));
+    auto b = Start(OpenChunkReadersAsync(nullptr,
+                                         kTestSegmentId,
+                                         second,
+                                         MakeChunkReaderOpenSpecs(2),
+                                         OpenOptions()));
+    ASSERT_EQ(first->AsyncCalls(), 1);
+    EXPECT_EQ(second->AsyncCalls(), 0);
+    first->Complete(0);
+    executor_.drain();
+    ASSERT_EQ(first->AsyncCalls(), 2);
+    EXPECT_EQ(second->AsyncCalls(), 0);
+    first->Complete(1);
+    const auto opened = Get(std::move(a));
+    ASSERT_EQ(opened.size(), 2);
+    // Retaining opened readers must not retain their admission slots.
+    ASSERT_EQ(second->AsyncCalls(), 1);
+    second->Complete(0);
+    executor_.drain();
+    ASSERT_EQ(second->AsyncCalls(), 2);
+    second->Complete(1);
+    EXPECT_EQ(Get(std::move(b)).size(), 2);
+    EXPECT_TRUE(
+        budget_.TryAcquire({0, 1}, storage::LoadAdmissionPriority::High));
+    budget_.Release({0, 1});
+}
+
+TEST_F(AsyncLoadPipelineTest, ChunkReaderSlotWaitUsesRequestPriority) {
+    budget_.SetCapacitySlots(1);
+    ASSERT_TRUE(
+        budget_.TryAcquire({0, 1}, storage::LoadAdmissionPriority::High));
+    auto low = std::make_shared<FakeReader>(&executor_);
+    auto high = std::make_shared<FakeReader>(&executor_);
+    auto low_task = Start(
+        OpenChunkReadersAsync(nullptr,
+                              kTestSegmentId,
+                              low,
+                              MakeChunkReaderOpenSpecs(1),
+                              OpenOptions(proto::common::LoadPriority::LOW)));
+    auto high_task = Start(OpenChunkReadersAsync(nullptr,
+                                                 kTestSegmentId,
+                                                 high,
+                                                 MakeChunkReaderOpenSpecs(1),
+                                                 OpenOptions()));
+    EXPECT_EQ(low->AsyncCalls(), 0);
+    EXPECT_EQ(high->AsyncCalls(), 0);
+    budget_.Release({0, 1});
+    executor_.drain();
+    EXPECT_EQ(low->AsyncCalls(), 0);
+    ASSERT_EQ(high->AsyncCalls(), 1);
+    high->Complete(0);
+    EXPECT_EQ(Get(std::move(high_task)).size(), 1);
+    ASSERT_EQ(low->AsyncCalls(), 1);
+    low->Complete(0);
+    EXPECT_EQ(Get(std::move(low_task)).size(), 1);
+}
+
+TEST_F(AsyncLoadPipelineTest,
+       ChunkReaderCancellationReleasesQueuedButDrainsActiveSlot) {
+    budget_.SetCapacitySlots(1);
+    folly::CancellationSource cancel;
+    OpContext ctx(cancel.getToken());
+    auto first = std::make_shared<FakeReader>(&executor_);
+    auto pending = Start(OpenChunkReadersAsync(&ctx,
+                                               kTestSegmentId,
+                                               first,
+                                               MakeChunkReaderOpenSpecs(2),
+                                               OpenOptions()));
+    ASSERT_EQ(first->AsyncCalls(), 1);
+    cancel.requestCancellation();
+    executor_.drain();
+    EXPECT_FALSE(pending.isReady());
+    EXPECT_EQ(first->AsyncCalls(), 1);
+    auto next = std::make_shared<FakeReader>(&executor_);
+    auto successor = Start(OpenChunkReadersAsync(nullptr,
+                                                 kTestSegmentId,
+                                                 next,
+                                                 MakeChunkReaderOpenSpecs(1),
+                                                 OpenOptions()));
+    EXPECT_EQ(next->AsyncCalls(), 0);
+    first->Complete(0);
+    ExpectClassifiedFailure([&] { Get(std::move(pending)); },
+                            ErrorCode::FollyCancel);
+    ASSERT_EQ(next->AsyncCalls(), 1);
+    next->Complete(0);
+    EXPECT_EQ(Get(std::move(successor)).size(), 1);
+}
+
 TEST_F(AsyncLoadPipelineTest, RunsSynchronousFallbackFactoryOnExecutor) {
     auto reader = std::make_shared<SyncFallbackReader>(&executor_);
     std::vector<ChunkReaderOpenSpec> specs{{.column_group_index = 5}};
@@ -1473,78 +1572,6 @@ TEST_F(AsyncLoadPipelineTest, RestoresRequestedCellOrder) {
     EXPECT_EQ(results[2].first, 1);
     EXPECT_EQ(reader->Parallelism(), 1);
     EXPECT_TRUE(reader->CalledOnExecutor());
-}
-
-TEST(AsyncLoadExecutorTest, ResizesExistingExecutorWithQueuedWork) {
-    const int previous = GetAsyncLoadThreadPoolSize();
-    auto restore =
-        folly::makeGuard([&]() { SetAsyncLoadThreadPoolSize(previous); });
-    SetAsyncLoadThreadPoolSize(1);
-    auto executor =
-        ResolveAsyncLoadExecutor({}, milvus::proto::common::LoadPriority::HIGH);
-    std::promise<void> release;
-    auto released = release.get_future().share();
-    std::promise<void> first_started;
-    std::promise<void> second_started;
-    std::promise<void> first_done;
-    std::promise<void> second_done;
-    auto first_completion = first_done.get_future();
-    auto second_completion = second_done.get_future();
-    bool first_submitted = false;
-    bool second_submitted = false;
-    auto unblock = folly::makeGuard([&]() {
-        release.set_value();
-        if (first_submitted && first_completion.valid()) {
-            first_completion.wait();
-        }
-        if (second_submitted && second_completion.valid()) {
-            second_completion.wait();
-        }
-    });
-    executor->add([&]() {
-        first_started.set_value();
-        released.wait();
-        first_done.set_value();
-    });
-    first_submitted = true;
-    EXPECT_EQ(first_started.get_future().wait_for(std::chrono::seconds(2)),
-              std::future_status::ready);
-    executor->add([&]() {
-        second_started.set_value();
-        released.wait();
-        second_done.set_value();
-    });
-    second_submitted = true;
-    auto second_start = second_started.get_future();
-    EXPECT_EQ(second_start.wait_for(std::chrono::milliseconds(20)),
-              std::future_status::timeout);
-
-    SetAsyncLoadThreadPoolSize(2);
-    EXPECT_EQ(GetAsyncLoadThreadPoolSize(), 2);
-    EXPECT_EQ(second_start.wait_for(std::chrono::seconds(2)),
-              std::future_status::ready);
-    release.set_value();
-    unblock.dismiss();
-    first_completion.get();
-    second_completion.get();
-
-    SetAsyncLoadThreadPoolSize(1);
-    EXPECT_EQ(GetAsyncLoadThreadPoolSize(), 1);
-    // A keep-alive acquired before resizing still submits to the same pool.
-    std::promise<void> after_resize;
-    auto completion = after_resize.get_future();
-    executor->add([&]() { after_resize.set_value(); });
-    EXPECT_EQ(completion.wait_for(std::chrono::seconds(2)),
-              std::future_status::ready);
-    completion.get();
-}
-
-TEST(AsyncLoadExecutorTest, InvalidSizePreservesConfiguration) {
-    const int previous = GetAsyncLoadThreadPoolSize();
-    for (const int value : {0, -1}) {
-        EXPECT_THROW(SetAsyncLoadThreadPoolSize(value), milvus::SegcoreError);
-        EXPECT_EQ(GetAsyncLoadThreadPoolSize(), previous);
-    }
 }
 
 TEST_F(AsyncLoadPipelineTest, DefaultExecutorRunsOffTheCallingThread) {

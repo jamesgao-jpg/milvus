@@ -29,7 +29,7 @@
 #include "segcore/SegmentInterface.h"
 #include "common/bson_view.h"
 #include "exec/expression/Utils.h"
-#include "index/json_stats/bson_inverted.h"
+#include "segcore/json_stats/bson_inverted.h"
 #include "cachinglayer/CacheSlot.h"
 
 namespace milvus {
@@ -445,7 +445,7 @@ class ShreddingArrayBsonContainsAnyWithDiffTypeExecutor {
 class PhyJsonContainsFilterExpr : public SegmentExpr {
  public:
     PhyJsonContainsFilterExpr(
-        const std::vector<std::shared_ptr<Expr>>& input,
+        std::vector<std::shared_ptr<Expr>> input,
         const std::shared_ptr<const milvus::expr::JsonContainsExpr>& expr,
         const std::string& name,
         milvus::OpContext* op_ctx,
@@ -475,6 +475,11 @@ class PhyJsonContainsFilterExpr : public SegmentExpr {
 
     void
     Eval(EvalCtx& context, VectorPtr& result) override;
+
+    bool
+    SupportsRawExprCache() const override {
+        return !expr_->column_.element_level_;
+    }
 
     std::string
     ToString() const override {
@@ -514,25 +519,28 @@ class PhyJsonContainsFilterExpr : public SegmentExpr {
             return;
         }
         if (expr_->column_.data_type_ == DataType::ARRAY &&
-            (expr_->column_.element_level_ || expr_->vals_.empty())) {
+            (expr_->column_.element_level_ || expr_->vals_.empty() ||
+             is_native_list_array_)) {
             exec_path_ = ExprExecPath::RawData;
             return;
         }
-        SegmentExpr::DetermineExecPath();
-        if (exec_path_ != ExprExecPath::ScalarIndex ||
-            expr_->column_.data_type_ != DataType::JSON ||
-            value_type_ != DataType::INT64 || PinnedJsonIndexIsFlat()) {
+        if (expr_->column_.data_type_ == DataType::JSON &&
+            value_type_ == DataType::INT64 &&
+            std::any_of(expr_->vals_.begin(),
+                        expr_->vals_.end(),
+                        [this](const auto& value) {
+                            return !IsInt64SafeForJsonDoubleIndex(
+                                value.int64_val());
+                        })) {
+            exec_path_ = ExprExecPath::RawData;
             return;
         }
-        const auto has_unsafe_int_literal = std::any_of(
-            expr_->vals_.begin(),
-            expr_->vals_.end(),
-            [this](const auto& value) {
-                return !IsInt64SafeForJsonDoubleIndex(value.int64_val());
-            });
-        if (has_unsafe_int_literal) {
-            exec_path_ = ExprExecPath::RawData;
-        }
+        auto req = MakeIndexRequirement(RequiredReader::Predicate);
+        req.value_type = expr_->column_.data_type_ == DataType::JSON
+                             ? value_type_
+                             : expr_->column_.element_type_;
+        req.json_array_cast = expr_->column_.data_type_ == DataType::JSON;
+        SelectAndPinIndex(req);
     }
 
  private:
@@ -554,6 +562,29 @@ class PhyJsonContainsFilterExpr : public SegmentExpr {
     template <typename ArrayType, typename ExprValueType, bool ElementLevel>
     VectorPtr
     ExecArrayContainsImpl(EvalCtx& context);
+
+    // Struct element index i for array_contains*(s[i][tags], ...) on a
+    // nested Array field, or kWholeArrayOperand when the row itself is the
+    // operand.
+    template <typename ArrayType, bool ElementLevel>
+    int
+    ArrayContainsNestedIndex() const {
+        if constexpr (std::is_same_v<ArrayType, ArrayValueView> &&
+                      !ElementLevel) {
+            if (IsNestedArrayElementOperand()) {
+                return ParseArraySubscript(expr_->column_.nested_path_);
+            }
+            if (is_nested_array_field_) {
+                ThrowInfo(ErrorCode::Unsupported,
+                          "array_contains on nested ARRAY field {} requires "
+                          "a struct element index",
+                          field_id_.get());
+            }
+        }
+        AssertInfo(expr_->column_.nested_path_.empty(),
+                   "[ExecArrayContains]nested path must be null");
+        return kWholeArrayOperand;
+    }
 
     template <typename ExprValueType>
     VectorPtr

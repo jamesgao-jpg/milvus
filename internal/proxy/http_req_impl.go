@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/errors"
 	"github.com/gin-gonic/gin"
 	"github.com/samber/lo"
 
@@ -31,6 +32,7 @@ import (
 	"github.com/milvus-io/milvus/internal/proxy/connection"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/dependency"
+	"github.com/milvus-io/milvus/pkg/v3/config"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/util/etcd"
 	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
@@ -47,37 +49,25 @@ var (
 	httpDBName         = "db_name"
 	HTTPCollectionName = "collection_name"
 	UnknownData        = "unknown"
-	sensitiveMark      = "*****"
-	sensitiveKeys      = []string{
-		"secretaccesskey",
-		"secret_access_key",
-		"password",
-		"apikey",
-		"credentialjson",
-		"credential_json",
-	}
+	// sensitiveMark is the redaction marker the access/trace log shares with the
+	// configuration projections, so an operator sees one shape for "withheld".
+	sensitiveMark = config.RedactedValue
 )
 
-func hideSensitive(configs map[string]string) {
-	checkFunc := func(key string) bool {
-		for _, sensitive := range sensitiveKeys {
-			if strings.Contains(strings.ToLower(key), sensitive) {
-				return true
-			}
-		}
-		return false
-	}
-	for key := range configs {
-		if checkFunc(key) {
-			configs[key] = sensitiveMark
-		}
-	}
-}
-
-func getConfigs(configs map[string]string) gin.HandlerFunc {
-	hideSensitive(configs)
+// getProjectedConfigs serves a configuration projection produced by the owning
+// config.Manager, and serves it verbatim. The name is the contract: what is
+// passed in MUST already have been through Manager.ProjectConfigs/GetConfigsView or
+// an equivalent, because nothing here will redact it. Redaction belongs to that
+// manager — only it knows which of its keys are declared, and the hook table's
+// keys are unknown to the main one.
+//
+// It takes a function rather than a map because the routes are registered once,
+// at startup, and a map captured there would answer every later request with
+// the configuration the process booted with — an endpoint whose whole purpose
+// is to report the configuration in force, reporting one that may no longer be.
+func getProjectedConfigs(project func() map[string]string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		bs, err := json.Marshal(configs)
+		bs, err := json.Marshal(project())
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
 				mhttp.HTTPReturnMessage: err.Error(),
@@ -337,18 +327,61 @@ func describeCollection(node *Proxy) gin.HandlerFunc {
 			return
 		}
 
-		describeCollectionResp, err := rootCoord.DescribeCollection(c, &milvuspb.DescribeCollectionRequest{
+		ctx := c.Request.Context()
+		localVisibility := false
+		if _, admin := mhttp.AuthenticatedAdminFromContext(ctx); !admin {
+			// With the management gate disabled, this route also accepts
+			// ordinary authenticated users. Preserve their object visibility;
+			// raw HTTP headers must not choose the forwarded identity.
+			ctx = NewContextWithMetadata(ctx, c.GetString("username"), dbName)
+			if err := checkDescribeCollectionUser(ctx); err != nil {
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{mhttp.HTTPReturnMessage: err.Error()})
+				return
+			}
+			localVisibility = localCollectionVisibilityEnabled()
+			if !localVisibility {
+				ctx = DescribeCollectionRPCContext(ctx)
+			}
+		}
+		// A verified management administrator retains the operator view,
+		// independently of data-plane RootShouldBindRole grants.
+		lookupCtx := ctx
+		if localVisibility {
+			lookupCtx = describeCollectionMetadataContext(ctx)
+		}
+		describeCollectionReq := &milvuspb.DescribeCollectionRequest{
 			Base: &commonpb.MsgBase{
 				MsgType: commonpb.MsgType_DescribeCollection,
 			},
 			DbName:         dbName,
 			CollectionName: collectionName,
-		})
+		}
+		describeCollectionResp, err := rootCoord.DescribeCollection(lookupCtx, describeCollectionReq)
 		if err := merr.CheckRPCCall(describeCollectionResp, err); err != nil {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
 				mhttp.HTTPReturnMessage: err.Error(),
 			})
 			return
+		}
+
+		if localVisibility {
+			known, visibilityErr := tryLocalCollectionVisibility(ctx, describeCollectionResp.GetDbName(), describeCollectionResp.GetSchema().GetName(), describeCollectionResp.GetCollectionID())
+			ctx = DescribeCollectionRPCContext(ctx)
+			if visibilityErr != nil {
+				status := http.StatusInternalServerError
+				if errors.Is(visibilityErr, merr.ErrPrivilegeNotPermitted) {
+					status = http.StatusForbidden
+				}
+				c.AbortWithStatusJSON(status, gin.H{mhttp.HTTPReturnMessage: visibilityErr.Error()})
+				return
+			}
+			if !known {
+				describeCollectionResp, err = rootCoord.DescribeCollection(ctx, describeCollectionReq)
+				if err := merr.CheckRPCCall(describeCollectionResp, err); err != nil {
+					c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{mhttp.HTTPReturnMessage: err.Error()})
+					return
+				}
+			}
 		}
 
 		// Convert TIMESTAMPTZ default values back to string format for the user.
@@ -358,7 +391,7 @@ func describeCollection(node *Proxy) gin.HandlerFunc {
 			})
 		}
 
-		describePartitionResp, err := rootCoord.ShowPartitions(c, &milvuspb.ShowPartitionsRequest{
+		describePartitionResp, err := rootCoord.ShowPartitions(ctx, &milvuspb.ShowPartitionsRequest{
 			Base: &commonpb.MsgBase{
 				MsgType: commonpb.MsgType_ShowPartitions,
 			},

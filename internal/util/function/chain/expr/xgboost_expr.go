@@ -58,7 +58,11 @@ func NewXGBoostExpr(modelResource string, output string, cache *xgboostModelCach
 		cache = globalXGBoostModelCache
 	}
 	return &XGBoostExpr{
-		BaseExpr:      *NewBaseExpr(XGBoostFuncName, []string{types.StageL0Rerank}),
+		BaseExpr: *NewBaseExpr(XGBoostFuncName, []string{
+			types.StageL0Rerank,
+			types.StageL1Rerank,
+			types.StageL2Rerank,
+		}),
 		modelResource: modelResource,
 		output:        output,
 		cache:         cache,
@@ -115,7 +119,7 @@ func (e *XGBoostExpr) Execute(ctx *types.FuncContext, inputs []*arrow.Chunked) (
 	if len(inputs) == 0 {
 		return nil, merr.WrapErrParameterInvalidMsg("xgboost: expected at least one input column")
 	}
-	lease, err := e.cache.acquireByResourceName(e.modelResource)
+	lease, err := e.cache.acquire(ctx.Context(), e.modelResource)
 	if err != nil {
 		return nil, err
 	}
