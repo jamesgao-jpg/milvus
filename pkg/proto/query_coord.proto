@@ -142,6 +142,8 @@ service QueryNode {
     }
     rpc Search(SearchRequest) returns (internal.SearchResults) {
     }
+    rpc SearchStream(stream SearchStreamRequest) returns (stream internal.SearchResults) {
+    }
     rpc SearchSegments(SearchRequest) returns (internal.SearchResults) {
     }
     rpc Query(QueryRequest) returns (internal.RetrieveResults) {
@@ -538,6 +540,11 @@ message SearchRequest {
     // If true, enable expression filter cache for two-stage search.
     // Stage 1 caches filter bitset, Stage 2 reuses it to skip re-execution.
     bool enable_expr_cache = 8;
+}
+
+message SearchStreamRequest {
+    SearchRequest request = 1;
+    int32 chunk_bytes = 2;
 }
 
 message QueryRequest {

@@ -18,6 +18,7 @@ package wrappers
 
 import (
 	"context"
+	"io"
 
 	"google.golang.org/grpc"
 
@@ -91,6 +92,59 @@ func (qn *qnServerWrapper) GetStatistics(ctx context.Context, in *querypb.GetSta
 
 func (qn *qnServerWrapper) Search(ctx context.Context, in *querypb.SearchRequest, opts ...grpc.CallOption) (*internalpb.SearchResults, error) {
 	return qn.QueryNode.Search(ctx, in)
+}
+
+func (qn *qnServerWrapper) SearchStream(ctx context.Context, _ ...grpc.CallOption) (querypb.QueryNode_SearchStreamClient, error) {
+	client := &searchStreamClient{
+		InMemoryStreamer: streamrpc.NewInMemoryStreamer[*internalpb.SearchResults](ctx, 0),
+		requests:         streamrpc.NewInMemoryStreamer[*querypb.SearchStreamRequest](ctx, 1),
+	}
+	go func() {
+		client.serverErr = qn.QueryNode.SearchStream(&searchStreamServer{
+			InMemoryStreamer: client.InMemoryStreamer, requests: client.requests,
+		})
+		client.Close()
+	}()
+	return client, nil
+}
+
+type searchStreamClient struct {
+	*streamrpc.InMemoryStreamer[*internalpb.SearchResults]
+	requests  *streamrpc.InMemoryStreamer[*querypb.SearchStreamRequest]
+	serverErr error // Written before the response buffer closes.
+}
+
+func (s *searchStreamClient) Send(request *querypb.SearchStreamRequest) error {
+	return s.requests.Send(request)
+}
+
+func (s *searchStreamClient) CloseSend() error {
+	s.requests.Close()
+	return nil
+}
+
+func (s *searchStreamClient) Recv() (*internalpb.SearchResults, error) {
+	result, err := s.InMemoryStreamer.Recv()
+	if err == io.EOF {
+		// The underlying streamer also reports EOF on cancellation. Distinguish
+		// that from a closed response buffer before reading the server's error.
+		if ctxErr := s.Context().Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if s.serverErr != nil {
+			return nil, s.serverErr
+		}
+	}
+	return result, err
+}
+
+type searchStreamServer struct {
+	*streamrpc.InMemoryStreamer[*internalpb.SearchResults]
+	requests *streamrpc.InMemoryStreamer[*querypb.SearchStreamRequest]
+}
+
+func (s *searchStreamServer) Recv() (*querypb.SearchStreamRequest, error) {
+	return s.requests.Recv()
 }
 
 func (qn *qnServerWrapper) SearchSegments(ctx context.Context, in *querypb.SearchRequest, opts ...grpc.CallOption) (*internalpb.SearchResults, error) {

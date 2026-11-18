@@ -42,6 +42,7 @@ import (
 	"github.com/milvus-io/milvus/internal/streamingnode/client/handler/registry"
 	"github.com/milvus-io/milvus/internal/util/analyzer"
 	"github.com/milvus-io/milvus/internal/util/fileresource"
+	searchreducestream "github.com/milvus-io/milvus/internal/util/searchutil/reduce_stream"
 	"github.com/milvus-io/milvus/internal/util/searchutil/scheduler"
 	streamingstatus "github.com/milvus-io/milvus/internal/util/streamingutil/status"
 	"github.com/milvus-io/milvus/internal/util/streamrpc"
@@ -993,6 +994,31 @@ func (node *QueryNode) Search(ctx context.Context, req *querypb.SearchRequest) (
 		ret.GetCostAggregation().ResponseTime = tr.ElapseSpan().Milliseconds()
 	}
 	return ret, nil
+}
+
+// SearchStream runs the same delegator and worker reduction as Search, then
+// sends the completed vchannel result in query-major Chunks.
+func (node *QueryNode) SearchStream(stream querypb.QueryNode_SearchStreamServer) error {
+	request, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	req := request.GetRequest()
+	if req.GetReq() == nil || request.GetChunkBytes() <= 0 || req.GetReq().GetIsAdvanced() || req.GetFilterOnly() {
+		return stream.Send(&internalpb.SearchResults{Status: merr.Status(merr.WrapErrServiceInternalMsg("invalid leader SearchStream request"))})
+	}
+	result, err := node.Search(stream.Context(), req)
+	if err != nil {
+		return stream.Send(&internalpb.SearchResults{Status: merr.Status(err)})
+	}
+	if !merr.Ok(result.GetStatus()) {
+		return stream.Send(result)
+	}
+	err = searchreducestream.SplitSearchResult(result, req.GetReq().GetNq(), req.GetReq().GetTopk(), int(request.GetChunkBytes()), stream.Send)
+	if merr.IsMilvusError(err) {
+		return stream.Send(&internalpb.SearchResults{Status: merr.Status(err)})
+	}
+	return err
 }
 
 // only used for delegator query segments from worker

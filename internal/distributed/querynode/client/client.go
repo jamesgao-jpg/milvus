@@ -215,6 +215,16 @@ func (c *Client) Search(ctx context.Context, req *querypb.SearchRequest, _ ...gr
 	})
 }
 
+func (c *Client) SearchStream(ctx context.Context, opts ...grpc.CallOption) (querypb.QueryNode_SearchStreamClient, error) {
+	ret, err := c.grpcClient.ReCall(ctx, func(client querypb.QueryNodeClient) (any, error) {
+		return client.SearchStream(ctx, opts...)
+	})
+	if err != nil || ret == nil {
+		return nil, err
+	}
+	return ret.(querypb.QueryNode_SearchStreamClient), nil
+}
+
 func (c *Client) SearchSegments(ctx context.Context, req *querypb.SearchRequest, _ ...grpc.CallOption) (*internalpb.SearchResults, error) {
 	return wrapGrpcCall(ctx, c, func(client querypb.QueryNodeClient) (*internalpb.SearchResults, error) {
 		return client.SearchSegments(ctx, req)

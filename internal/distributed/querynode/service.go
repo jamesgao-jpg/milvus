@@ -396,6 +396,10 @@ func (s *Server) Search(ctx context.Context, req *querypb.SearchRequest) (*inter
 	return s.querynode.Search(ctx, req)
 }
 
+func (s *Server) SearchStream(stream querypb.QueryNode_SearchStreamServer) error {
+	return s.querynode.SearchStream(stream)
+}
+
 func (s *Server) SearchSegments(ctx context.Context, req *querypb.SearchRequest) (*internalpb.SearchResults, error) {
 	return s.querynode.SearchSegments(ctx, req)
 }

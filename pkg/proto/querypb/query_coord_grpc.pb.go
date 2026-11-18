@@ -1613,6 +1613,7 @@ const (
 	QueryNode_SyncReplicaSegments_FullMethodName    = "/milvus.proto.query.QueryNode/SyncReplicaSegments"
 	QueryNode_GetStatistics_FullMethodName          = "/milvus.proto.query.QueryNode/GetStatistics"
 	QueryNode_Search_FullMethodName                 = "/milvus.proto.query.QueryNode/Search"
+	QueryNode_SearchStream_FullMethodName           = "/milvus.proto.query.QueryNode/SearchStream"
 	QueryNode_SearchSegments_FullMethodName         = "/milvus.proto.query.QueryNode/SearchSegments"
 	QueryNode_Query_FullMethodName                  = "/milvus.proto.query.QueryNode/Query"
 	QueryNode_QueryStream_FullMethodName            = "/milvus.proto.query.QueryNode/QueryStream"
@@ -1652,6 +1653,7 @@ type QueryNodeClient interface {
 	SyncReplicaSegments(ctx context.Context, in *SyncReplicaSegmentsRequest, opts ...grpc.CallOption) (*commonpb.Status, error)
 	GetStatistics(ctx context.Context, in *GetStatisticsRequest, opts ...grpc.CallOption) (*internalpb.GetStatisticsResponse, error)
 	Search(ctx context.Context, in *SearchRequest, opts ...grpc.CallOption) (*internalpb.SearchResults, error)
+	SearchStream(ctx context.Context, opts ...grpc.CallOption) (QueryNode_SearchStreamClient, error)
 	SearchSegments(ctx context.Context, in *SearchRequest, opts ...grpc.CallOption) (*internalpb.SearchResults, error)
 	Query(ctx context.Context, in *QueryRequest, opts ...grpc.CallOption) (*internalpb.RetrieveResults, error)
 	QueryStream(ctx context.Context, in *QueryRequest, opts ...grpc.CallOption) (QueryNode_QueryStreamClient, error)
@@ -1811,6 +1813,37 @@ func (c *queryNodeClient) Search(ctx context.Context, in *SearchRequest, opts ..
 	return out, nil
 }
 
+func (c *queryNodeClient) SearchStream(ctx context.Context, opts ...grpc.CallOption) (QueryNode_SearchStreamClient, error) {
+	stream, err := c.cc.NewStream(ctx, &QueryNode_ServiceDesc.Streams[0], QueryNode_SearchStream_FullMethodName, opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &queryNodeSearchStreamClient{stream}
+	return x, nil
+}
+
+type QueryNode_SearchStreamClient interface {
+	Send(*SearchStreamRequest) error
+	Recv() (*internalpb.SearchResults, error)
+	grpc.ClientStream
+}
+
+type queryNodeSearchStreamClient struct {
+	grpc.ClientStream
+}
+
+func (x *queryNodeSearchStreamClient) Send(m *SearchStreamRequest) error {
+	return x.ClientStream.SendMsg(m)
+}
+
+func (x *queryNodeSearchStreamClient) Recv() (*internalpb.SearchResults, error) {
+	m := new(internalpb.SearchResults)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
 func (c *queryNodeClient) SearchSegments(ctx context.Context, in *SearchRequest, opts ...grpc.CallOption) (*internalpb.SearchResults, error) {
 	out := new(internalpb.SearchResults)
 	err := c.cc.Invoke(ctx, QueryNode_SearchSegments_FullMethodName, in, out, opts...)
@@ -1830,7 +1863,7 @@ func (c *queryNodeClient) Query(ctx context.Context, in *QueryRequest, opts ...g
 }
 
 func (c *queryNodeClient) QueryStream(ctx context.Context, in *QueryRequest, opts ...grpc.CallOption) (QueryNode_QueryStreamClient, error) {
-	stream, err := c.cc.NewStream(ctx, &QueryNode_ServiceDesc.Streams[0], QueryNode_QueryStream_FullMethodName, opts...)
+	stream, err := c.cc.NewStream(ctx, &QueryNode_ServiceDesc.Streams[1], QueryNode_QueryStream_FullMethodName, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1871,7 +1904,7 @@ func (c *queryNodeClient) QuerySegments(ctx context.Context, in *QueryRequest, o
 }
 
 func (c *queryNodeClient) QueryStreamSegments(ctx context.Context, in *QueryRequest, opts ...grpc.CallOption) (QueryNode_QueryStreamSegmentsClient, error) {
-	stream, err := c.cc.NewStream(ctx, &QueryNode_ServiceDesc.Streams[1], QueryNode_QueryStreamSegments_FullMethodName, opts...)
+	stream, err := c.cc.NewStream(ctx, &QueryNode_ServiceDesc.Streams[2], QueryNode_QueryStreamSegments_FullMethodName, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2046,6 +2079,7 @@ type QueryNodeServer interface {
 	SyncReplicaSegments(context.Context, *SyncReplicaSegmentsRequest) (*commonpb.Status, error)
 	GetStatistics(context.Context, *GetStatisticsRequest) (*internalpb.GetStatisticsResponse, error)
 	Search(context.Context, *SearchRequest) (*internalpb.SearchResults, error)
+	SearchStream(QueryNode_SearchStreamServer) error
 	SearchSegments(context.Context, *SearchRequest) (*internalpb.SearchResults, error)
 	Query(context.Context, *QueryRequest) (*internalpb.RetrieveResults, error)
 	QueryStream(*QueryRequest, QueryNode_QueryStreamServer) error
@@ -2116,6 +2150,9 @@ func (UnimplementedQueryNodeServer) GetStatistics(context.Context, *GetStatistic
 }
 func (UnimplementedQueryNodeServer) Search(context.Context, *SearchRequest) (*internalpb.SearchResults, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Search not implemented")
+}
+func (UnimplementedQueryNodeServer) SearchStream(QueryNode_SearchStreamServer) error {
+	return status.Errorf(codes.Unimplemented, "method SearchStream not implemented")
 }
 func (UnimplementedQueryNodeServer) SearchSegments(context.Context, *SearchRequest) (*internalpb.SearchResults, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method SearchSegments not implemented")
@@ -2436,6 +2473,32 @@ func _QueryNode_Search_Handler(srv interface{}, ctx context.Context, dec func(in
 		return srv.(QueryNodeServer).Search(ctx, req.(*SearchRequest))
 	}
 	return interceptor(ctx, in, info, handler)
+}
+
+func _QueryNode_SearchStream_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(QueryNodeServer).SearchStream(&queryNodeSearchStreamServer{stream})
+}
+
+type QueryNode_SearchStreamServer interface {
+	Send(*internalpb.SearchResults) error
+	Recv() (*SearchStreamRequest, error)
+	grpc.ServerStream
+}
+
+type queryNodeSearchStreamServer struct {
+	grpc.ServerStream
+}
+
+func (x *queryNodeSearchStreamServer) Send(m *internalpb.SearchResults) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func (x *queryNodeSearchStreamServer) Recv() (*SearchStreamRequest, error) {
+	m := new(SearchStreamRequest)
+	if err := x.ServerStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 func _QueryNode_SearchSegments_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -2919,6 +2982,12 @@ var QueryNode_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "SearchStream",
+			Handler:       _QueryNode_SearchStream_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
 		{
 			StreamName:    "QueryStream",
 			Handler:       _QueryNode_QueryStream_Handler,

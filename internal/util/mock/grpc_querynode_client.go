@@ -20,6 +20,8 @@ import (
 	"context"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
@@ -84,6 +86,13 @@ func (m *GrpcQueryNodeClient) GetSegmentInfo(ctx context.Context, in *querypb.Ge
 
 func (m *GrpcQueryNodeClient) Search(ctx context.Context, in *querypb.SearchRequest, opts ...grpc.CallOption) (*internalpb.SearchResults, error) {
 	return &internalpb.SearchResults{}, m.Err
+}
+
+func (m *GrpcQueryNodeClient) SearchStream(context.Context, ...grpc.CallOption) (querypb.QueryNode_SearchStreamClient, error) {
+	if m.Err != nil {
+		return nil, m.Err
+	}
+	return nil, status.Error(codes.Unimplemented, "SearchStream not configured")
 }
 
 func (m *GrpcQueryNodeClient) SearchSegments(ctx context.Context, in *querypb.SearchRequest, opts ...grpc.CallOption) (*internalpb.SearchResults, error) {

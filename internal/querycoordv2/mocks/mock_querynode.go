@@ -1417,6 +1417,52 @@ func (_c *MockQueryNodeServer_SearchSegments_Call) RunAndReturn(run func(context
 	return _c
 }
 
+// SearchStream provides a mock function with given fields: _a0
+func (_m *MockQueryNodeServer) SearchStream(_a0 querypb.QueryNode_SearchStreamServer) error {
+	ret := _m.Called(_a0)
+
+	if len(ret) == 0 {
+		panic("no return value specified for SearchStream")
+	}
+
+	var r0 error
+	if rf, ok := ret.Get(0).(func(querypb.QueryNode_SearchStreamServer) error); ok {
+		r0 = rf(_a0)
+	} else {
+		r0 = ret.Error(0)
+	}
+
+	return r0
+}
+
+// MockQueryNodeServer_SearchStream_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'SearchStream'
+type MockQueryNodeServer_SearchStream_Call struct {
+	*mock.Call
+}
+
+// SearchStream is a helper method to define mock.On call
+//   - _a0 querypb.QueryNode_SearchStreamServer
+func (_e *MockQueryNodeServer_Expecter) SearchStream(_a0 interface{}) *MockQueryNodeServer_SearchStream_Call {
+	return &MockQueryNodeServer_SearchStream_Call{Call: _e.mock.On("SearchStream", _a0)}
+}
+
+func (_c *MockQueryNodeServer_SearchStream_Call) Run(run func(_a0 querypb.QueryNode_SearchStreamServer)) *MockQueryNodeServer_SearchStream_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(querypb.QueryNode_SearchStreamServer))
+	})
+	return _c
+}
+
+func (_c *MockQueryNodeServer_SearchStream_Call) Return(_a0 error) *MockQueryNodeServer_SearchStream_Call {
+	_c.Call.Return(_a0)
+	return _c
+}
+
+func (_c *MockQueryNodeServer_SearchStream_Call) RunAndReturn(run func(querypb.QueryNode_SearchStreamServer) error) *MockQueryNodeServer_SearchStream_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // ShowConfigurations provides a mock function with given fields: _a0, _a1
 func (_m *MockQueryNodeServer) ShowConfigurations(_a0 context.Context, _a1 *internalpb.ShowConfigurationsRequest) (*internalpb.ShowConfigurationsResponse, error) {
 	ret := _m.Called(_a0, _a1)
