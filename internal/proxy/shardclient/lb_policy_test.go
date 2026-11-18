@@ -1510,6 +1510,47 @@ func (s *LBPolicySuite) TestExecuteWithRetryUnscopedKeepsTheExecError() {
 	s.NotErrorIs(err, merr.ErrServiceUnavailable)
 }
 
+func (s *LBPolicySuite) TestExecuteCancelsSiblingStreamAfterRetry() {
+	parent, expire := context.WithTimeout(context.Background(), 5*time.Second)
+	defer expire()
+	ctx, cancel := context.WithCancelCause(parent)
+	defer cancel(nil)
+	s.lbPolicy.retryOnReplica = 1
+	s.mgr.EXPECT().GetShardLeaderList(mock.Anything, s.dbName, s.collectionName, s.collectionID, true).Return(s.channels, nil)
+	s.mgr.EXPECT().GetShard(mock.Anything, true, s.dbName, s.collectionName, s.collectionID, mock.Anything).Return(s.nodes, nil)
+	s.mgr.EXPECT().GetClient(mock.Anything, mock.Anything).Return(s.qn, nil)
+	s.lbBalancer.EXPECT().RegisterNodeInfo(mock.Anything)
+	s.lbBalancer.EXPECT().SelectNode(mock.Anything, mock.Anything, mock.Anything).RunAndReturn(func(_ context.Context, nodes []int64, _ int64) (int64, error) {
+		return nodes[0], nil
+	})
+	s.lbBalancer.EXPECT().CancelWorkload(mock.Anything, mock.Anything)
+
+	siblingOpened := make(chan struct{})
+	failure := merr.WrapErrParameterInvalidMsg("invalid Search request")
+	attempts := 0
+	err := s.lbPolicy.Execute(ctx, CollectionWorkLoad{
+		Db: s.dbName, CollectionName: s.collectionName, CollectionID: s.collectionID, Nq: 1,
+		CancelOnFailure: cancel,
+		Exec: func(ctx context.Context, _ UniqueID, _ types.QueryNodeClient, channel string) error {
+			if channel == s.channels[1] {
+				close(siblingOpened)
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			<-siblingOpened
+			attempts++
+			if attempts == 1 {
+				return merr.WrapErrServiceUnavailable("leader is not ready")
+			}
+			return failure
+		},
+	})
+	s.Require().Error(err)
+	s.ErrorIs(context.Cause(ctx), failure)
+	s.NoError(parent.Err(), "sibling stops before the caller's deadline")
+	s.Equal(2, attempts, "one channel can retry without canceling its sibling")
+}
+
 // TestExecuteOneChannelScopedPrePassRetriesTransientErrors pins that the
 // pre-pass read goes through the same retry wrapper as the other two manager
 // reads: a transient coordinator error (ErrServiceNotReady during a restart)

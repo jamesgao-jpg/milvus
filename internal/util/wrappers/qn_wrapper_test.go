@@ -48,6 +48,32 @@ func (s *QnWrapperSuite) TearDownTest() {
 	s.qn = nil
 }
 
+func (s *QnWrapperSuite) TestSearchStreamPreservesServerError() {
+	terminalErr := merr.WrapErrServiceUnavailable("leader stopped")
+	s.qn.EXPECT().SearchStream(mock.Anything).RunAndReturn(func(server querypb.QueryNode_SearchStreamServer) error {
+		req, err := server.Recv()
+		if err != nil {
+			return err
+		}
+		s.EqualValues(256, req.GetChunkBytes())
+		if err := server.Send(&internalpb.SearchResults{NumQueries: 2}); err != nil {
+			return err
+		}
+		return terminalErr
+	}).Once()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream, err := s.client.SearchStream(ctx)
+	s.Require().NoError(err)
+	s.Require().NoError(stream.Send(&querypb.SearchStreamRequest{ChunkBytes: 256}))
+	s.Require().NoError(stream.CloseSend())
+	chunk, err := stream.Recv()
+	s.Require().NoError(err)
+	s.EqualValues(2, chunk.GetNumQueries())
+	_, err = stream.Recv()
+	s.ErrorIs(err, terminalErr)
+}
+
 func (s *QnWrapperSuite) TestGetComponentStates() {
 	s.qn.EXPECT().GetComponentStates(mock.Anything, mock.Anything).
 		Return(&milvuspb.ComponentStates{Status: merr.Status(nil)}, nil)
