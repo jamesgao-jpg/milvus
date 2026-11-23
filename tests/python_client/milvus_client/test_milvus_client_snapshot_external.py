@@ -677,11 +677,11 @@ class TestMilvusClientMilvusTableExternal(MilvusTableExternalTestBase):
         )
 
     @pytest.mark.tags(CaseLabel.L1)
-    def test_milvus_table_snapshot_excludes_unflushed_dml(self, request):
+    def test_milvus_table_snapshot_includes_unflushed_dml(self, request):
         """
-        target: keep the snapshot boundary at flushed source data
+        target: capture pre-snapshot DML without a separate client Flush
         method: flush a baseline, then delete, update-upsert, and insert-upsert without flushing
-        expected: target contains original baseline rows and excludes all unflushed changes
+        expected: target reflects pre-snapshot mutations and excludes later source changes
         """
         client = self._client()
         cfg = self._minio_cfg(request)
@@ -695,11 +695,8 @@ class TestMilvusClientMilvusTableExternal(MilvusTableExternalTestBase):
         self.delete(client, source, ids=[0])
         self.upsert(client, source, [_core_row(1, marker=9), _core_row(SMALL_ROWS, marker=9)])
 
-        # Establish, with Strong consistency, that these unflushed mutations are
-        # actually visible in the source BEFORE the snapshot. This proves the
-        # snapshot below excluded real changes (delete of pk 0, in-place
-        # replacement of pk 1, and insert-upsert of pk SMALL_ROWS) rather than
-        # no-op writes that the target would also not contain.
+        # Confirm that the pre-snapshot Delete and Upserts are visible in the
+        # source without a client Flush. CreateSnapshot must persist them.
         source_rows = self.query(
             client,
             source,
@@ -721,18 +718,35 @@ class TestMilvusClientMilvusTableExternal(MilvusTableExternalTestBase):
 
         snapshot = self._create_snapshot_ref(client, source, cfg, suffix="unflushed")
 
+        # Mutate the same keys after the snapshot to verify its fixed boundary:
+        # reinsert pk 0, delete the replacement at pk 1, and add a new key.
+        self.delete(client, source, ids=[1])
+        self.upsert(client, source, [_core_row(0, marker=10), _core_row(SMALL_ROWS + 1, marker=10)])
+        source_rows = self.query(
+            client,
+            source,
+            filter=f"pk in [0, 1, {SMALL_ROWS}, {SMALL_ROWS + 1}]",
+            output_fields=["pk"],
+            consistency_level="Strong",
+            limit=10,
+        )[0]
+        assert {_row_value(row, "pk") for row in source_rows} == {0, SMALL_ROWS, SMALL_ROWS + 1}
+
         schema = self._build_core_target_schema(client, snapshot, cfg, real_pk=True)
         self.create_collection(client, collection_name=target, schema=schema)
         self._refresh(client, target)
         self._index_and_load(client, target)
 
         assert self._count(client, target) == SMALL_ROWS
-        row_zero = self._query_source_pks(client, target, [0])
-        row_one = self._query_source_pks(client, target, [1])
-        assert len(row_zero) == len(row_one) == 1
-        self._assert_core_row(row_zero[0], _core_row(0))
-        self._assert_core_row(row_one[0], _core_row(1))
-        assert self._query_source_pks(client, target, [SMALL_ROWS]) == []
+        assert self._query_source_pks(client, target, [0, SMALL_ROWS + 1]) == []
+        for row_id in (1, SMALL_ROWS):
+            queried = self._query_source_pks(client, target, [row_id])
+            assert len(queried) == 1
+            self._assert_core_row(queried[0], _core_row(row_id, marker=9))
+        # Unmodified baseline data is preserved alongside the two Upserts.
+        queried = self._query_source_pks(client, target, [2])
+        assert len(queried) == 1
+        self._assert_core_row(queried[0], _core_row(2))
 
     @pytest.mark.tags(CaseLabel.L1)
     @pytest.mark.parametrize("real_pk", [True, False], ids=["real_pk", "virtual_pk"])
@@ -774,7 +788,8 @@ class TestMilvusClientMilvusTableExternal(MilvusTableExternalTestBase):
 
     @pytest.mark.tags(CaseLabel.L1)
     @pytest.mark.parametrize("real_pk", [True, False], ids=["real_pk", "virtual_pk"])
-    def test_milvus_table_refresh_applies_snapshot_deletes(self, request, real_pk):
+    @pytest.mark.parametrize("refresh_loaded", [False, True], ids=["reload", "loaded"])
+    def test_milvus_table_refresh_applies_snapshot_deletes(self, request, real_pk, refresh_loaded):
         """
         target: apply a later snapshot's deletes through refresh
         method: load snapshot A, flush deletes into snapshot B, then refresh B twice
@@ -806,22 +821,27 @@ class TestMilvusClientMilvusTableExternal(MilvusTableExternalTestBase):
         self._flush_rate_limited(client, source)
         snapshot_b = self._create_snapshot_ref(client, source, cfg, suffix="delete_b")
 
-        self.release_collection(client, target)
+        if not refresh_loaded:
+            self.release_collection(client, target)
         self._refresh(client, target, snapshot_ref=snapshot_b, minio_cfg=cfg)
-        self.load_collection(client, target)
+        if not refresh_loaded:
+            self.load_collection(client, target)
         assert self._count(client, target) == CORE_ROWS - CORE_DELETE_ROWS
         assert self._query_source_pks(client, target, [0, CORE_DELETE_ROWS - 1]) == []
         first_signature = self._core_signature(client, target, [CORE_DELETE_ROWS, 500, CORE_ROWS - 1])
         assert self.describe_collection(client, target)[0]["external_source"] == snapshot_b.external_source
 
-        self.release_collection(client, target)
+        if not refresh_loaded:
+            self.release_collection(client, target)
         self._refresh(client, target, snapshot_ref=snapshot_b, minio_cfg=cfg)
-        self.load_collection(client, target)
+        if not refresh_loaded:
+            self.load_collection(client, target)
         assert self._count(client, target) == CORE_ROWS - CORE_DELETE_ROWS
         assert self._core_signature(client, target, [CORE_DELETE_ROWS, 500, CORE_ROWS - 1]) == first_signature
 
     @pytest.mark.tags(CaseLabel.L1)
-    def test_milvus_table_refresh_adds_rows_and_is_idempotent(self, request):
+    @pytest.mark.parametrize("refresh_loaded", [False, True], ids=["reload", "loaded"])
+    def test_milvus_table_refresh_adds_rows_and_is_idempotent(self, request, refresh_loaded):
         """
         target: add newly flushed source rows through a later snapshot
         method: refresh snapshot A, append rows, refresh snapshot B, then repeat B
@@ -847,9 +867,11 @@ class TestMilvusClientMilvusTableExternal(MilvusTableExternalTestBase):
         self._flush_rate_limited(client, source)
         snapshot_b = self._create_snapshot_ref(client, source, cfg, suffix="append_b")
 
-        self.release_collection(client, target)
+        if not refresh_loaded:
+            self.release_collection(client, target)
         self._refresh(client, target, snapshot_ref=snapshot_b, minio_cfg=cfg)
-        self.load_collection(client, target)
+        if not refresh_loaded:
+            self.load_collection(client, target)
         assert self._count(client, target) == SMALL_ROWS + len(added_ids)
         added_rows = self._query_source_pks(client, target, [added_ids[0], added_ids[-1]])
         assert {_row_value(row, "source_pk") for row in added_rows} == {
@@ -858,14 +880,17 @@ class TestMilvusClientMilvusTableExternal(MilvusTableExternalTestBase):
         }
         first_signature = self._core_signature(client, target, [0, SMALL_ROWS, added_ids[-1]])
 
-        self.release_collection(client, target)
+        if not refresh_loaded:
+            self.release_collection(client, target)
         self._refresh(client, target, snapshot_ref=snapshot_b, minio_cfg=cfg)
-        self.load_collection(client, target)
+        if not refresh_loaded:
+            self.load_collection(client, target)
         assert self._count(client, target) == SMALL_ROWS + len(added_ids)
         assert self._core_signature(client, target, [0, SMALL_ROWS, added_ids[-1]]) == first_signature
 
     @pytest.mark.tags(CaseLabel.L1)
-    def test_milvus_table_refresh_overwrites_existing_rows(self, request):
+    @pytest.mark.parametrize("refresh_loaded", [False, True], ids=["reload", "loaded"])
+    def test_milvus_table_refresh_overwrites_existing_rows(self, request, refresh_loaded):
         """
         target: overwrite an existing source row value through a later snapshot
         method: refresh snapshot A, upsert a new value over an existing PK, refresh snapshot B
@@ -893,9 +918,11 @@ class TestMilvusClientMilvusTableExternal(MilvusTableExternalTestBase):
         self._flush_rate_limited(client, source)
         snapshot_b = self._create_snapshot_ref(client, source, cfg, suffix="overwrite_b")
 
-        self.release_collection(client, target)
+        if not refresh_loaded:
+            self.release_collection(client, target)
         self._refresh(client, target, snapshot_ref=snapshot_b, minio_cfg=cfg)
-        self.load_collection(client, target)
+        if not refresh_loaded:
+            self.load_collection(client, target)
         assert self._count(client, target) == SMALL_ROWS
         updated_rows = self._query_source_pks(client, target, [row_id])
         assert len(updated_rows) == 1

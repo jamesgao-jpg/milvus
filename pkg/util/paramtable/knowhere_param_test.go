@@ -7,7 +7,19 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus/pkg/v3/common"
 )
+
+func TestKnowhereConfig_MRLRefineRatio(t *testing.T) {
+	bt := NewBaseTable(SkipRemote(true))
+	cfg := &knowhereConfig{}
+	cfg.init(bt)
+	assert.Equal(t, 1.0, cfg.MRLRefineRatio.GetAsFloat())
+	assert.NoError(t, bt.Save("knowhere.MRL.search.refine_ratio", "2.9"))
+	assert.Equal(t, 2.9, cfg.MRLRefineRatio.GetAsFloat())
+	// The MRL setting is consumed at startup, not merged into base-index params.
+	assert.Empty(t, cfg.getIndexParam("HNSW", SearchStage))
+}
 
 func TestKnowhereConfig_GetIndexParam(t *testing.T) {
 	bt := NewBaseTable(SkipRemote(true))
@@ -186,6 +198,31 @@ func TestKnowhereConfig_MergeParameter(t *testing.T) {
 				assert.Equal(t, expectedValue, result[key], "The value for key %s should match the expected value", key)
 			}
 		})
+	}
+}
+
+func TestKnowhereConfig_MergeIndexParamsJSON(t *testing.T) {
+	bt := NewBaseTable(SkipRemote(true))
+	cfg := &knowhereConfig{}
+	cfg.init(bt)
+
+	bt.Save("knowhere.TEST_INDEX.search.default_number", "0.5")
+	bt.Save("knowhere.TEST_INDEX.search.default_string", "balanced")
+
+	params := map[string]any{common.SearchParamKey: `{"default_number":0.8,"request_param":16}`}
+	err := cfg.MergeIndexParamsJSON("TEST_INDEX", SearchStage, params)
+	assert.NoError(t, err)
+	assert.JSONEq(t, `{"default_number":0.8,"default_string":"balanced","request_param":16}`, params[common.SearchParamKey].(string))
+
+	params[common.SearchParamKey] = `{"request_param":16}`
+	err = cfg.MergeIndexParamsJSON("TEST_INDEX", SearchStage, params)
+	assert.NoError(t, err)
+	assert.JSONEq(t, `{"default_number":0.5,"default_string":"balanced","request_param":16}`, params[common.SearchParamKey].(string))
+
+	for _, raw := range []string{"invalid", "null", "[]", "1"} {
+		params[common.SearchParamKey] = raw
+		err = cfg.MergeIndexParamsJSON("TEST_INDEX", SearchStage, params)
+		assert.Error(t, err, raw)
 	}
 }
 

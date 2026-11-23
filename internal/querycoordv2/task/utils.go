@@ -25,9 +25,9 @@ import (
 	"github.com/samber/lo"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/msgpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/internal/metacache"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
 	"github.com/milvus-io/milvus/pkg/v3/common"
@@ -185,17 +185,17 @@ func packReleaseSegmentRequest(task *SegmentTask, action *SegmentAction) *queryp
 	}
 }
 
-func packLoadMeta(loadType querypb.LoadType, collectionInfo *milvuspb.DescribeCollectionResponse, resourceGroup string, loadFields []int64, partitions ...int64) *querypb.LoadMetaInfo {
+func packLoadMeta(loadType querypb.LoadType, collectionInfo *metacache.CollectionInfo, resourceGroup string, loadFields []int64, partitions ...int64) *querypb.LoadMetaInfo {
 	return &querypb.LoadMetaInfo{
 		LoadType:      loadType,
-		CollectionID:  collectionInfo.GetCollectionID(),
+		CollectionID:  collectionInfo.ID,
 		PartitionIDs:  partitions,
-		DbName:        collectionInfo.GetDbName(),
+		DbName:        collectionInfo.DatabaseName,
 		ResourceGroup: resourceGroup,
 		LoadFields:    loadFields,
 		// The update timestamp is a load barrier, not the logical schema version.
 		// QueryNode uses it only to reject stale load results after schema changes.
-		SchemaBarrierTs: collectionInfo.GetUpdateTimestamp(),
+		SchemaBarrierTs: collectionInfo.UpdateTimestamp,
 	}
 }
 
@@ -223,7 +223,7 @@ func packSubChannelRequest(
 		Schema:        finalSchema, // assign it for compatibility of rolling upgrade from 2.2.x to 2.3
 		LoadMeta:      loadMeta,    // assign it for compatibility of rolling upgrade from 2.2.x to 2.3
 		ReplicaID:     task.ReplicaID(),
-		Version:       time.Now().UnixNano(),
+		Version:       task.WatchVersion(),
 		IndexInfoList: indexInfo,
 		TargetVersion: targetVersion,
 	}
@@ -273,7 +273,7 @@ func packUnsubDmChannelRequest(task *ChannelTask, action Action) *querypb.UnsubD
 }
 
 // applyCollectionSettings applies collection-level mmap and warmup settings to all fields.
-// It combines applyCollectionMmapSetting and applyCollectionWarmupSetting into a single call.
+// It combines ApplyCollectionMmapSetting and applyCollectionWarmupSetting into a single call.
 func applyCollectionSettings(schema *schemapb.CollectionSchema,
 	collectionProperties []*commonpb.KeyValuePair,
 ) *schemapb.CollectionSchema {
@@ -281,7 +281,7 @@ func applyCollectionSettings(schema *schemapb.CollectionSchema,
 	schemaCloned := typeutil.Clone(schema)
 	schemaCloned.Properties = mergeCollectionProps(schemaCloned.Properties, collectionProperties)
 
-	schemaCloned = applyCollectionMmapSetting(schemaCloned, collectionProperties)
+	schemaCloned = ApplyCollectionMmapSetting(schemaCloned, collectionProperties)
 	schemaCloned = applyCollectionWarmupSetting(schemaCloned, collectionProperties)
 
 	// Index warmup is normally materialized into each IndexInfo by
@@ -299,7 +299,9 @@ func applyCollectionSettings(schema *schemapb.CollectionSchema,
 	return schemaCloned
 }
 
-func applyCollectionMmapSetting(schema *schemapb.CollectionSchema,
+// ApplyCollectionMmapSetting applies collection and struct mmap defaults in place,
+// preserving explicit field settings. Callers must pass an owned schema.
+func ApplyCollectionMmapSetting(schema *schemapb.CollectionSchema,
 	collectionProperties []*commonpb.KeyValuePair,
 ) *schemapb.CollectionSchema {
 	// field mmap enabled if collection-level mmap enabled or the field mmap enabled

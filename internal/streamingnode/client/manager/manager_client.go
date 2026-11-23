@@ -44,6 +44,7 @@ type ManagerClient interface {
 	Assign(ctx context.Context, pchannel types.PChannelInfoAssigned) error
 
 	// Remove the wal instance for the channel on streaming node of given server id.
+	// Return types.ErrNotAlive if the streaming node is not in the session view; in that case the wal on it is not confirmed closed.
 	Remove(ctx context.Context, pchannel types.PChannelInfoAssigned) error
 
 	// Close closes the manager client.
@@ -111,13 +112,13 @@ func getDialOptions(rb resolver.Builder) []grpc.DialOption {
 			mlog.UnaryClientInterceptor(),
 			otelgrpc.UnaryClientInterceptor(tracer.GetInterceptorOpts()...),
 			interceptor.ClusterInjectionUnaryClientInterceptor(),
-			streamingserviceinterceptor.NewStreamingServiceUnaryClientInterceptor(),
+			streamingserviceinterceptor.NewServiceUnaryClientInterceptor(typeutil.StreamingNodeRole),
 		),
 		grpc.WithChainStreamInterceptor(
 			mlog.StreamClientInterceptor(),
 			otelgrpc.StreamClientInterceptor(tracer.GetInterceptorOpts()...),
 			interceptor.ClusterInjectionStreamClientInterceptor(),
-			streamingserviceinterceptor.NewStreamingServiceStreamClientInterceptor(),
+			streamingserviceinterceptor.NewServiceStreamClientInterceptor(typeutil.StreamingNodeRole),
 		),
 		grpc.WithReturnConnectionError(),
 		grpc.WithDefaultServiceConfig(string(defaultServiceConfigJSON)),

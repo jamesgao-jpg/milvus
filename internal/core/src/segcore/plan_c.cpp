@@ -19,6 +19,7 @@
 
 #include "NamedType/named_type_impl.hpp"
 #include "NamedType/underlying_functionalities.hpp"
+#include "common/CGoCatch.h"
 #include "common/EasyAssert.h"
 #include "common/FieldMeta.h"
 #include "common/IndexMeta.h"
@@ -81,11 +82,12 @@ CreateSearchPlanByExpr(CCollection c_col,
         *res_plan = nullptr;
         return status;
     } catch (std::exception& e) {
-        auto status = CStatus();
-        status.error_code = milvus::UnexpectedError;
-        status.error_msg = strdup(e.what());
         *res_plan = nullptr;
-        return status;
+        return milvus::FailureCStatus(&e);
+    } catch (...) {
+        *res_plan = nullptr;
+        return milvus::FailureCStatus(milvus::UnexpectedError,
+                                      "unknown exception");
     }
 }
 
@@ -107,11 +109,12 @@ ParsePlaceholderGroup(CSearchPlan c_plan,
         *res_placeholder_group = group;
         return status;
     } catch (std::exception& e) {
-        auto status = CStatus();
-        status.error_code = milvus::UnexpectedError;
-        status.error_msg = strdup(e.what());
         *res_placeholder_group = nullptr;
-        return status;
+        return milvus::FailureCStatus(&e);
+    } catch (...) {
+        *res_placeholder_group = nullptr;
+        return milvus::FailureCStatus(milvus::UnexpectedError,
+                                      "unknown exception");
     }
 }
 
@@ -128,15 +131,46 @@ GetTopK(CSearchPlan plan) {
     return res;
 }
 
+uint64_t
+GetSearchPlanFeatureBits(CSearchPlan c_plan) {
+    auto plan = static_cast<milvus::query::Plan*>(c_plan);
+    if (plan == nullptr || plan->plan_node_ == nullptr) {
+        return 0;
+    }
+    const auto& recorder = plan->plan_node_->plan_options_.feature_recorder;
+    return recorder ? recorder->Bits() : 0;
+}
+
+uint64_t
+GetRetrievePlanFeatureBits(CRetrievePlan c_plan) {
+    auto plan = static_cast<milvus::query::RetrievePlan*>(c_plan);
+    if (plan == nullptr || plan->plan_node_ == nullptr) {
+        return 0;
+    }
+    const auto& recorder = plan->plan_node_->plan_options_.feature_recorder;
+    return recorder ? recorder->Bits() : 0;
+}
+
+int64_t
+GetGroupSize(CSearchPlan plan) {
+    auto search_plan = static_cast<milvus::query::Plan*>(plan);
+    return search_plan->plan_node_->search_info_.group_size_;
+}
+
+void
+SetSearchPlanTakeForOutputAllowed(CSearchPlan plan, bool allowed) {
+    auto search_plan = static_cast<milvus::query::Plan*>(plan);
+    search_plan->take_for_output_allowed_ = allowed;
+}
+
 CStatus
 GetFieldID(CSearchPlan plan, int64_t* field_id) {
     try {
         auto p = static_cast<const milvus::query::Plan*>(plan);
         *field_id = milvus::query::GetFieldID(p);
         return milvus::SuccessCStatus();
-    } catch (std::exception& e) {
-        return milvus::FailureCStatus(&e);
     }
+    CGO_CATCH_AND_RETURN_CSTATUS
 }
 
 const char*
@@ -198,11 +232,12 @@ CreateRetrievePlanByExpr(CCollection c_col,
         *res_plan = nullptr;
         return status;
     } catch (std::exception& e) {
-        auto status = CStatus();
-        status.error_code = milvus::UnexpectedError;
-        status.error_msg = strdup(e.what());
         *res_plan = nullptr;
-        return status;
+        return milvus::FailureCStatus(&e);
+    } catch (...) {
+        *res_plan = nullptr;
+        return milvus::FailureCStatus(milvus::UnexpectedError,
+                                      "unknown exception");
     }
 }
 
@@ -212,9 +247,39 @@ DeleteRetrievePlan(CRetrievePlan c_plan) {
     delete plan;
 }
 
+void
+SetRetrievePlanTakeForOutputAllowed(CRetrievePlan c_plan, bool allowed) {
+    auto plan = static_cast<milvus::query::RetrievePlan*>(c_plan);
+    plan->take_for_output_allowed_ = allowed;
+}
+
+CStatus
+SetRetrievePlanMode(CRetrievePlan c_plan,
+                    CRetrieveMode mode,
+                    int64_t max_candidate_rows) {
+    try {
+        AssertInfo(c_plan != nullptr, "retrieve plan is null");
+        AssertInfo(mode == RetrieveModeNormal || mode == RetrieveModeCandidates,
+                   "invalid retrieve mode: {}",
+                   static_cast<int>(mode));
+        AssertInfo(max_candidate_rows >= 0,
+                   "candidate row cap must be non-negative");
+        auto* plan = static_cast<milvus::query::RetrievePlan*>(c_plan);
+        plan->max_candidate_rows_ = max_candidate_rows;
+        plan->mode_ = mode == RetrieveModeCandidates
+                          ? milvus::query::RetrieveMode::Candidates
+                          : milvus::query::RetrieveMode::Normal;
+        return CStatus{milvus::Success, ""};
+    }
+    CGO_CATCH_AND_RETURN_CSTATUS
+}
+
 bool
 ShouldIgnoreNonPk(CRetrievePlan c_plan) {
     auto plan = static_cast<milvus::query::RetrievePlan*>(c_plan);
+    if (plan->mode_ == milvus::query::RetrieveMode::Candidates) {
+        return true;
+    }
     // ORDER BY queries must not use two-phase retrieval: the pipeline
     // returns data in a positional layout [pk, orderby, remaining] that
     // the Go-side Remap depends on.  RetrieveByOffsets would re-fetch

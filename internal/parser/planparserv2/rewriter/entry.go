@@ -39,6 +39,13 @@ func (v *visitor) visitExpr(expr *planpb.Expr) interface{} {
 		return v.visitTermExpr(real.TermExpr)
 	case *planpb.Expr_ValueExpr:
 		return v.visitValueExpr(real.ValueExpr, expr)
+	case *planpb.Expr_RandomSampleExpr:
+		real.RandomSampleExpr.Predicate = v.visitExpr(real.RandomSampleExpr.GetPredicate()).(*planpb.Expr)
+		return expr
+	case *planpb.Expr_ElementFilterExpr:
+		real.ElementFilterExpr.ElementExpr = v.visitExpr(real.ElementFilterExpr.GetElementExpr()).(*planpb.Expr)
+		real.ElementFilterExpr.Predicate = v.visitExpr(real.ElementFilterExpr.GetPredicate()).(*planpb.Expr)
+		return expr
 	// no optimization for other types
 	default:
 		return expr
@@ -46,9 +53,9 @@ func (v *visitor) visitExpr(expr *planpb.Expr) interface{} {
 }
 
 func (v *visitor) visitBinaryExpr(expr *planpb.BinaryExpr) interface{} {
-	left := v.visitExpr(expr.GetLeft()).(*planpb.Expr)
-	right := v.visitExpr(expr.GetRight()).(*planpb.Expr)
 	if !v.optimizeEnabled {
+		left := v.visitExpr(expr.GetLeft()).(*planpb.Expr)
+		right := v.visitExpr(expr.GetRight()).(*planpb.Expr)
 		return &planpb.Expr{
 			Expr: &planpb.Expr_BinaryExpr{
 				BinaryExpr: &planpb.BinaryExpr{
@@ -61,28 +68,33 @@ func (v *visitor) visitBinaryExpr(expr *planpb.BinaryExpr) interface{} {
 	}
 	switch expr.GetOp() {
 	case planpb.BinaryExpr_LogicalOr:
-		parts := flattenOr(left, right)
-		parts = combineArrayContains(parts, planpb.JSONContainsExpr_ContainsAny)
-		parts = v.combineOrEqualsToIn(parts)
-		parts = v.combineOrTextMatchToMerged(parts)
-		parts = v.combineOrRangePredicates(parts)
-		parts = v.combineOrBinaryRanges(parts)
-		parts = v.combineOrInWithNotEqual(parts)
-		parts = v.combineOrInWithIn(parts)
-		parts = v.combineOrInWithEqual(parts)
-		return foldBinary(planpb.BinaryExpr_LogicalOr, parts)
+		// Do not recurse into the operand tree before flattening: a left-deep
+		// chain a OR b OR ... OR z (as produced by ANTLR) has O(N) OR nodes,
+		// each of which would re-flatten its whole subtree -> O(N^2) total.
+		// Flatten the whole same-op chain once, then optimize each operand
+		// independently (same-op descendants have already been collected).
+		parts := flattenLogicalExpr(expr)
+		for i, p := range parts {
+			if res, ok := v.visitExpr(p).(*planpb.Expr); ok {
+				parts[i] = res
+			}
+		}
+		return v.mergeOrParts(spliceLogicalParts(parts, planpb.BinaryExpr_LogicalOr))
 	case planpb.BinaryExpr_LogicalAnd:
-		parts := flattenAnd(left, right)
-		parts = combineArrayContains(parts, planpb.JSONContainsExpr_ContainsAll)
-		parts = v.combineAndRangePredicates(parts)
-		parts = v.combineAndBinaryRanges(parts)
-		parts = v.combineAndInWithIn(parts)
-		parts = v.combineAndInWithNotEqual(parts)
-		parts = v.combineAndInWithRange(parts)
-		parts = v.combineAndInWithEqual(parts)
-		parts = v.combineAndNotEqualsToNotIn(parts)
-		return foldBinary(planpb.BinaryExpr_LogicalAnd, parts)
+		parts := flattenLogicalExpr(expr)
+		for i, p := range parts {
+			if res, ok := v.visitExpr(p).(*planpb.Expr); ok {
+				parts[i] = res
+			}
+		}
+		// A visited operand can itself become an AND (an OR whose common
+		// factors were extracted); splice it so the AND rules see its operands.
+		// The OR branch above does the same for an AND whose common factors
+		// were extracted into an OR.
+		return v.mergeAndParts(spliceLogicalParts(parts, planpb.BinaryExpr_LogicalAnd))
 	default:
+		left := v.visitExpr(expr.GetLeft()).(*planpb.Expr)
+		right := v.visitExpr(expr.GetRight()).(*planpb.Expr)
 		return &planpb.Expr{
 			Expr: &planpb.Expr_BinaryExpr{
 				BinaryExpr: &planpb.BinaryExpr{
@@ -93,6 +105,118 @@ func (v *visitor) visitBinaryExpr(expr *planpb.BinaryExpr) interface{} {
 			},
 		}
 	}
+}
+
+// mergeOrParts applies the OR rules to visited operands: same-column merges
+// first, then common-factor extraction over the merged operands.
+func (v *visitor) mergeOrParts(parts []*planpb.Expr) *planpb.Expr {
+	parts = combineArrayContains(parts, planpb.JSONContainsExpr_ContainsAny)
+	parts = v.combineOrEqualsToIn(parts)
+	parts = v.combineOrTextMatchToMerged(parts)
+	parts = v.combineOrRangePredicates(parts)
+	parts = v.combineOrBinaryRanges(parts)
+	parts = v.combineOrInWithIn(parts)
+	parts = v.combineOrInWithNotEqual(parts)
+	parts = v.combineOrInWithEqual(parts)
+	// Constant operands are resolved before factoring: an AlwaysTrue operand
+	// decides the OR, and an AlwaysFalse one must not block a factor that
+	// every other operand shares.
+	operands, alwaysTrue := dropLogicalConstants(parts, planpb.BinaryExpr_LogicalOr)
+	if alwaysTrue {
+		return newAlwaysTrueExpr()
+	}
+	if factored := v.factorCommonOrPredicates(operands); factored != nil {
+		return factored
+	}
+	return foldBinary(planpb.BinaryExpr_LogicalOr, parts)
+}
+
+// dropLogicalConstants removes the neutral constant of op (AlwaysFalse for OR,
+// AlwaysTrue for AND), copying only when one is present, and reports whether
+// the absorbing constant (AlwaysTrue for OR, AlwaysFalse for AND) decides the
+// chain.
+func dropLogicalConstants(parts []*planpb.Expr, op planpb.BinaryExpr_BinaryOp) ([]*planpb.Expr, bool) {
+	absorbing, neutral := IsAlwaysTrueExpr, IsAlwaysFalseExpr
+	if op == planpb.BinaryExpr_LogicalAnd {
+		absorbing, neutral = IsAlwaysFalseExpr, IsAlwaysTrueExpr
+	}
+	var out []*planpb.Expr
+	for i, p := range parts {
+		if absorbing(p) {
+			return nil, true
+		}
+		if neutral(p) {
+			if out == nil {
+				out = append(make([]*planpb.Expr, 0, len(parts)), parts[:i]...)
+			}
+			continue
+		}
+		if out != nil {
+			out = append(out, p)
+		}
+	}
+	if out == nil {
+		return parts, false
+	}
+	return out, false
+}
+
+// mergeAndParts applies AND rules to operands that have already been visited:
+// same-column merges first, then common-factor extraction over the OR clauses
+// of the merged operands.
+func (v *visitor) mergeAndParts(parts []*planpb.Expr) *planpb.Expr {
+	parts = combineArrayContains(parts, planpb.JSONContainsExpr_ContainsAll)
+	parts = v.combineAndRangePredicates(parts)
+	parts = v.combineAndBinaryRanges(parts)
+	parts = v.combineAndInWithIn(parts)
+	parts = v.combineAndInWithNotEqual(parts)
+	parts = v.combineAndInWithRange(parts)
+	parts = v.combineAndInWithEqual(parts)
+	parts = v.combineAndNotEqualsToNotIn(parts)
+	// As for OR: an AlwaysFalse operand decides the AND. An AlwaysTrue one is
+	// dropped as well; it cannot block a factor here, since only the clauses
+	// that contain the factor are grouped, but it would still count against
+	// the branch budget.
+	operands, alwaysFalse := dropLogicalConstants(parts, planpb.BinaryExpr_LogicalAnd)
+	if alwaysFalse {
+		return newAlwaysFalseExpr()
+	}
+	if factored := v.factorCommonAndPredicates(operands); factored != nil {
+		return factored
+	}
+	return foldBinary(planpb.BinaryExpr_LogicalAnd, parts)
+}
+
+// BalanceLogicalExpr balances the same-op AND/OR chain rooted at expr, leaving
+// its operands unchanged. It preserves source order and template flags without
+// folding constants, so it is safe to use before deferred template validation.
+func BalanceLogicalExpr(expr *planpb.Expr) *planpb.Expr {
+	binary := expr.GetBinaryExpr()
+	if binary == nil || (binary.GetOp() != planpb.BinaryExpr_LogicalAnd && binary.GetOp() != planpb.BinaryExpr_LogicalOr) {
+		return expr
+	}
+	return buildBalancedBinary(binary.GetOp(), flattenLogicalExpr(binary))
+}
+
+// flattenLogicalExpr collects a same-op chain once, in source order, without
+// recursing through a potentially left-deep parser tree.
+func flattenLogicalExpr(expr *planpb.BinaryExpr) []*planpb.Expr {
+	parts := make([]*planpb.Expr, 0, 4)
+	stack := []*planpb.Expr{expr.GetRight(), expr.GetLeft()}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if cur == nil {
+			continue
+		}
+		be := cur.GetBinaryExpr()
+		if be != nil && be.GetOp() == expr.GetOp() {
+			stack = append(stack, be.GetRight(), be.GetLeft())
+			continue
+		}
+		parts = append(parts, cur)
+	}
+	return parts
 }
 
 func (v *visitor) visitUnaryExpr(expr *planpb.UnaryExpr) interface{} {
@@ -252,38 +376,6 @@ func (v *visitor) visitValueExpr(expr *planpb.ValueExpr, original *planpb.Expr) 
 	return original
 }
 
-func flattenOr(a, b *planpb.Expr) []*planpb.Expr {
-	out := make([]*planpb.Expr, 0, 4)
-	collectOr(a, &out)
-	collectOr(b, &out)
-	return out
-}
-
-func collectOr(e *planpb.Expr, out *[]*planpb.Expr) {
-	if be := e.GetBinaryExpr(); be != nil && be.GetOp() == planpb.BinaryExpr_LogicalOr {
-		collectOr(be.GetLeft(), out)
-		collectOr(be.GetRight(), out)
-		return
-	}
-	*out = append(*out, e)
-}
-
-func flattenAnd(a, b *planpb.Expr) []*planpb.Expr {
-	out := make([]*planpb.Expr, 0, 4)
-	collectAnd(a, &out)
-	collectAnd(b, &out)
-	return out
-}
-
-func collectAnd(e *planpb.Expr, out *[]*planpb.Expr) {
-	if be := e.GetBinaryExpr(); be != nil && be.GetOp() == planpb.BinaryExpr_LogicalAnd {
-		collectAnd(be.GetLeft(), out)
-		collectAnd(be.GetRight(), out)
-		return
-	}
-	*out = append(*out, e)
-}
-
 func foldBinary(op planpb.BinaryExpr_BinaryOp, exprs []*planpb.Expr) *planpb.Expr {
 	if len(exprs) == 0 {
 		return nil
@@ -327,20 +419,34 @@ func foldBinary(op planpb.BinaryExpr_BinaryOp, exprs []*planpb.Expr) *planpb.Exp
 		}
 	}
 
-	if len(exprs) == 1 {
-		return exprs[0]
+	return buildBalancedBinary(op, exprs)
+}
+
+// buildBalancedBinary preserves every operand and its template flag while
+// keeping the tree height O(log N) for protobuf and recursive consumers.
+func buildBalancedBinary(op planpb.BinaryExpr_BinaryOp, exprs []*planpb.Expr) *planpb.Expr {
+	if len(exprs) == 0 {
+		return nil
 	}
-	cur := exprs[0]
-	for i := 1; i < len(exprs); i++ {
-		cur = &planpb.Expr{
-			Expr: &planpb.Expr_BinaryExpr{
-				BinaryExpr: &planpb.BinaryExpr{
-					Left:  cur,
-					Right: exprs[i],
-					Op:    op,
-				},
-			},
+	for len(exprs) > 1 {
+		next := make([]*planpb.Expr, 0, (len(exprs)+1)/2)
+		for i := 0; i < len(exprs); i += 2 {
+			if i+1 < len(exprs) {
+				next = append(next, &planpb.Expr{
+					Expr: &planpb.Expr_BinaryExpr{
+						BinaryExpr: &planpb.BinaryExpr{
+							Left:  exprs[i],
+							Right: exprs[i+1],
+							Op:    op,
+						},
+					},
+					IsTemplate: exprs[i].GetIsTemplate() || exprs[i+1].GetIsTemplate(),
+				})
+			} else {
+				next = append(next, exprs[i])
+			}
 		}
+		exprs = next
 	}
-	return cur
+	return exprs[0]
 }

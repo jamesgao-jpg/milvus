@@ -3,6 +3,7 @@
 #include <exception>
 #include <string>
 
+#include "common/CGoCatch.h"
 #include "common/EasyAssert.h"
 #include "common/type_c.h"
 #include "milvus-storage/common/extend_status.h"
@@ -19,7 +20,7 @@ InitArrowFileSystem(CStorageConfig c_storage_config) {
                          .GetProperties();
         if (props) {
             auto result =
-                milvus_storage::FilesystemCache::getInstance().get(*props, "");
+                milvus_storage::FilesystemCache::getInstance().get(props, "");
             if (!result.ok()) {
                 auto error = milvus_storage::ToSegcoreError(result.status());
                 return milvus::FailureCStatus(&error);
@@ -27,12 +28,14 @@ InitArrowFileSystem(CStorageConfig c_storage_config) {
         }
 
         return milvus::SuccessCStatus();
-    } catch (std::exception& e) {
-        return milvus::FailureCStatus(&e);
     }
+    CGO_CATCH_AND_RETURN_CSTATUS
 }
 
 void
 CleanArrowFileSystem() {
-    milvus_storage::FilesystemCache::getInstance().clean();
+    try {
+        milvus_storage::FilesystemCache::getInstance().clean();
+    }
+    CGO_CATCH_AND_LOG("CleanArrowFileSystem")
 }

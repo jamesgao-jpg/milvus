@@ -27,6 +27,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"path"
 	"strconv"
@@ -40,14 +41,17 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.uber.org/atomic"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/internal/metastore/kv/binlog"
 	"github.com/milvus-io/milvus/internal/querynodev2/pkoracle"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/storagecommon"
 	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/internal/util/indexparamcheck"
+	"github.com/milvus-io/milvus/internal/util/segcore/loadresource"
 	"github.com/milvus-io/milvus/internal/util/vecindexmgr"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
@@ -61,7 +65,6 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/logutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/metautil"
-	"github.com/milvus-io/milvus/pkg/v3/util/metric"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v3/util/syncutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/timerecord"
@@ -80,15 +83,31 @@ type Loader interface {
 	// NOTE: make sure the ref count of the corresponding collection will never go down to 0 during this
 	Load(ctx context.Context, collectionID int64, segmentType SegmentType, version int64, segments ...*querypb.SegmentLoadInfo) ([]Segment, error)
 
+	// ReserveLoadResourceWithSchema reserves memory and storage for segment loading. The
+	// returned reservation must be released after the load attempt finishes.
+	ReserveLoadResourceWithSchema(ctx context.Context, schema *schemapb.CollectionSchema, infos ...*querypb.SegmentLoadInfo) (LoadResourceReservation, error)
+
 	// LoadDeltaLogs load deltalog and write delta data into provided segment.
 	// it also executes resource protection logic in case of OOM.
 	LoadDeltaLogs(ctx context.Context, segment Segment, loadInfo *querypb.SegmentLoadInfo) error
 
+	// LoadDeltaLogsWithoutResource loads deltalog into the provided segment
+	// when the caller has already reserved loading resources.
+	LoadDeltaLogsWithoutResource(ctx context.Context, segment Segment, loadInfo *querypb.SegmentLoadInfo) error
+
+	// LoadSegment loads base sealed segment data and blocking index files into
+	// the provided segment without putting it into SegmentManager.
+	LoadSegment(ctx context.Context, segment Segment, loadInfo *querypb.SegmentLoadInfo) error
+
 	// LoadBloomFilterSet loads needed statslog for RemoteSegment.
 	LoadBloomFilterSet(ctx context.Context, collectionID int64, infos ...*querypb.SegmentLoadInfo) ([]*pkoracle.BloomFilterSet, error)
+	LoadBloomFilterSetWithSchema(ctx context.Context, schema *schemapb.CollectionSchema, infos ...*querypb.SegmentLoadInfo) ([]*pkoracle.BloomFilterSet, error)
 
 	// GetChunkManager returns the chunk manager for remote storage access.
 	GetChunkManager() storage.ChunkManager
+
+	// GetLocalDiskUsage returns the cached size of the local storage directory.
+	GetLocalDiskUsage() (int64, error)
 
 	// ReopenSegments update segment data according to new load info.
 	ReopenSegments(ctx context.Context,
@@ -96,29 +115,27 @@ type Loader interface {
 	) error
 }
 
-type ResourceEstimate struct {
-	MaxMemoryCost   uint64
-	MaxDiskCost     uint64
-	FinalMemoryCost uint64
-	FinalDiskCost   uint64
-	HasRawData      bool
-}
-
-func GetResourceEstimate(estimate *C.LoadResourceRequest) ResourceEstimate {
-	return ResourceEstimate{
-		MaxMemoryCost:   uint64(estimate.max_memory_cost),
-		MaxDiskCost:     uint64(estimate.max_disk_cost),
-		FinalMemoryCost: uint64(estimate.final_memory_cost),
-		FinalDiskCost:   uint64(estimate.final_disk_cost),
-		HasRawData:      bool(estimate.has_raw_data),
-	}
-}
-
 type requestResourceResult struct {
 	Resource          LoadResource
 	LogicalResource   LoadResource
 	CommittedResource LoadResource
 	ConcurrencyLevel  int
+}
+
+type LoadResourceReservation interface {
+	Release()
+}
+
+type loadResourceReservation struct {
+	loader *segmentLoader
+	result requestResourceResult
+	once   sync.Once
+}
+
+func (r *loadResourceReservation) Release() {
+	r.once.Do(func() {
+		r.loader.freeRequestResource(r.result)
+	})
 }
 
 type LoadResource struct {
@@ -160,22 +177,6 @@ type resourceEstimateFactor struct {
 	externalRawDataFactor float64
 }
 
-func estimateTantivyValidityBitmapBytes(numRows int64) uint64 {
-	if numRows <= 0 {
-		return 0
-	}
-
-	// TextIndexStats does not carry the null count, so admission reserves the
-	// full word-aligned bitmap conservatively. All-valid indexes charge zero
-	// actual bitmap bytes after loading.
-	const (
-		bitsPerWord  = uint64(64)
-		bytesPerWord = uint64(8)
-	)
-	words := (uint64(numRows)-1)/bitsPerWord + 1
-	return words * bytesPerWord
-}
-
 func NewLoader(
 	ctx context.Context,
 	manager *Manager,
@@ -205,19 +206,20 @@ const (
 
 type loadResult struct {
 	status *atomic.Int32
-	cond   *sync.Cond
+	done   chan struct{}
 }
 
 func newLoadResult() *loadResult {
 	return &loadResult{
 		status: atomic.NewInt32(loading),
-		cond:   sync.NewCond(&sync.Mutex{}),
+		done:   make(chan struct{}),
 	}
 }
 
 func (r *loadResult) SetResult(status loadStatus) {
-	r.status.CompareAndSwap(loading, status)
-	r.cond.Broadcast()
+	if r.status.CompareAndSwap(loading, status) {
+		close(r.done)
+	}
 }
 
 // segmentLoader is only responsible for loading the field data from binlog
@@ -238,6 +240,10 @@ type segmentLoader struct {
 
 var _ Loader = (*segmentLoader)(nil)
 
+func (loader *segmentLoader) GetLocalDiskUsage() (int64, error) {
+	return loader.duf.GetDiskUsage()
+}
+
 func (loader *segmentLoader) Load(ctx context.Context,
 	collectionID int64,
 	segmentType SegmentType,
@@ -255,6 +261,9 @@ func (loader *segmentLoader) Load(ctx context.Context,
 		mlog.Warn(context.TODO(), "failed to get collection", mlog.Err(err))
 		return nil, err
 	}
+	schema := collection.Schema()
+	hasVirtualPK := typeutil.IsExternalCollection(schema) &&
+		(!typeutil.NewStorageColumnResolver(schema).IsMilvusTable() || !HasExternalPrimaryKey(schema))
 	for _, segment := range segments {
 		configureUseTakeForOutput(segment, collection.Schema())
 	}
@@ -348,60 +357,13 @@ func (loader *segmentLoader) Load(ctx context.Context,
 			return merr.Wrap(err, "At LoadDeltaLogs")
 		}
 
-		schema := collection.Schema()
-		isExternalCollection := typeutil.IsExternalCollection(schema)
-		isMilvusTableRealPK := typeutil.NewStorageColumnResolver(schema).IsMilvusTable() &&
-			HasExternalPrimaryKey(schema)
-		if !segment.PkCandidateExist() {
-			mlog.Debug(context.TODO(), "loading PK candidate for segment", mlog.Int64("segmentID", segment.ID()))
-			if isExternalCollection {
-				var candidate pkoracle.Candidate
-				if isMilvusTableRealPK {
-					bfs, err := loader.loadSingleBloomFilterSet(ctx, loadInfo.GetCollectionID(), loadInfo, segment.Type())
-					if err != nil {
-						return merr.Wrap(err, "At LoadBloomFilter")
-					}
-					if bfs.PkCandidateExist() {
-						segment.SetPKCandidate(bfs)
-						bfs.Charge()
-						mlog.Info(context.TODO(), "using external real-PK bloom filter candidate",
-							mlog.FieldSegmentID(loadInfo.GetSegmentID()))
-					}
-					if !segment.PkCandidateExist() {
-						return merr.WrapErrServiceInternalMsg("milvus-table real-PK segment missing bloom filter stats")
-					}
-				} else {
-					candidate = pkoracle.NewExternalSegmentCandidate(
-						loadInfo.GetSegmentID(),
-						loadInfo.GetPartitionID(),
-						segment.Type(),
-					)
-				}
-				if candidate != nil {
-					segment.SetPKCandidate(candidate)
-					mlog.Info(context.TODO(), "using external collection PK candidate",
-						mlog.FieldSegmentID(loadInfo.GetSegmentID()),
-						mlog.Bool("realPK", isMilvusTableRealPK))
-				}
-
-				// Check for truncated segment ID collision with other segments being loaded.
-				if !isMilvusTableRealPK {
-					collisions := detectVirtualPKCollisions(loadInfo.GetSegmentID(), infos)
-					for _, collidingID := range collisions {
-						mlog.Warn(context.TODO(), "virtual PK collision detected: two segments share truncated segment ID",
-							mlog.Int64("segmentID1", loadInfo.GetSegmentID()),
-							mlog.Int64("segmentID2", collidingID),
-							mlog.Int64("truncatedID", loadInfo.GetSegmentID()&0xFFFFFFFF))
-					}
-				}
-			} else if paramtable.Get().CommonCfg.BloomFilterEnabled.GetAsBool() {
-				bfs, err := loader.loadSingleBloomFilterSet(ctx, loadInfo.GetCollectionID(), loadInfo, segment.Type())
-				if err != nil {
-					return merr.Wrap(err, "At LoadBloomFilter")
-				}
-				segment.SetPKCandidate(bfs)
-				// Charge bloom filter resource
-				bfs.Charge()
+		// Collision diagnostics depend only on load metadata, not PK candidates.
+		if hasVirtualPK {
+			for _, collidingID := range detectVirtualPKCollisions(segmentID, infos) {
+				mlog.Warn(ctx, "virtual PK collision detected: two segments share truncated segment ID",
+					mlog.Int64("segmentID1", segmentID),
+					mlog.Int64("segmentID2", collidingID),
+					mlog.Int64("truncatedID", segmentID&0xFFFFFFFF))
 			}
 		}
 
@@ -411,9 +373,7 @@ func (loader *segmentLoader) Load(ctx context.Context,
 		newSegments.GetAndRemove(segmentID)
 		loaded.Insert(segmentID, segment)
 		loader.notifyLoadFinish(loadInfo)
-		if localSegment, ok := segment.(*LocalSegment); ok {
-			localSegment.compactLoadInfoForRuntime()
-		}
+		FinalizeLoad(segment)
 
 		metrics.QueryNodeLoadSegmentLatency.WithLabelValues(paramtable.GetStringNodeID()).Observe(float64(tr.ElapseSpan().Milliseconds()))
 		return nil
@@ -472,6 +432,18 @@ func (loader *segmentLoader) prepare(ctx context.Context, segmentType SegmentTyp
 	return infos
 }
 
+// PrepareSegmentLoadInfo creates a private load info with node-local parameters.
+// Call it before constructing a native segment or reopening it; neither the
+// coordinator's metadata nor a shared watch snapshot may be modified in place.
+func PrepareSegmentLoadInfo(info *querypb.SegmentLoadInfo, schema *schemapb.CollectionSchema) (*querypb.SegmentLoadInfo, error) {
+	prepared := proto.Clone(info).(*querypb.SegmentLoadInfo)
+	configureUseTakeForOutput(prepared, schema)
+	if err := prepareIndexLoadParams(prepared.GetIndexInfos()); err != nil {
+		return nil, err
+	}
+	return prepared, nil
+}
+
 func configureUseTakeForOutput(loadInfo *querypb.SegmentLoadInfo, schema *schemapb.CollectionSchema) {
 	if loadInfo == nil {
 		return
@@ -504,6 +476,10 @@ func (loader *segmentLoader) notifyLoadFinish(segments ...*querypb.SegmentLoadIn
 // requestResource requests memory & storage to load segments,
 // returns the memory usage, disk usage and concurrency with the gained memory.
 func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*querypb.SegmentLoadInfo) (requestResourceResult, error) {
+	return loader.requestResourceWithSchema(ctx, nil, infos...)
+}
+
+func (loader *segmentLoader) requestResourceWithSchema(ctx context.Context, schema *schemapb.CollectionSchema, infos ...*querypb.SegmentLoadInfo) (_ requestResourceResult, err error) {
 	// we need to deal with empty infos case separately,
 	// because the following judgement for requested resources are based on current status and static config
 	// which may block empty-load operations by accident
@@ -518,11 +494,23 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 		mlog.Int64s("segmentIDs", segmentIDs),
 	)
 
-	loadingUsage, maxSegmentSize, err := loader.estimateSegmentLoadingResourceUsage(ctx, infos...)
+	loadingUsage, maxSegmentSize, err := loader.estimateSegmentLoadingResourceUsageWithSchema(ctx, schema, infos...)
 	if err != nil {
 		logger.Warn(ctx, "no sufficient physical resource to load segments", mlog.Err(err))
 		return requestResourceResult{}, err
 	}
+
+	resource := LoadResource{MemorySize: loadingUsage.MemorySize, DiskSize: loadingUsage.DiskSize}
+	tieredEvictionEnabled := paramtable.Get().QueryNodeCfg.TieredEvictionEnabled.GetAsBool()
+	reservedLoadingResource := false
+	if tieredEvictionEnabled {
+		reservedLoadingResource = tryReserveLoadingResource(resource)
+	}
+	defer func() {
+		if reservedLoadingResource && err != nil {
+			releaseLoadingResource(resource)
+		}
+	}()
 
 	loader.mut.Lock()
 	defer loader.mut.Unlock()
@@ -548,6 +536,20 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 
 	result.ConcurrencyLevel = funcutil.Min(hardware.GetCPUNum(), len(infos))
 
+	if tieredEvictionEnabled && !reservedLoadingResource {
+		memUsage := physicalMemoryUsage + loader.committedResource.MemorySize
+		diskUsage := uint64(physicalDiskUsage) + loader.committedResource.DiskSize
+		return result, merr.WrapErrSegmentRequestResourceFailed("memory/disk",
+			fmt.Sprintf("failed to reserve loading resource from caching layer, predictMemUsage = %v MB, predictDiskUsage = %v MB, memUsage = %v MB, diskUsage = %v MB, memoryThresholdFactor = %f, diskThresholdFactor = %f",
+				logutil.ToMB(float64(memUsage+loadingUsage.MemorySize)),
+				logutil.ToMB(float64(diskUsage+loadingUsage.DiskSize)),
+				logutil.ToMB(float64(memUsage)),
+				logutil.ToMB(float64(diskUsage)),
+				paramtable.Get().QueryNodeCfg.OverloadedMemoryThresholdPercentage.GetAsFloat(),
+				paramtable.Get().QueryNodeCfg.MaxDiskUsagePercentage.GetAsFloat(),
+			))
+	}
+
 	// TODO: disable logical resource checking for now
 	// lmu, ldu, err := loader.checkLogicalSegmentSize(ctx, infos, totalMemory)
 	// if err != nil {
@@ -566,7 +568,7 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 
 	loader.committedResource.Add(result.Resource)
 	// loader.committedLogicalResource.Add(result.LogicalResource)
-	mlog.Info(context.TODO(), "request resource for loading segments (unit in MiB)",
+	mlog.Debug(ctx, "request resource for loading segments (unit in MiB)",
 		mlog.Float64("memory", logutil.ToMB(float64(result.Resource.MemorySize))),
 		mlog.Float64("committedMemory", logutil.ToMB(float64(loader.committedResource.MemorySize))),
 		mlog.Float64("disk", logutil.ToMB(float64(result.Resource.DiskSize))),
@@ -576,24 +578,40 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 	return result, nil
 }
 
+func (loader *segmentLoader) ReserveLoadResourceWithSchema(ctx context.Context, schema *schemapb.CollectionSchema, infos ...*querypb.SegmentLoadInfo) (LoadResourceReservation, error) {
+	result, err := loader.requestResourceWithSchema(ctx, schema, infos...)
+	if err != nil {
+		return nil, err
+	}
+	return &loadResourceReservation{loader: loader, result: result}, nil
+}
+
 // freeRequestResource returns request memory & storage usage request.
 func (loader *segmentLoader) freeRequestResource(requestResourceResult requestResourceResult) {
-	loader.mut.Lock()
-	defer loader.mut.Unlock()
-
 	resource := requestResourceResult.Resource
-	// logicalResource := requestResourceResult.LogicalResource
+	loader.mut.Lock()
+	loader.committedResource.Sub(resource)
+	loader.mut.Unlock()
 
 	if paramtable.Get().QueryNodeCfg.TieredEvictionEnabled.GetAsBool() {
-		C.ReleaseLoadingResource(C.CResourceUsage{
-			memory_bytes: C.int64_t(resource.MemorySize),
-			disk_bytes:   C.int64_t(resource.DiskSize),
-		})
+		releaseLoadingResource(resource)
 	}
 
-	loader.committedResource.Sub(resource)
-	// loader.committedLogicalResource.Sub(logicalResource)
 	loader.committedResourceNotifier.NotifyAll()
+}
+
+func tryReserveLoadingResource(resource LoadResource) bool {
+	return bool(C.TryReserveLoadingResourceWithTimeout(C.CResourceUsage{
+		memory_bytes: C.int64_t(resource.MemorySize),
+		disk_bytes:   C.int64_t(resource.DiskSize),
+	}, 1000))
+}
+
+func releaseLoadingResource(resource LoadResource) {
+	C.ReleaseLoadingResource(C.CResourceUsage{
+		memory_bytes: C.int64_t(resource.MemorySize),
+		disk_bytes:   C.int64_t(resource.DiskSize),
+	})
 }
 
 func (loader *segmentLoader) waitSegmentLoadDone(ctx context.Context, segmentType SegmentType, segmentIDs []int64, version int64) error {
@@ -610,22 +628,9 @@ func (loader *segmentLoader) waitSegmentLoadDone(ctx context.Context, segmentTyp
 
 		mlog.Info(context.TODO(), "wait segment loaded...", mlog.Int64("segmentID", segmentID))
 
-		signal := make(chan struct{})
-		go func() {
-			select {
-			case <-signal:
-			case <-ctx.Done():
-				result.cond.Broadcast()
-			}
-		}()
-		result.cond.L.Lock()
-		for result.status.Load() == loading && ctx.Err() == nil {
-			result.cond.Wait()
-		}
-		result.cond.L.Unlock()
-		close(signal)
-
-		if ctx.Err() != nil {
+		select {
+		case <-result.done:
+		case <-ctx.Done():
 			mlog.Warn(context.TODO(), "failed to wait segment loaded due to context done", mlog.Int64("segmentID", segmentID))
 			return ctx.Err()
 		}
@@ -647,57 +652,18 @@ func (loader *segmentLoader) GetChunkManager() storage.ChunkManager {
 	return loader.cm
 }
 
-// load single bloom filter
-func (loader *segmentLoader) loadSingleBloomFilterSet(ctx context.Context, collectionID int64, loadInfo *querypb.SegmentLoadInfo, segtype SegmentType) (*pkoracle.BloomFilterSet, error) {
-	partitionID := loadInfo.PartitionID
-	segmentID := loadInfo.SegmentID
-	bfs := pkoracle.NewBloomFilterSet(segmentID, partitionID, segtype)
-
+func (loader *segmentLoader) LoadBloomFilterSet(ctx context.Context, collectionID int64, infos ...*querypb.SegmentLoadInfo) ([]*pkoracle.BloomFilterSet, error) {
+	if len(infos) == 0 {
+		return nil, nil
+	}
 	collection := loader.manager.Collection.Get(collectionID)
 	if collection == nil {
-		err := merr.WrapErrCollectionNotFound(collectionID)
-		mlog.Warn(context.TODO(), "failed to get collection while loading segment", mlog.Err(err))
-		return nil, err
+		return nil, merr.WrapErrCollectionNotFound(collectionID)
 	}
-
-	mlog.Info(context.TODO(), "start loading remote...", mlog.Int("segmentNum", 1))
-
-	schema := collection.Schema()
-	isExternalCollection := typeutil.IsExternalCollection(schema)
-	isMilvusTableRealPK := typeutil.NewStorageColumnResolver(schema).IsMilvusTable() &&
-		HasExternalPrimaryKey(schema)
-	if !paramtable.Get().CommonCfg.BloomFilterEnabled.GetAsBool() && !isMilvusTableRealPK {
-		mlog.Info(context.TODO(), "skip loading bloom filter for remote segment because bloom filter is disabled")
-		return bfs, nil
-	}
-	if isExternalCollection && !isMilvusTableRealPK {
-		mlog.Debug(context.TODO(), "virtual-PK external collection: returning empty bloom filter set")
-		return bfs, nil
-	}
-
-	pkField := GetPkField(schema)
-	mlog.Info(context.TODO(), "loading bloom filter for remote...")
-	pkStatsBinlogs, err := packed.NewStatsResolverFromLoadInfo(loadInfo).BloomFilterPaths(pkField.GetFieldID())
-	if err != nil {
-		return nil, err
-	}
-	err = loader.loadBloomFilter(ctx, segmentID, bfs, pkStatsBinlogs, loader.bloomFilterDownloader(collection, isMilvusTableRealPK))
-	if err != nil {
-		mlog.Warn(context.TODO(), "load remote segment bloom filter failed",
-			mlog.Int64("partitionID", partitionID),
-			mlog.Int64("segmentID", segmentID),
-			mlog.Err(err),
-		)
-		return nil, err
-	}
-	if isMilvusTableRealPK && !bfs.PkCandidateExist() {
-		return nil, merr.WrapErrServiceInternalMsg("milvus-table real-PK segment missing bloom filter stats")
-	}
-
-	return bfs, nil
+	return loader.LoadBloomFilterSetWithSchema(ctx, collection.Schema(), infos...)
 }
 
-func (loader *segmentLoader) LoadBloomFilterSet(ctx context.Context, collectionID int64, infos ...*querypb.SegmentLoadInfo) ([]*pkoracle.BloomFilterSet, error) {
+func (loader *segmentLoader) LoadBloomFilterSetWithSchema(ctx context.Context, schema *schemapb.CollectionSchema, infos ...*querypb.SegmentLoadInfo) ([]*pkoracle.BloomFilterSet, error) {
 	segmentNum := len(infos)
 	if segmentNum == 0 {
 		mlog.Info(context.TODO(), "no segment to load")
@@ -712,14 +678,6 @@ func (loader *segmentLoader) LoadBloomFilterSet(ctx context.Context, collectionI
 		bfSets[i] = pkoracle.NewBloomFilterSet(info.GetSegmentID(), info.GetPartitionID(), commonpb.SegmentState_Sealed)
 	}
 
-	collection := loader.manager.Collection.Get(collectionID)
-	if collection == nil {
-		err := merr.WrapErrCollectionNotFound(collectionID)
-		mlog.Warn(context.TODO(), "failed to get collection while loading segment", mlog.Err(err))
-		return nil, err
-	}
-
-	schema := collection.Schema()
 	isExternalCollection := typeutil.IsExternalCollection(schema)
 	isMilvusTableRealPK := typeutil.NewStorageColumnResolver(schema).IsMilvusTable() &&
 		HasExternalPrimaryKey(schema)
@@ -760,7 +718,7 @@ func (loader *segmentLoader) LoadBloomFilterSet(ctx context.Context, collectionI
 				fmt.Sprintf("failed to reserve loading resource for bloom filters, totalMemorySize = %v MB",
 					logutil.ToMB(float64(totalMemorySize))))
 		}
-		mlog.Info(context.TODO(), "reserved loading resource for bloom filters", mlog.Float64("totalMemorySizeMB", logutil.ToMB(float64(totalMemorySize))))
+		mlog.Debug(ctx, "reserved loading resource for bloom filters", mlog.Float64("totalMemorySizeMB", logutil.ToMB(float64(totalMemorySize))))
 	}
 
 	defer func() {
@@ -769,22 +727,22 @@ func (loader *segmentLoader) LoadBloomFilterSet(ctx context.Context, collectionI
 				memory_bytes: C.int64_t(totalMemorySize * 2),
 				disk_bytes:   C.int64_t(0),
 			})
-			mlog.Info(context.TODO(), "released loading resource for bloom filters", mlog.Float64("totalMemorySizeMB", logutil.ToMB(float64(totalMemorySize))))
+			mlog.Debug(ctx, "released loading resource for bloom filters", mlog.Float64("totalMemorySizeMB", logutil.ToMB(float64(totalMemorySize))))
 		}
 	}()
 
-	mlog.Info(context.TODO(), "start loading remote...", mlog.Int("segmentNum", segmentNum))
+	mlog.Debug(ctx, "start loading remote...", mlog.Int("segmentNum", segmentNum))
 
 	loadRemoteFunc := func(idx int) error {
 		loadInfo := infos[idx]
 		bfs := bfSets[idx]
 
-		mlog.Info(context.TODO(), "loading bloom filter for remote...")
+		mlog.Debug(ctx, "loading bloom filter for remote...")
 		pkStatsBinlogs, err := packed.NewStatsResolverFromLoadInfo(loadInfo).BloomFilterPaths(pkFieldID)
 		if err != nil {
 			return err
 		}
-		err = loader.loadBloomFilter(ctx, bfs.ID(), bfs, pkStatsBinlogs, loader.bloomFilterDownloader(collection, isMilvusTableRealPK))
+		err = loader.loadBloomFilter(ctx, bfs.ID(), bfs, pkStatsBinlogs, loader.bloomFilterDownloaderWithSchema(loadInfo.GetCollectionID(), schema, isMilvusTableRealPK))
 		if err != nil {
 			mlog.Warn(context.TODO(), "load remote segment bloom filter failed",
 				mlog.Int64("partitionID", bfs.Partition()),
@@ -1012,7 +970,8 @@ func separateLoadInfoV2(loadInfo *querypb.SegmentLoadInfo, schema *schemapb.Coll
 
 	// For V2 (non-manifest) segments, compute basePaths from metadata.
 	// The resolver returns empty basePaths for V2; we compute them here.
-	rootPath := paramtable.Get().MinioCfg.RootPath.GetValue()
+	// Match the writer's primary storage root; local stats do not use MinIO's prefix.
+	rootPath := binlog.GetRootPath()
 	for fieldID, stats := range textIndexedInfo {
 		if _, ok := textBasePaths[fieldID]; !ok {
 			textBasePaths[fieldID] = metautil.BuildTextIndexPrefix(rootPath,
@@ -1060,16 +1019,18 @@ func (loader *segmentLoader) loadSealedSegment(ctx context.Context, loadInfo *qu
 		stateLockGuard.Done(err)
 	}()
 
-	collection := segment.GetCollection()
-	indexedFieldInfos, _, textIndexes, unindexedTextFields, jsonKeyStats, _, _ := separateLoadInfoV2(loadInfo, collection.Schema())
-
 	tr := timerecord.NewTimeRecorder("segmentLoader.loadSealedSegment")
-	mlog.Info(context.TODO(), "Start loading fields...",
-		mlog.Int("indexedFields count", len(indexedFieldInfos)),
-		mlog.Int64s("indexed text fields", lo.Keys(textIndexes)),
-		mlog.Int64s("unindexed text fields", lo.Keys(unindexedTextFields)),
-		mlog.Int64s("indexed json key fields", lo.Keys(jsonKeyStats)),
-	)
+	if mlog.LevelEnabled(mlog.DebugLevel) {
+		collection := segment.GetCollection()
+		indexedFieldInfos, _, textIndexes, unindexedTextFields, jsonKeyStats, _, _ := separateLoadInfoV2(loadInfo, collection.Schema())
+
+		mlog.Debug(ctx, "Start loading fields...",
+			mlog.Int("indexedFields count", len(indexedFieldInfos)),
+			mlog.Int64s("indexed text fields", lo.Keys(textIndexes)),
+			mlog.Int64s("unindexed text fields", lo.Keys(unindexedTextFields)),
+			mlog.Int64s("indexed json key fields", lo.Keys(jsonKeyStats)),
+		)
+	}
 	_, err = GetLoadPool().Submit(func() (any, error) {
 		if err = segment.Load(ctx); err != nil {
 			return struct{}{}, merr.Wrap(err, "At Load")
@@ -1098,7 +1059,7 @@ func (loader *segmentLoader) loadSealedSegment(ctx context.Context, loadInfo *qu
 		return err
 	}
 	patchEntryNumberSpan := tr.RecordSpan()
-	mlog.Info(context.TODO(), "Finish loading segment",
+	mlog.Debug(ctx, "Finish loading segment",
 		mlog.Duration("patchEntryNumberSpan", patchEntryNumberSpan),
 	)
 	return nil
@@ -1112,12 +1073,12 @@ func (loader *segmentLoader) LoadSegment(ctx context.Context,
 	if !ok {
 		return merr.WrapErrParameterInvalid("LocalSegment", fmt.Sprintf("%T", seg))
 	}
-	mlog.Info(context.TODO(), "start loading segment files",
+	mlog.Debug(ctx, "start loading segment files",
 		mlog.Int64("rowNum", loadInfo.GetNumOfRows()),
 		mlog.String("segmentType", segment.Type().String()),
 		mlog.Int32("priority", int32(loadInfo.GetPriority())))
 
-	collection := loader.manager.Collection.Get(segment.Collection())
+	collection := segment.GetCollection()
 	if collection == nil {
 		err := merr.WrapErrCollectionNotFound(segment.Collection())
 		mlog.Warn(context.TODO(), "failed to get collection while loading segment", mlog.Err(err))
@@ -1243,19 +1204,15 @@ func (loader *segmentLoader) loadBloomFilter(
 	return loader.loadBloomFilterWithDownloader(ctx, segmentID, bfs, binlogPaths, downloader)
 }
 
-// bloomFilterDownloader returns the byte downloader used for PK bloom-filter
+// bloomFilterDownloaderWithSchema returns the byte downloader used for PK bloom-filter
 // stats. Milvus-table real-PK stats live in the external source filesystem;
 // ordinary internal stats stay on the local chunk manager.
-func (loader *segmentLoader) bloomFilterDownloader(
-	collection *Collection,
-	useExternalSpec bool,
-) func(context.Context, []string) ([][]byte, error) {
+func (loader *segmentLoader) bloomFilterDownloaderWithSchema(collectionID int64, schema *schemapb.CollectionSchema, useExternalSpec bool) func(context.Context, []string) ([][]byte, error) {
 	if !useExternalSpec {
 		return loader.cm.MultiRead
 	}
-	schema := collection.Schema()
 	extfs := packed.ExternalSpecContext{
-		CollectionID: collection.ID(),
+		CollectionID: collectionID,
 		Source:       schema.GetExternalSource(),
 		Spec:         schema.GetExternalSpec(),
 	}
@@ -1304,7 +1261,7 @@ func (loader *segmentLoader) loadBloomFilterWithDownloader(
 		size += stat.BF.Cap()
 		bfs.AddHistoricalStats(pkStat)
 	}
-	mlog.Info(context.TODO(), "Successfully load pk stats", mlog.Duration("time", time.Since(startTs)), mlog.Uint("size", size))
+	mlog.Debug(ctx, "Successfully load pk stats", mlog.Duration("time", time.Since(startTs)), mlog.Uint("size", size))
 	return nil
 }
 
@@ -1314,7 +1271,7 @@ func (loader *segmentLoader) loadDeltalogs(ctx context.Context, segment Segment,
 	deltaLogs := loadInfo.GetDeltalogs()
 	ctx, sp := otel.Tracer(typeutil.QueryNodeRole).Start(ctx, fmt.Sprintf("LoadDeltalogs-%d", segment.ID()))
 	defer sp.End()
-	mlog.Info(context.TODO(), "loading delta...")
+	mlog.Debug(ctx, "loading delta...")
 
 	var rowNums int64
 	valid := func(binlog *datapb.Binlog, _ int) bool {
@@ -1331,11 +1288,17 @@ func (loader *segmentLoader) loadDeltalogs(ctx context.Context, segment Segment,
 		})
 	}
 
-	collection := loader.manager.Collection.Get(segment.Collection())
-
-	helper, _ := typeutil.CreateSchemaHelper(collection.Schema())
-	pkField, _ := helper.GetPrimaryKeyField()
-	deltaData, err := storage.NewDeltaDataWithPkType(rowNums, pkField.DataType)
+	var metadata deltaStorageMetadata
+	if local, ok := segment.(*LocalSegment); ok && local.sealedMetadata != nil {
+		metadata = local.sealedMetadata.delta
+	} else {
+		collection := loader.manager.Collection.Get(segment.Collection())
+		if local, ok := segment.(*LocalSegment); ok {
+			collection = local.GetCollection()
+		}
+		metadata = newDeltaStorageMetadata(collection.Schema())
+	}
+	deltaData, err := storage.NewDeltaDataWithPkType(rowNums, metadata.primaryKeyType)
 	if err != nil {
 		return err
 	}
@@ -1353,7 +1316,7 @@ func (loader *segmentLoader) loadDeltalogs(ctx context.Context, segment Segment,
 
 			for i := 0; i < dl.Len(); i++ {
 				var pk storage.PrimaryKey
-				switch pkField.DataType {
+				switch metadata.primaryKeyType {
 				case schemapb.DataType_Int64:
 					pk = storage.NewInt64PrimaryKey(dl.Column(0).(*array.Int64).Value(i))
 				case schemapb.DataType_VarChar:
@@ -1369,20 +1332,17 @@ func (loader *segmentLoader) loadDeltalogs(ctx context.Context, segment Segment,
 		return nil
 	}
 
-	schema := collection.Schema()
-	isExternalCollection := typeutil.IsExternalCollection(schema)
-	resolver := typeutil.NewStorageColumnResolver(schema)
-	if isExternalCollection && !resolver.IsMilvusTable() {
+	if metadata.external && !metadata.milvusTable {
 		mlog.Info(context.TODO(), "skip loading delta logs for non-milvus-table external collection")
 		return nil
 	}
-	isMilvusTableRealPK := resolver.IsMilvusTable() && HasExternalPrimaryKey(schema)
+	isMilvusTableRealPK := metadata.milvusTableRealPK
 	useExplicitDeltalogs := isMilvusTableRealPK && len(deltaLogs) > 0
 	readPaths := func(paths []string, opts ...storage.RwOption) error {
 		if len(paths) == 0 {
 			return nil
 		}
-		reader, err := storage.NewDeltalogReader(ctx, pkField.DataType, paths, opts...)
+		reader, err := storage.NewDeltalogReader(ctx, metadata.primaryKeyType, paths, opts...)
 		if err != nil {
 			return err
 		}
@@ -1396,9 +1356,9 @@ func (loader *segmentLoader) loadDeltalogs(ctx context.Context, segment Segment,
 			// Real-PK milvus-table manifests keep source deltalogs. Target-owned
 			// deltalogs are only valid for virtual-PK translation.
 			extfs := packed.ExternalSpecContext{
-				CollectionID: collection.ID(),
-				Source:       schema.GetExternalSource(),
-				Spec:         schema.GetExternalSpec(),
+				CollectionID: segment.Collection(),
+				Source:       metadata.source,
+				Spec:         metadata.spec,
 			}
 			sourceDeltalogs, err := packed.GetDeltaLogsFromManifestWithExtfs(
 				manifestPath,
@@ -1426,7 +1386,7 @@ func (loader *segmentLoader) loadDeltalogs(ctx context.Context, segment Segment,
 				if len(storageV3Paths) > 0 {
 					reader, err := storage.NewDeltalogReader(
 						ctx,
-						pkField.DataType,
+						metadata.primaryKeyType,
 						storageV3Paths,
 						storage.WithVersion(storage.StorageV3),
 						storage.WithStorageConfig(createStorageConfig()),
@@ -1442,7 +1402,7 @@ func (loader *segmentLoader) loadDeltalogs(ctx context.Context, segment Segment,
 				if len(legacyPaths) > 0 {
 					reader, err := storage.NewDeltalogReader(
 						ctx,
-						pkField.DataType,
+						metadata.primaryKeyType,
 						legacyPaths,
 						storage.WithVersion(storage.StorageV1),
 						storage.WithDownloader(func(ctx context.Context, paths []string) ([][]byte, error) {
@@ -1509,7 +1469,7 @@ func (loader *segmentLoader) loadDeltalogs(ctx context.Context, segment Segment,
 		return err
 	}
 
-	mlog.Info(context.TODO(), "load delta logs done", mlog.Int64("deleteCount", deltaData.DeleteRowCount()))
+	mlog.Debug(ctx, "load delta logs done", mlog.Int64("deleteCount", deltaData.DeleteRowCount()))
 	return nil
 }
 
@@ -1584,6 +1544,10 @@ func (loader *segmentLoader) LoadDeltaLogs(ctx context.Context, segment Segment,
 	return loader.loadDeltalogs(ctx, segment, loadInfo)
 }
 
+func (loader *segmentLoader) LoadDeltaLogsWithoutResource(ctx context.Context, segment Segment, loadInfo *querypb.SegmentLoadInfo) error {
+	return loader.loadDeltalogs(ctx, segment, loadInfo)
+}
+
 func createStorageConfig() *indexpb.StorageConfig {
 	params := paramtable.Get()
 	if params.CommonCfg.StorageType.GetValue() == "local" {
@@ -1592,28 +1556,40 @@ func createStorageConfig() *indexpb.StorageConfig {
 			StorageType: params.CommonCfg.StorageType.GetValue(),
 			// External collections may reference an s3:// source even when the
 			// primary storage is local, so the connection cap still applies.
-			MaxConnections: uint32(params.MinioCfg.MaxConnections.GetAsInt()),
+			MaxConnections:              uint32(params.MinioCfg.MaxConnections.GetAsInt()),
+			TalonMode:                   params.CommonCfg.StorageTalonMode.GetAsUint32(),
+			TalonSmallReadThreshold:     params.CommonCfg.StorageTalonSmallReadThreshold.GetAsUint32(),
+			TalonCoordinator:            params.CommonCfg.StorageTalonCoordinator.GetValue(),
+			TalonBlockSize:              params.CommonCfg.StorageTalonBlockSize.GetAsUint32(),
+			TalonMaxIdlePerAddr:         params.CommonCfg.StorageTalonMaxIdlePerAddr.GetAsUint32(),
+			TalonEnableForExternalTable: params.CommonCfg.StorageTalonEnableForExternalTable.GetAsBool(),
 		}
 	}
 	return &indexpb.StorageConfig{
-		Address:           params.MinioCfg.Address.GetValue(),
-		AccessKeyID:       params.MinioCfg.AccessKeyID.GetValue(),
-		SecretAccessKey:   params.MinioCfg.SecretAccessKey.GetValue(),
-		UseSSL:            params.MinioCfg.UseSSL.GetAsBool(),
-		SslCACert:         params.MinioCfg.SslCACert.GetValue(),
-		BucketName:        params.MinioCfg.BucketName.GetValue(),
-		RootPath:          params.MinioCfg.RootPath.GetValue(),
-		UseIAM:            params.MinioCfg.UseIAM.GetAsBool(),
-		IAMEndpoint:       params.MinioCfg.IAMEndpoint.GetValue(),
-		StorageType:       params.CommonCfg.StorageType.GetValue(),
-		Region:            params.MinioCfg.Region.GetValue(),
-		UseVirtualHost:    params.MinioCfg.UseVirtualHost.GetAsBool(),
-		CloudProvider:     params.MinioCfg.CloudProvider.GetValue(),
-		RequestTimeoutMs:  params.MinioCfg.RequestTimeoutMs.GetAsInt64(),
-		MaxConnections:    uint32(params.MinioCfg.MaxConnections.GetAsInt()),
-		GcpCredentialJSON: params.MinioCfg.GcpCredentialJSON.GetValue(),
-		SslTlsMinVersion:  params.MinioCfg.SslTLSMinVersion.GetValue(),
-		UseCrc32CChecksum: params.MinioCfg.UseCRC32C.GetAsBool(),
+		Address:                     params.MinioCfg.Address.GetValue(),
+		AccessKeyID:                 params.MinioCfg.AccessKeyID.GetValue(),
+		SecretAccessKey:             params.MinioCfg.SecretAccessKey.GetValue(),
+		UseSSL:                      params.MinioCfg.UseSSL.GetAsBool(),
+		SslCACert:                   params.MinioCfg.SslCACert.GetValue(),
+		BucketName:                  params.MinioCfg.BucketName.GetValue(),
+		RootPath:                    params.MinioCfg.RootPath.GetValue(),
+		UseIAM:                      params.MinioCfg.UseIAM.GetAsBool(),
+		IAMEndpoint:                 params.MinioCfg.IAMEndpoint.GetValue(),
+		StorageType:                 params.CommonCfg.StorageType.GetValue(),
+		Region:                      params.MinioCfg.Region.GetValue(),
+		UseVirtualHost:              params.MinioCfg.UseVirtualHost.GetAsBool(),
+		CloudProvider:               params.MinioCfg.CloudProvider.GetValue(),
+		RequestTimeoutMs:            params.MinioCfg.RequestTimeoutMs.GetAsInt64(),
+		MaxConnections:              uint32(params.MinioCfg.MaxConnections.GetAsInt()),
+		GcpCredentialJSON:           params.MinioCfg.GcpCredentialJSON.GetValue(),
+		SslTlsMinVersion:            params.MinioCfg.SslTLSMinVersion.GetValue(),
+		UseCrc32CChecksum:           params.MinioCfg.UseCRC32C.GetAsBool(),
+		TalonMode:                   params.CommonCfg.StorageTalonMode.GetAsUint32(),
+		TalonSmallReadThreshold:     params.CommonCfg.StorageTalonSmallReadThreshold.GetAsUint32(),
+		TalonCoordinator:            params.CommonCfg.StorageTalonCoordinator.GetValue(),
+		TalonBlockSize:              params.CommonCfg.StorageTalonBlockSize.GetAsUint32(),
+		TalonMaxIdlePerAddr:         params.CommonCfg.StorageTalonMaxIdlePerAddr.GetAsUint32(),
+		TalonEnableForExternalTable: params.CommonCfg.StorageTalonEnableForExternalTable.GetAsBool(),
 	}
 }
 
@@ -1718,6 +1694,7 @@ func (loader *segmentLoader) checkLogicalSegmentSize(ctx context.Context, segmen
 	// so we need to estimate the final resource usage of the segments
 	finalFactor := resourceEstimateFactor{
 		deltaDataExpansionFactor:        paramtable.Get().QueryNodeCfg.DeltaDataExpansionRate.GetAsFloat(),
+		jsonKeyStatsExpansionFactor:     paramtable.Get().QueryNodeCfg.JSONKeyStatsExpansionFactor.GetAsFloat(),
 		textIndexExpansionFactor:        paramtable.Get().QueryNodeCfg.TextIndexExpansionFactor.GetAsFloat(),
 		TieredEvictionEnabled:           paramtable.Get().QueryNodeCfg.TieredEvictionEnabled.GetAsBool(),
 		TieredEvictableMemoryCacheRatio: paramtable.Get().QueryNodeCfg.TieredEvictableMemoryCacheRatio.GetAsFloat(),
@@ -1776,6 +1753,10 @@ func (loader *segmentLoader) checkLogicalSegmentSize(ctx context.Context, segmen
 }
 
 func (loader *segmentLoader) estimateSegmentLoadingResourceUsage(ctx context.Context, segmentLoadInfos ...*querypb.SegmentLoadInfo) (*ResourceUsage, uint64, error) {
+	return loader.estimateSegmentLoadingResourceUsageWithSchema(ctx, nil, segmentLoadInfos...)
+}
+
+func (loader *segmentLoader) estimateSegmentLoadingResourceUsageWithSchema(ctx context.Context, schema *schemapb.CollectionSchema, segmentLoadInfos ...*querypb.SegmentLoadInfo) (*ResourceUsage, uint64, error) {
 	if len(segmentLoadInfos) == 0 {
 		return &ResourceUsage{}, 0, nil
 	}
@@ -1801,8 +1782,11 @@ func (loader *segmentLoader) estimateSegmentLoadingResourceUsage(ctx context.Con
 	var predictGpuMemUsage []uint64
 	mmapFieldCount := 0
 	for _, loadInfo := range segmentLoadInfos {
-		collection := loader.manager.Collection.Get(loadInfo.GetCollectionID())
-		loadingUsage, err := estimateLoadingResourceUsageOfSegment(collection.Schema(), loadInfo, maxFactor)
+		loadSchema := schema
+		if loadSchema == nil {
+			loadSchema = loader.manager.Collection.Get(loadInfo.GetCollectionID()).Schema()
+		}
+		loadingUsage, err := estimateLoadingResourceUsageOfSegment(loadSchema, loadInfo, maxFactor)
 		if err != nil {
 			logger.Warn(ctx, "failed to estimate max resource usage of segment",
 				mlog.Int64("collectionID", loadInfo.GetCollectionID()),
@@ -1854,7 +1838,7 @@ func (loader *segmentLoader) checkLoadingResource(
 	predictMemUsage := memUsage + loadingUsage.MemorySize
 	predictDiskUsage := diskUsage + loadingUsage.DiskSize
 
-	logger.Info(ctx, "predict memory and disk usage while loading (in MiB)",
+	logger.Debug(ctx, "predict memory and disk usage while loading (in MiB)",
 		mlog.Float64("maxSegmentSize(MB)", logutil.ToMB(float64(maxSegmentSize))),
 		mlog.Float64("committedMemSize(MB)", logutil.ToMB(float64(loader.committedResource.MemorySize))),
 		mlog.Float64("memLimit(MB)", logutil.ToMB(float64(totalMem))),
@@ -1866,28 +1850,7 @@ func (loader *segmentLoader) checkLoadingResource(
 		mlog.Int("mmapFieldCount", loadingUsage.MmapFieldCount),
 	)
 
-	var loadingResource C.CResourceUsage
-	reservedLoadingResource := false
-	if paramtable.Get().QueryNodeCfg.TieredEvictionEnabled.GetAsBool() {
-		loadingResource = C.CResourceUsage{
-			memory_bytes: C.int64_t(loadingUsage.MemorySize),
-			disk_bytes:   C.int64_t(loadingUsage.DiskSize),
-		}
-
-		// try to reserve loading resource from caching layer
-		if ok := C.TryReserveLoadingResourceWithTimeout(loadingResource, 1000); !ok {
-			return merr.WrapErrSegmentRequestResourceFailed("memory/disk",
-				fmt.Sprintf("failed to reserve loading resource from caching layer, predictMemUsage = %v MB, predictDiskUsage = %v MB, memUsage = %v MB, diskUsage = %v MB, memoryThresholdFactor = %f, diskThresholdFactor = %f",
-					logutil.ToMB(float64(predictMemUsage)),
-					logutil.ToMB(float64(predictDiskUsage)),
-					logutil.ToMB(float64(memUsage)),
-					logutil.ToMB(float64(diskUsage)),
-					paramtable.Get().QueryNodeCfg.OverloadedMemoryThresholdPercentage.GetAsFloat(),
-					paramtable.Get().QueryNodeCfg.MaxDiskUsagePercentage.GetAsFloat(),
-				))
-		}
-		reservedLoadingResource = true
-	} else {
+	if !paramtable.Get().QueryNodeCfg.TieredEvictionEnabled.GetAsBool() {
 		// fallback to original segment loading logic
 		if predictMemUsage > uint64(float64(totalMem)*paramtable.Get().QueryNodeCfg.OverloadedMemoryThresholdPercentage.GetAsFloat()) {
 			mlog.Warn(context.TODO(), "load segment failed, OOM if load",
@@ -1913,57 +1876,7 @@ func (loader *segmentLoader) checkLoadingResource(
 		}
 	}
 
-	err := checkSegmentGpuMemSize(loadingUsage.FieldGpuMemorySize, float32(paramtable.Get().GpuConfig.OverloadedMemoryThresholdPercentage.GetAsFloat()))
-	if err != nil {
-		if reservedLoadingResource {
-			C.ReleaseLoadingResource(loadingResource)
-		}
-		return err
-	}
-
-	return nil
-}
-
-// resolveSegmentEstimateLogs returns the raw and delta metadata consumed by the
-// existing estimator. Internal Storage V3 descriptors are adapted to pathless
-// FieldBinlogs; all other SegmentLoadInfo metadata remains on the original proto.
-func resolveSegmentEstimateLogs(schema *schemapb.CollectionSchema, loadInfo *querypb.SegmentLoadInfo) ([]*datapb.FieldBinlog, []*datapb.FieldBinlog) {
-	binlogs := loadInfo.GetBinlogPaths()
-	deltalogs := loadInfo.GetDeltalogs()
-	if len(binlogs) > 0 {
-		return binlogs, deltalogs
-	}
-	if loadInfo.GetStorageVersion() != storage.StorageV3 || loadInfo.GetManifestPath() == "" || typeutil.IsExternalCollection(schema) {
-		return binlogs, deltalogs
-	}
-
-	stats := loadInfo.GetStats()
-	resource := stats.GetLoadResource()
-	if resource == nil {
-		return binlogs, deltalogs
-	}
-
-	groups := resource.GetColumnGroups()
-	binlogs = make([]*datapb.FieldBinlog, 0, len(groups))
-	for _, group := range groups {
-		binlogs = append(binlogs, &datapb.FieldBinlog{
-			FieldID:     group.GetGroupId(),
-			ChildFields: append([]int64(nil), group.GetFieldIds()...),
-			Binlogs: []*datapb.Binlog{{
-				EntriesNum: loadInfo.GetNumOfRows(),
-				MemorySize: group.GetMemorySize(),
-			}},
-		})
-	}
-
-	deltalogs = nil
-	if deltaSize := stats.GetDeltaBinlogSize(); deltaSize > 0 {
-		deltalogs = []*datapb.FieldBinlog{{
-			Binlogs: []*datapb.Binlog{{MemorySize: deltaSize}},
-		}}
-	}
-
-	return binlogs, deltalogs
+	return checkSegmentGpuMemSize(loadingUsage.FieldGpuMemorySize, float32(paramtable.Get().GpuConfig.OverloadedMemoryThresholdPercentage.GetAsFloat()))
 }
 
 // this function is used to estimate the logical resource usage of a segment, which should only be used when tiered eviction is enabled
@@ -1971,195 +1884,32 @@ func resolveSegmentEstimateLogs(schema *schemapb.CollectionSchema, loadInfo *que
 // TODO: the inevictable part is not correct, since we cannot know the final resource usage of interim index and default-value column before loading,
 // current they are ignored, but we should consider them in the future
 func estimateLogicalResourceUsageOfSegment(schema *schemapb.CollectionSchema, loadInfo *querypb.SegmentLoadInfo, multiplyFactor resourceEstimateFactor) (usage *ResourceUsage, err error) {
-	var segmentInevictableMemorySize, segmentInevictableDiskSize uint64
-	var segmentEvictableMemorySize, segmentEvictableDiskSize uint64
-
-	binlogs, deltalogs := resolveSegmentEstimateLogs(schema, loadInfo)
-	id2Binlogs := lo.SliceToMap(binlogs, func(fieldBinlog *datapb.FieldBinlog) (int64, *datapb.FieldBinlog) {
-		return fieldBinlog.GetFieldID(), fieldBinlog
+	options := loadresource.DefaultSegmentFinalEstimateOptions()
+	options.DeltaDataExpansionFactor = multiplyFactor.deltaDataExpansionFactor
+	options.JSONKeyStatsExpansionFactor = multiplyFactor.jsonKeyStatsExpansionFactor
+	options.TextIndexExpansionFactor = multiplyFactor.textIndexExpansionFactor
+	options.TieredEvictionEnabled = multiplyFactor.TieredEvictionEnabled
+	options.TieredEvictableMemoryCacheRatio = multiplyFactor.TieredEvictableMemoryCacheRatio
+	options.TieredEvictableDiskCacheRatio = multiplyFactor.TieredEvictableDiskCacheRatio
+	estimate, err := loadresource.EstimateSegmentFinalResource(context.Background(), schema, loadInfo, options, func(fn func() error) error {
+		_, err := GetDynamicPool().Submit(func() (any, error) {
+			return nil, fn()
+		}).Await()
+		return err
 	})
-
-	schemaHelper, err := typeutil.CreateSchemaHelper(schema)
 	if err != nil {
-		mlog.Warn(context.TODO(), "failed to create schema helper", mlog.String("name", schema.GetName()), mlog.Err(err))
 		return nil, err
 	}
-	ctx := context.TODO()
 
-	// PART 1: calculate logical resource usage of indexes
-	for _, fieldIndexInfo := range loadInfo.IndexInfos {
-		fieldID := fieldIndexInfo.GetFieldID()
-		if len(fieldIndexInfo.GetIndexFilePaths()) > 0 {
-			fieldSchema, err := schemaHelper.GetFieldFromID(fieldID)
-			if err != nil {
-				return nil, err
-			}
-			isVectorType := typeutil.IsVectorType(fieldSchema.GetDataType())
-
-			var estimateResult ResourceEstimate
-			err = GetCLoadInfoWithFunc(ctx, fieldSchema, loadInfo, fieldIndexInfo, func(c *LoadIndexInfo) error {
-				GetDynamicPool().Submit(func() (any, error) {
-					loadResourceRequest := C.EstimateLoadIndexResource(c.cLoadIndexInfo)
-					estimateResult = GetResourceEstimate(&loadResourceRequest)
-					return nil, nil
-				}).Await()
-				return nil
-			})
-			if err != nil {
-				return nil, merr.Wrapf(err, "failed to estimate logical resource usage of index, collection %d, segment %d, indexBuildID %d",
-					loadInfo.GetCollectionID(),
-					loadInfo.GetSegmentID(),
-					fieldIndexInfo.GetBuildID())
-			}
-			segmentEvictableMemorySize += estimateResult.FinalMemoryCost
-			segmentEvictableDiskSize += estimateResult.FinalDiskCost
-
-			// could skip binlog or
-			// could be missing for new field or storage v2 group 0
-			if estimateResult.HasRawData &&
-				!paramtable.Get().QueryNodeCfg.PreferFieldDataWhenIndexHasRawData.GetAsBool() {
-				delete(id2Binlogs, fieldID)
-				continue
-			}
-
-			// BM25 only checks vector datatype
-			// scalar index does not have metrics type key
-			if !isVectorType {
-				continue
-			}
-
-			metricType, err := funcutil.GetAttrByKeyFromRepeatedKV(common.MetricTypeKey, fieldIndexInfo.IndexParams)
-			if err != nil {
-				return nil, merr.Wrapf(err, "failed to estimate logical resource usage of index, metric type not found, collection %d, segment %d, indexBuildID %d",
-					loadInfo.GetCollectionID(),
-					loadInfo.GetSegmentID(),
-					fieldIndexInfo.GetBuildID())
-			}
-			// skip raw data for BM25 index
-			if metricType == metric.BM25 {
-				delete(id2Binlogs, fieldID)
-			}
-		}
-	}
-
-	// PART 2: calculate logical resource usage of binlogs
-	for fieldID, fieldBinlog := range id2Binlogs {
-		fieldIDs := fieldBinlog.GetChildFields()
-		// legacy default split
-		if len(fieldIDs) == 0 {
-			fieldIDs = []int64{fieldID}
-		}
-		binlogSize := uint64(getBinlogDataMemorySize(fieldBinlog))
-
-		var supportInterimIndexDataType bool
-		var containsTimestampField bool
-		var doubleMemoryDataField bool
-		var legacyNilSchema bool
-		mmapEnabled := true
-		isVectorType := true
-
-		for _, fieldID := range fieldIDs {
-			// get field schema from fieldID
-			fieldSchema, err := schemaHelper.GetFieldFromID(fieldID)
-			if err != nil {
-				mlog.Info(ctx, "skip binlog for dropped field", mlog.FieldFieldID(fieldID), mlog.String("name", schema.GetName()))
-				continue
-			}
-
-			// missing mapping, shall be "0" group for storage v2
-			if fieldSchema == nil {
-				legacyNilSchema = true
-				break
-			}
-
-			supportInterimIndexDataType = supportInterimIndexDataType || SupportInterimIndexDataType(fieldSchema.GetDataType())
-			isVectorType = isVectorType && typeutil.IsVectorType(fieldSchema.GetDataType())
-			// constainSystemField = constainSystemField || common.IsSystemField(fieldSchema.GetFieldID())
-			mmapEnabled = mmapEnabled && isDataMmapEnable(fieldSchema)
-			containsTimestampField = containsTimestampField || DoubleMemorySystemField(fieldSchema.GetFieldID())
-			doubleMemoryDataField = doubleMemoryDataField || DoubleMemoryDataType(fieldSchema.GetDataType())
-		}
-
-		// TODO: add default-value column's resource usage to inevictable part
-		// TODO: add interim index's resource usage to inevictable part
-
-		if legacyNilSchema {
-			segmentEvictableMemorySize += binlogSize
-			continue
-		}
-
-		// timestamp field double in InsertRecord & TimestampIndex
-		if containsTimestampField {
-			timestampSize := lo.SumBy(fieldBinlog.GetBinlogs(), func(binlog *datapb.Binlog) int64 {
-				return binlog.GetEntriesNum() * 4
-			})
-			segmentInevictableMemorySize += 2 * uint64(timestampSize)
-		}
-
-		if isVectorType {
-			mmapVectorField := paramtable.Get().QueryNodeCfg.MmapVectorField.GetAsBool()
-			if mmapVectorField {
-				segmentEvictableDiskSize += binlogSize
-			} else {
-				segmentEvictableMemorySize += binlogSize
-			}
-		} else if !mmapEnabled {
-			segmentEvictableMemorySize += binlogSize
-			if doubleMemoryDataField {
-				segmentEvictableMemorySize += binlogSize
-			}
-		} else {
-			segmentEvictableDiskSize += binlogSize
-		}
-	}
-
-	// PART 3: calculate logical resource usage of stats data
-	for _, fieldBinlog := range loadInfo.Statslogs {
-		segmentInevictableMemorySize += uint64(getBinlogDataMemorySize(fieldBinlog))
-	}
-
-	// PART 4: calculate logical resource usage of delete data
-	for _, fieldBinlog := range deltalogs {
-		// MemorySize of filedBinlog is the actual size in memory, so the expansionFactor
-		//   should be 1, in most cases.
-		expansionFactor := float64(1)
-		memSize := getBinlogDataMemorySize(fieldBinlog)
-
-		// Note: If MemorySize == DiskSize, it means the segment comes from Milvus 2.3,
-		//   MemorySize is actually compressed DiskSize of deltalog, so we'll fallback to use
-		//   deltaExpansionFactor to compromise the compression ratio.
-		if memSize == getBinlogDataDiskSize(fieldBinlog) {
-			expansionFactor = multiplyFactor.deltaDataExpansionFactor
-		}
-		segmentInevictableMemorySize += uint64(float64(memSize) * expansionFactor)
-	}
-
-	// PART 5: calculate logical resource usage of text index stats data
-	// Text match indexes are evictable (support_eviction=true in caching layer).
-	// Text match index mmap is driven by scalar_field_enable_mmap (same as raw scalar data).
-	textIndexMmapEnable := paramtable.Get().QueryNodeCfg.MmapScalarField.GetAsBool()
-	validityBitmapBytes := estimateTantivyValidityBitmapBytes(loadInfo.GetNumOfRows())
-	for _, textStats := range loadInfo.GetTextStatsLogs() {
-		indexFileBytes := uint64(float64(textStats.GetMemorySize()) * multiplyFactor.textIndexExpansionFactor)
-		segmentEvictableMemorySize += validityBitmapBytes
-		if textIndexMmapEnable {
-			segmentEvictableDiskSize += indexFileBytes
-		} else {
-			segmentEvictableMemorySize += indexFileBytes
-		}
-	}
-
-	mlog.Debug(context.TODO(), "estimate logical resoure usage result",
+	mlog.Debug(context.TODO(), "estimate logical resource usage result",
 		mlog.Int64("segmentID", loadInfo.GetSegmentID()),
-		mlog.Uint64("segmentInevictableMemorySize", segmentInevictableMemorySize),
-		mlog.Uint64("segmentEvictableMemorySize", segmentEvictableMemorySize),
-		mlog.Uint64("segmentInevictableDiskSize", segmentInevictableDiskSize),
-		mlog.Uint64("segmentEvictableDiskSize", segmentEvictableDiskSize),
+		mlog.Uint64("memorySize", estimate.MemoryBytes),
+		mlog.Uint64("diskSize", estimate.DiskBytes),
 	)
 
 	return &ResourceUsage{
-		MemorySize: segmentInevictableMemorySize + uint64(float64(segmentEvictableMemorySize)*multiplyFactor.TieredEvictableMemoryCacheRatio),
-		DiskSize:   segmentInevictableDiskSize + uint64(float64(segmentEvictableDiskSize)*multiplyFactor.TieredEvictableDiskCacheRatio),
+		MemorySize: estimate.MemoryBytes,
+		DiskSize:   estimate.DiskBytes,
 	}, nil
 }
 
@@ -2169,319 +1919,31 @@ func estimateLogicalResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 //     which should be a subset of the segment inevictable part
 //   - when tiered eviction is disabled, the result is the max resource usage of both the segment evictable and inevictable part
 func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, loadInfo *querypb.SegmentLoadInfo, multiplyFactor resourceEstimateFactor) (usage *ResourceUsage, err error) {
-	var segMemoryLoadingSize, segDiskLoadingSize uint64
-	var indexMemorySize uint64
-	var mmapFieldCount int
-	var fieldGpuMemorySize []uint64
+	options := loadresource.DefaultSegmentLoadingEstimateOptions()
+	options.DeltaDataExpansionFactor = multiplyFactor.deltaDataExpansionFactor
+	options.JSONKeyStatsExpansionFactor = multiplyFactor.jsonKeyStatsExpansionFactor
+	options.TextIndexExpansionFactor = multiplyFactor.textIndexExpansionFactor
+	options.TieredEvictionEnabled = multiplyFactor.TieredEvictionEnabled
+	options.EnableInterimSegmentIndex = multiplyFactor.EnableInterminSegmentIndex
+	options.TempSegmentIndexFactor = multiplyFactor.tempSegmentIndexFactor
+	options.ExternalRawDataFactor = multiplyFactor.externalRawDataFactor
 
-	binlogs, deltalogs := resolveSegmentEstimateLogs(schema, loadInfo)
-	id2Binlogs := lo.SliceToMap(binlogs, func(fieldBinlog *datapb.FieldBinlog) (int64, *datapb.FieldBinlog) {
-		return fieldBinlog.GetFieldID(), fieldBinlog
+	estimate, err := loadresource.EstimateSegmentLoadingResource(context.Background(), schema, loadInfo, options, func(fn func() error) error {
+		_, err := GetDynamicPool().Submit(func() (any, error) {
+			return nil, fn()
+		}).Await()
+		return err
 	})
-
-	schemaHelper, err := typeutil.CreateSchemaHelper(schema)
 	if err != nil {
-		mlog.Warn(context.TODO(), "failed to create schema helper", mlog.String("name", schema.GetName()), mlog.Err(err))
 		return nil, err
-	}
-	indexedFields := make(map[int64]struct{})
-	ctx := context.Background()
-
-	// PART 1: calculate size of indexes
-	for _, fieldIndexInfo := range loadInfo.IndexInfos {
-		fieldID := fieldIndexInfo.GetFieldID()
-		if len(fieldIndexInfo.GetIndexFilePaths()) > 0 {
-			fieldSchema, err := schemaHelper.GetFieldFromID(fieldID)
-			if err != nil {
-				// field might have been dropped, skip its index
-				mlog.Info(ctx, "skip index for dropped field", mlog.FieldFieldID(fieldID), mlog.String("name", schema.GetName()))
-				continue
-			}
-			indexedFields[fieldID] = struct{}{}
-
-			isVectorType := typeutil.IsVectorType(fieldSchema.GetDataType())
-
-			var estimateResult ResourceEstimate
-			err = GetCLoadInfoWithFunc(ctx, fieldSchema, loadInfo, fieldIndexInfo, func(c *LoadIndexInfo) error {
-				GetDynamicPool().Submit(func() (any, error) {
-					loadResourceRequest := C.EstimateLoadIndexResource(c.cLoadIndexInfo)
-					estimateResult = GetResourceEstimate(&loadResourceRequest)
-					return nil, nil
-				}).Await()
-				return nil
-			})
-			if err != nil {
-				return nil, merr.Wrapf(err, "failed to estimate loading resource usage of index, collection %d, segment %d, indexBuildID %d",
-					loadInfo.GetCollectionID(),
-					loadInfo.GetSegmentID(),
-					fieldIndexInfo.GetBuildID())
-			}
-
-			if !multiplyFactor.TieredEvictionEnabled {
-				indexMemorySize += estimateResult.MaxMemoryCost
-				segDiskLoadingSize += estimateResult.MaxDiskCost
-			}
-
-			if gpuIndexRequiresGpu(fieldIndexInfo.IndexParams) {
-				fieldGpuMemorySize = append(fieldGpuMemorySize, estimateResult.MaxMemoryCost)
-			}
-
-			// could skip binlog or
-			// could be missing for new field or storage v2 group 0
-			if estimateResult.HasRawData &&
-				!paramtable.Get().QueryNodeCfg.PreferFieldDataWhenIndexHasRawData.GetAsBool() {
-				delete(id2Binlogs, fieldID)
-				continue
-			}
-
-			// BM25 only checks vector datatype
-			// scalar index does not have metrics type key
-			if !isVectorType {
-				continue
-			}
-
-			metricType, err := funcutil.GetAttrByKeyFromRepeatedKV(common.MetricTypeKey, fieldIndexInfo.IndexParams)
-			if err != nil {
-				return nil, merr.Wrapf(err, "failed to estimate loading resource usage of index, metric type not found, collection %d, segment %d, indexBuildID %d",
-					loadInfo.GetCollectionID(),
-					loadInfo.GetSegmentID(),
-					fieldIndexInfo.GetBuildID())
-			}
-			// skip raw data for BM25 index
-			if metricType == metric.BM25 {
-				delete(id2Binlogs, fieldID)
-			}
-		}
-	}
-
-	// PART 2: calculate size of binlogs
-	for fieldID, fieldBinlog := range id2Binlogs {
-		fieldIDs := fieldBinlog.GetChildFields()
-		// legacy default split
-		if len(fieldIDs) == 0 {
-			fieldIDs = []int64{fieldID}
-		}
-		binlogSize := uint64(getBinlogDataMemorySize(fieldBinlog))
-
-		var supportInterimIndexDataType bool
-		var containsTimestampField bool
-		var doubleMomoryDataField bool
-		var legacyNilSchema bool
-		mmapEnabled := true
-		isVectorType := true
-		hasIndex := true
-
-		for _, fieldID := range fieldIDs {
-			// get field schema from fieldID
-			fieldSchema, err := schemaHelper.GetFieldFromID(fieldID)
-			if err != nil {
-				// field might have been dropped, skip it and continue processing
-				// other fields in the same column group
-				mlog.Info(ctx, "skip binlog for dropped field", mlog.FieldFieldID(fieldID), mlog.String("name", schema.GetName()))
-				continue
-			}
-			if _, ok := indexedFields[fieldID]; !ok {
-				hasIndex = false
-			}
-
-			// missing mapping, shall be "0" group for storage v2
-			if fieldSchema == nil {
-				if !multiplyFactor.TieredEvictionEnabled {
-					segMemoryLoadingSize += binlogSize
-				}
-				legacyNilSchema = true
-				break
-			}
-
-			supportInterimIndexDataType = supportInterimIndexDataType || SupportInterimIndexDataType(fieldSchema.GetDataType())
-			isVectorType = isVectorType && typeutil.IsVectorType(fieldSchema.GetDataType())
-			mmapEnabled = mmapEnabled && isDataMmapEnable(fieldSchema)
-			containsTimestampField = containsTimestampField || DoubleMemorySystemField(fieldSchema.GetFieldID())
-			doubleMomoryDataField = doubleMomoryDataField || DoubleMemoryDataType(fieldSchema.GetDataType())
-		}
-		// legacy v2 segment without children
-		if legacyNilSchema {
-			continue
-		}
-
-		if !hasIndex {
-			if !multiplyFactor.TieredEvictionEnabled {
-				interimIndexEnable := multiplyFactor.EnableInterminSegmentIndex && !isGrowingMmapEnable() && supportInterimIndexDataType
-				if interimIndexEnable {
-					segMemoryLoadingSize += uint64(float64(binlogSize) * multiplyFactor.tempSegmentIndexFactor)
-				}
-			}
-		}
-
-		if isVectorType {
-			mmapVectorField := paramtable.Get().QueryNodeCfg.MmapVectorField.GetAsBool()
-			if mmapVectorField {
-				if !multiplyFactor.TieredEvictionEnabled {
-					segDiskLoadingSize += binlogSize
-				}
-			} else {
-				if !multiplyFactor.TieredEvictionEnabled {
-					segMemoryLoadingSize += binlogSize
-				}
-			}
-			continue
-		}
-
-		// timestamp field double in InsertRecord & TimestampIndex
-		if containsTimestampField {
-			timestampSize := lo.SumBy(fieldBinlog.GetBinlogs(), func(binlog *datapb.Binlog) int64 {
-				return binlog.GetEntriesNum() * 4
-			})
-			segMemoryLoadingSize += 2 * uint64(timestampSize)
-		}
-
-		if !mmapEnabled {
-			if !multiplyFactor.TieredEvictionEnabled {
-				segMemoryLoadingSize += binlogSize
-				if doubleMomoryDataField {
-					segMemoryLoadingSize += binlogSize
-				}
-			}
-		} else {
-			if !multiplyFactor.TieredEvictionEnabled {
-				segDiskLoadingSize += uint64(getBinlogDataMemorySize(fieldBinlog))
-			}
-		}
-	}
-
-	// PART 2.5: external segment adjustments
-	//
-	// External segments carry pre-computed MemorySize in fake binlogs (from
-	// DataNode Take sampling). Adjust the memory estimate for two external-
-	// specific behaviors:
-	//   1. Non-lazy path without tiered eviction: apply externalRawDataFactor
-	//      to cover the peak transient memory during download + decompress +
-	//      Arrow deserialize (normal packed segments do not have this peak
-	//      because their binlogs are already in Arrow IPC format). When tiered
-	//      eviction is enabled, the caching layer reserves this loading
-	//      overhead, so Go must not reserve the same raw-data margin again.
-	//   2. Full-lazy path (all external fields warmup=disable): no eager
-	//      load, so subtract the raw data size that PART 2 added.
-	// Also propagate EstimatedBytesPerRow to the C++ ManifestGroupTranslator
-	// so the tiered-cache layer sizes chunks correctly.
-	if typeutil.IsExternalCollection(schema) && loadInfo.GetNumOfRows() > 0 {
-		var fakeBinlogMemSize int64
-		for _, fb := range binlogs {
-			fakeBinlogMemSize += getBinlogDataMemorySize(fb)
-		}
-		loadInfo.EstimatedBytesPerRow = fakeBinlogMemSize / loadInfo.GetNumOfRows()
-
-		if isExternalCollectionLazyLoad(schema) {
-			// Full-lazy → zero eager load. Undo PART 2's rawSize addition.
-			// Safety factor does not apply: no peak to cover.
-			if segMemoryLoadingSize >= uint64(fakeBinlogMemSize) {
-				segMemoryLoadingSize -= uint64(fakeBinlogMemSize)
-			} else {
-				segMemoryLoadingSize = 0
-			}
-		} else if !multiplyFactor.TieredEvictionEnabled {
-			if factor := multiplyFactor.externalRawDataFactor; factor > 1.0 {
-				// Non-lazy → add peak margin on top of rawSize that PART 2 added.
-				segMemoryLoadingSize += uint64(float64(fakeBinlogMemSize) * (factor - 1.0))
-			}
-		}
-	}
-
-	// PART 3: calculate size of stats data
-	// stats data isn't managed by the caching layer, so its size should always be included,
-	// regardless of the tiered eviction value
-	for _, fieldBinlog := range loadInfo.Statslogs {
-		segMemoryLoadingSize += uint64(getBinlogDataMemorySize(fieldBinlog))
-	}
-
-	// PART 4: calculate size of delete data
-	// delete data isn't managed by the caching layer, so its size should always be included,
-	// regardless of the tiered eviction value
-	for _, fieldBinlog := range deltalogs {
-		// MemorySize of filedBinlog is the actual size in memory, but we should also consider
-		// the memcpy from golang to cpp side, so the expansionFactor is set to 2.
-		expansionFactor := float64(2)
-		memSize := getBinlogDataMemorySize(fieldBinlog)
-
-		// Note: If MemorySize == DiskSize, it means the segment comes from Milvus 2.3,
-		//   MemorySize is actually compressed DiskSize of deltalog, so we'll fallback to use
-		//   deltaExpansionFactor to compromise the compression ratio.
-		if memSize == getBinlogDataDiskSize(fieldBinlog) {
-			expansionFactor = multiplyFactor.deltaDataExpansionFactor
-		}
-		segMemoryLoadingSize += uint64(float64(memSize) * expansionFactor)
-	}
-
-	// PART 5: calculate size of json key stats data
-	jsonStatsMmapEnable := paramtable.Get().QueryNodeCfg.MmapJSONStats.GetAsBool()
-	for _, jsonKeyStats := range loadInfo.GetJsonKeyStatsLogs() {
-		if jsonStatsMmapEnable {
-			if !multiplyFactor.TieredEvictionEnabled {
-				segDiskLoadingSize += uint64(float64(jsonKeyStats.GetMemorySize()) * multiplyFactor.jsonKeyStatsExpansionFactor)
-			}
-		} else {
-			if !multiplyFactor.TieredEvictionEnabled {
-				segMemoryLoadingSize += uint64(float64(jsonKeyStats.GetMemorySize()) * multiplyFactor.jsonKeyStatsExpansionFactor)
-			}
-		}
-	}
-
-	// per struct memory size, used to keep mapping between row id and element id
-	var structArrayOffsetsSize uint64
-	// PART 6: calculate size of struct array offsets
-	// The memory size is 4 * row_count + 4 * total_element_count
-	// We cannot easily get the element count, so we estimate it by the row count * 10
-	rowCount := uint64(loadInfo.GetNumOfRows())
-	for range len(schema.GetStructArrayFields()) {
-		structArrayOffsetsSize += 4*rowCount + 4*rowCount*10
-	}
-
-	// PART 7: calculate size of text index stats data
-	// text index data is managed by the caching layer when tiered eviction is enabled,
-	// so it only needs to be included when tiered eviction is disabled.
-	// Text match index mmap is driven by scalar_field_enable_mmap (same as raw scalar data).
-	// memory_size is the sum of uploaded Tantivy index files, including sparse null sidecars.
-	// The materialized word-aligned validity bitmap is separate heap memory, and
-	// textIndexExpansionFactor applies only to the index file bytes.
-	textIndexMmapEnable := paramtable.Get().QueryNodeCfg.MmapScalarField.GetAsBool()
-	validityBitmapBytes := estimateTantivyValidityBitmapBytes(loadInfo.GetNumOfRows())
-	for _, textStats := range loadInfo.GetTextStatsLogs() {
-		if multiplyFactor.TieredEvictionEnabled {
-			continue
-		}
-
-		indexFileBytes := uint64(float64(textStats.GetMemorySize()) * multiplyFactor.textIndexExpansionFactor)
-		segMemoryLoadingSize += validityBitmapBytes
-		if textIndexMmapEnable {
-			segDiskLoadingSize += indexFileBytes
-		} else {
-			segMemoryLoadingSize += indexFileBytes
-		}
 	}
 
 	return &ResourceUsage{
-		MemorySize:         segMemoryLoadingSize + indexMemorySize + structArrayOffsetsSize,
-		DiskSize:           segDiskLoadingSize,
-		MmapFieldCount:     mmapFieldCount,
-		FieldGpuMemorySize: fieldGpuMemorySize,
+		MemorySize:         estimate.MemoryBytes,
+		DiskSize:           estimate.DiskBytes,
+		MmapFieldCount:     estimate.MmapFieldCount,
+		FieldGpuMemorySize: estimate.FieldGPUMemoryBytes,
 	}, nil
-}
-
-func DoubleMemoryDataType(dataType schemapb.DataType) bool {
-	return dataType == schemapb.DataType_String ||
-		dataType == schemapb.DataType_VarChar ||
-		dataType == schemapb.DataType_JSON
-}
-
-func DoubleMemorySystemField(fieldID int64) bool {
-	return fieldID == common.TimeStampField
-}
-
-func SupportInterimIndexDataType(dataType schemapb.DataType) bool {
-	return dataType == schemapb.DataType_FloatVector ||
-		dataType == schemapb.DataType_SparseFloatVector ||
-		dataType == schemapb.DataType_Float16Vector ||
-		dataType == schemapb.DataType_BFloat16Vector
 }
 
 // prepareIndexLoadParams injects QueryNode-local index load parameters into each
@@ -2547,7 +2009,19 @@ func (loader *segmentLoader) ReopenSegments(ctx context.Context,
 			configureUseTakeForOutput(info, collection.Schema())
 		}
 
-		err := segment.Reopen(ctx, info)
+		var err error
+		local, ok := segment.(*LocalSegment)
+		if ok && collection != nil && typeutil.IsExternalCollection(collection.Schema()) &&
+			typeutil.NewStorageColumnResolver(collection.Schema()).IsMilvusTable() &&
+			!deltaSourceUnchanged(local.LoadInfo(), info) {
+			// External refresh may add deletes to the new manifest; replay them
+			// before the new load info is published.
+			err = local.reopen(ctx, info, func() error {
+				return loader.loadDeltalogs(ctx, local, info)
+			})
+		} else {
+			err = segment.Reopen(ctx, info)
+		}
 		if err != nil {
 			mlog.Warn(context.TODO(), "failed to reopen segment", mlog.Int64("segmentID", info.GetSegmentID()), mlog.Err(err))
 			return err
@@ -2555,6 +2029,33 @@ func (loader *segmentLoader) ReopenSegments(ctx context.Context,
 	}
 
 	return nil
+}
+
+// deltaSourceUnchanged reports whether incoming references the same delete
+// sources as the published load info. Reopen publishes load info only after a
+// successful replay, so an unchanged source (e.g. index-only reopen) has
+// already been applied. Child manifests are not kept in the runtime load info,
+// so their presence always forces a replay.
+func deltaSourceUnchanged(current, incoming *querypb.SegmentLoadInfo) bool {
+	if len(incoming.GetChildManifestPaths()) != 0 || current.GetManifestPath() != incoming.GetManifestPath() {
+		return false
+	}
+	// Files are immutable; ordering and repeated references do not change their contents.
+	type identity struct {
+		fieldID int64
+		logID   int64
+		path    string
+	}
+	sources := func(info *querypb.SegmentLoadInfo) map[identity]struct{} {
+		result := make(map[identity]struct{})
+		for _, field := range info.GetDeltalogs() {
+			for _, log := range field.GetBinlogs() {
+				result[identity{field.GetFieldID(), log.GetLogID(), log.GetLogPath()}] = struct{}{}
+			}
+		}
+		return result
+	}
+	return maps.Equal(sources(current), sources(incoming))
 }
 
 func getBinlogDataDiskSize(fieldBinlog *datapb.FieldBinlog) int64 {

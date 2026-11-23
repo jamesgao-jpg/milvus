@@ -30,6 +30,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
@@ -42,8 +43,15 @@ type SnapshotRestoreSuite struct {
 	integration.MiniClusterSuite
 }
 
+func (s *SnapshotRestoreSuite) SetupSuite() {
+	s.WithMilvusConfig("common.storage.useLoonFFI", "true")
+	s.MiniClusterSuite.SetupSuite()
+}
+
 func TestSnapshotRestore(t *testing.T) {
-	suite.Run(t, new(SnapshotRestoreSuite))
+	t.Run("StorageV3", func(t *testing.T) {
+		suite.Run(t, &SnapshotRestoreSuite{})
+	})
 }
 
 // TestSnapshotRestoreWithDynamicField verifies that snapshot restore correctly
@@ -205,7 +213,7 @@ func (s *SnapshotRestoreSuite) TestSnapshotRestoreWithDynamicField() {
 		CollectionNames: []string{collectionName},
 	})
 	s.NoError(err)
-	segmentIDs, has := flushResp.GetCollSegIDs()[collectionName]
+	segmentIDs, has := flushResp.GetFlushCollSegIDs()[collectionName]
 	s.True(has)
 	s.NotEmpty(segmentIDs.GetData())
 	flushTs, has := flushResp.GetCollFlushTs()[collectionName]
@@ -231,6 +239,17 @@ func (s *SnapshotRestoreSuite) TestSnapshotRestoreWithDynamicField() {
 	initialCount := queryResult.GetFieldsData()[0].GetScalars().GetLongData().GetData()[0]
 	s.Equal(int64(rowNum), initialCount)
 	mlog.Info(context.TODO(), "Verified initial data", mlog.Int64("count", initialCount))
+	segments, err := c.ShowSegments(collectionName)
+	s.Require().NoError(err)
+	flushedSegments := 0
+	for _, segment := range segments {
+		if segment.GetState() == commonpb.SegmentState_Flushed && segment.GetNumOfRows() > 0 {
+			flushedSegments++
+			s.Require().EqualValues(storage.StorageV3, segment.GetStorageVersion())
+			s.Require().NotEmpty(segment.GetManifestPath())
+		}
+	}
+	s.Require().Positive(flushedSegments)
 
 	// Step 6: Create snapshot
 	snapshotName := fmt.Sprintf("snap_%s", funcutil.GenRandomStr())
@@ -286,12 +305,14 @@ func (s *SnapshotRestoreSuite) TestSnapshotRestoreWithDynamicField() {
 	// Step 8: Restore snapshot to a new collection
 	restoredCollName := fmt.Sprintf("restored_%s", funcutil.GenRandomStr())
 	restoreResp, err := c.MilvusClient.RestoreSnapshot(ctx, &milvuspb.RestoreSnapshotRequest{
-		Name:           snapshotName,
-		CollectionName: restoredCollName,
+		Name:                 snapshotName,
+		CollectionName:       collectionName,
+		TargetCollectionName: restoredCollName,
 	})
 	err = merr.CheckRPCCall(restoreResp, err)
-	s.NoError(err)
+	s.Require().NoError(err)
 	jobID := restoreResp.GetJobId()
+	s.Require().NotZero(jobID)
 	mlog.Info(context.TODO(), "Restore started", mlog.FieldJobID(jobID), mlog.String("target", restoredCollName))
 
 	// Step 9: Wait for restore to complete
@@ -351,7 +372,8 @@ func (s *SnapshotRestoreSuite) TestSnapshotRestoreWithDynamicField() {
 
 	// Cleanup
 	dropSnap, err := c.MilvusClient.DropSnapshot(ctx, &milvuspb.DropSnapshotRequest{
-		Name: snapshotName,
+		Name:           snapshotName,
+		CollectionName: collectionName,
 	})
 	err = merr.CheckRPCCall(dropSnap, err)
 	s.NoError(err)
@@ -373,7 +395,7 @@ func (s *SnapshotRestoreSuite) waitForRestoreComplete(ctx context.Context, jobID
 			JobId: jobID,
 		})
 		err = merr.CheckRPCCall(resp, err)
-		s.NoError(err)
+		s.Require().NoError(err)
 
 		info := resp.GetInfo()
 		state := info.GetState()

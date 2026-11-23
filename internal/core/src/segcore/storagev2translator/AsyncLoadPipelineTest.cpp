@@ -55,7 +55,6 @@
 #include "milvus-storage/common/extend_status.h"
 #include "milvus-storage/reader.h"
 #include "segcore/storagev2translator/AsyncChunkReader.h"
-#include "segcore/storagev2translator/AsyncLoadExecutor.h"
 #include "segcore/storagev2translator/StorageV2Config.h"
 #include "storage/EntryStreamUtils.h"
 #include "storage/FileWriter.h"
@@ -507,6 +506,27 @@ class FakeChunkReader : public milvus_storage::api::ChunkReader {
     std::shared_ptr<folly::Promise<ChunkReadResult>> deferred_read_;
 };
 
+class DeferredWindowReader : public FakeChunkReader {
+ public:
+    DeferredWindowReader() : FakeChunkReader(nullptr) {
+    }
+
+    ChunkReadFuture
+    get_chunks_async(const std::vector<int64_t>& indices, size_t) override {
+        requests.push_back(indices);
+        promises.emplace_back();
+        return promises.back().getSemiFuture();
+    }
+
+    void
+    Complete(size_t index) {
+        promises[index].setValue(get_chunks(requests[index], 1));
+    }
+
+    std::vector<std::vector<int64_t>> requests;
+    std::vector<folly::Promise<ChunkReadResult>> promises;
+};
+
 using ChunkReaderOpenResult =
     arrow::Result<std::unique_ptr<milvus_storage::api::ChunkReader>>;
 
@@ -743,7 +763,7 @@ class AsyncLoadPipelineTest : public ::testing::Test {
     }
 
     template <typename T>
-    folly::Future<T>
+    auto
     Start(folly::coro::Task<T> task) {
         auto future =
             std::move(task).semi().via(folly::getKeepAliveToken(&executor_));
@@ -860,6 +880,106 @@ TEST_F(AsyncLoadPipelineTest, LimitsConcurrentChunkReaderOpens) {
         EXPECT_EQ(chunk_reader->Identifier(),
                   std::optional<int64_t>{static_cast<int64_t>(request_index)});
     }
+}
+
+TEST_F(AsyncLoadPipelineTest, ChunkReaderBatchesShareSlotsWithDataLoads) {
+    budget_.SetCapacitySlots(2);
+    // Fill the byte budget: opening readers only needs the remaining slot.
+    ASSERT_TRUE(
+        budget_.TryAcquire({1024, 1}, storage::LoadAdmissionPriority::High));
+    auto release = folly::makeGuard([&] { budget_.Release({1024, 1}); });
+    auto first = std::make_shared<FakeReader>(&executor_);
+    auto second = std::make_shared<FakeReader>(&executor_);
+    auto a = Start(OpenChunkReadersAsync(nullptr,
+                                         kTestSegmentId,
+                                         first,
+                                         MakeChunkReaderOpenSpecs(2),
+                                         OpenOptions()));
+    auto b = Start(OpenChunkReadersAsync(nullptr,
+                                         kTestSegmentId,
+                                         second,
+                                         MakeChunkReaderOpenSpecs(2),
+                                         OpenOptions()));
+    ASSERT_EQ(first->AsyncCalls(), 1);
+    EXPECT_EQ(second->AsyncCalls(), 0);
+    first->Complete(0);
+    executor_.drain();
+    ASSERT_EQ(first->AsyncCalls(), 2);
+    EXPECT_EQ(second->AsyncCalls(), 0);
+    first->Complete(1);
+    const auto opened = Get(std::move(a));
+    ASSERT_EQ(opened.size(), 2);
+    // Retaining opened readers must not retain their admission slots.
+    ASSERT_EQ(second->AsyncCalls(), 1);
+    second->Complete(0);
+    executor_.drain();
+    ASSERT_EQ(second->AsyncCalls(), 2);
+    second->Complete(1);
+    EXPECT_EQ(Get(std::move(b)).size(), 2);
+    EXPECT_TRUE(
+        budget_.TryAcquire({0, 1}, storage::LoadAdmissionPriority::High));
+    budget_.Release({0, 1});
+}
+
+TEST_F(AsyncLoadPipelineTest, ChunkReaderSlotWaitUsesRequestPriority) {
+    budget_.SetCapacitySlots(1);
+    ASSERT_TRUE(
+        budget_.TryAcquire({0, 1}, storage::LoadAdmissionPriority::High));
+    auto low = std::make_shared<FakeReader>(&executor_);
+    auto high = std::make_shared<FakeReader>(&executor_);
+    auto low_task = Start(
+        OpenChunkReadersAsync(nullptr,
+                              kTestSegmentId,
+                              low,
+                              MakeChunkReaderOpenSpecs(1),
+                              OpenOptions(proto::common::LoadPriority::LOW)));
+    auto high_task = Start(OpenChunkReadersAsync(nullptr,
+                                                 kTestSegmentId,
+                                                 high,
+                                                 MakeChunkReaderOpenSpecs(1),
+                                                 OpenOptions()));
+    EXPECT_EQ(low->AsyncCalls(), 0);
+    EXPECT_EQ(high->AsyncCalls(), 0);
+    budget_.Release({0, 1});
+    executor_.drain();
+    EXPECT_EQ(low->AsyncCalls(), 0);
+    ASSERT_EQ(high->AsyncCalls(), 1);
+    high->Complete(0);
+    EXPECT_EQ(Get(std::move(high_task)).size(), 1);
+    ASSERT_EQ(low->AsyncCalls(), 1);
+    low->Complete(0);
+    EXPECT_EQ(Get(std::move(low_task)).size(), 1);
+}
+
+TEST_F(AsyncLoadPipelineTest,
+       ChunkReaderCancellationReleasesQueuedButDrainsActiveSlot) {
+    budget_.SetCapacitySlots(1);
+    folly::CancellationSource cancel;
+    OpContext ctx(cancel.getToken());
+    auto first = std::make_shared<FakeReader>(&executor_);
+    auto pending = Start(OpenChunkReadersAsync(&ctx,
+                                               kTestSegmentId,
+                                               first,
+                                               MakeChunkReaderOpenSpecs(2),
+                                               OpenOptions()));
+    ASSERT_EQ(first->AsyncCalls(), 1);
+    cancel.requestCancellation();
+    executor_.drain();
+    EXPECT_FALSE(pending.isReady());
+    EXPECT_EQ(first->AsyncCalls(), 1);
+    auto next = std::make_shared<FakeReader>(&executor_);
+    auto successor = Start(OpenChunkReadersAsync(nullptr,
+                                                 kTestSegmentId,
+                                                 next,
+                                                 MakeChunkReaderOpenSpecs(1),
+                                                 OpenOptions()));
+    EXPECT_EQ(next->AsyncCalls(), 0);
+    first->Complete(0);
+    ExpectClassifiedFailure([&] { Get(std::move(pending)); },
+                            ErrorCode::FollyCancel);
+    ASSERT_EQ(next->AsyncCalls(), 1);
+    next->Complete(0);
+    EXPECT_EQ(Get(std::move(successor)).size(), 1);
 }
 
 TEST_F(AsyncLoadPipelineTest, RunsSynchronousFallbackFactoryOnExecutor) {
@@ -1475,78 +1595,6 @@ TEST_F(AsyncLoadPipelineTest, RestoresRequestedCellOrder) {
     EXPECT_TRUE(reader->CalledOnExecutor());
 }
 
-TEST(AsyncLoadExecutorTest, ResizesExistingExecutorWithQueuedWork) {
-    const int previous = GetAsyncLoadThreadPoolSize();
-    auto restore =
-        folly::makeGuard([&]() { SetAsyncLoadThreadPoolSize(previous); });
-    SetAsyncLoadThreadPoolSize(1);
-    auto executor =
-        ResolveAsyncLoadExecutor({}, milvus::proto::common::LoadPriority::HIGH);
-    std::promise<void> release;
-    auto released = release.get_future().share();
-    std::promise<void> first_started;
-    std::promise<void> second_started;
-    std::promise<void> first_done;
-    std::promise<void> second_done;
-    auto first_completion = first_done.get_future();
-    auto second_completion = second_done.get_future();
-    bool first_submitted = false;
-    bool second_submitted = false;
-    auto unblock = folly::makeGuard([&]() {
-        release.set_value();
-        if (first_submitted && first_completion.valid()) {
-            first_completion.wait();
-        }
-        if (second_submitted && second_completion.valid()) {
-            second_completion.wait();
-        }
-    });
-    executor->add([&]() {
-        first_started.set_value();
-        released.wait();
-        first_done.set_value();
-    });
-    first_submitted = true;
-    EXPECT_EQ(first_started.get_future().wait_for(std::chrono::seconds(2)),
-              std::future_status::ready);
-    executor->add([&]() {
-        second_started.set_value();
-        released.wait();
-        second_done.set_value();
-    });
-    second_submitted = true;
-    auto second_start = second_started.get_future();
-    EXPECT_EQ(second_start.wait_for(std::chrono::milliseconds(20)),
-              std::future_status::timeout);
-
-    SetAsyncLoadThreadPoolSize(2);
-    EXPECT_EQ(GetAsyncLoadThreadPoolSize(), 2);
-    EXPECT_EQ(second_start.wait_for(std::chrono::seconds(2)),
-              std::future_status::ready);
-    release.set_value();
-    unblock.dismiss();
-    first_completion.get();
-    second_completion.get();
-
-    SetAsyncLoadThreadPoolSize(1);
-    EXPECT_EQ(GetAsyncLoadThreadPoolSize(), 1);
-    // A keep-alive acquired before resizing still submits to the same pool.
-    std::promise<void> after_resize;
-    auto completion = after_resize.get_future();
-    executor->add([&]() { after_resize.set_value(); });
-    EXPECT_EQ(completion.wait_for(std::chrono::seconds(2)),
-              std::future_status::ready);
-    completion.get();
-}
-
-TEST(AsyncLoadExecutorTest, InvalidSizePreservesConfiguration) {
-    const int previous = GetAsyncLoadThreadPoolSize();
-    for (const int value : {0, -1}) {
-        EXPECT_THROW(SetAsyncLoadThreadPoolSize(value), milvus::SegcoreError);
-        EXPECT_EQ(GetAsyncLoadThreadPoolSize(), previous);
-    }
-}
-
 TEST_F(AsyncLoadPipelineTest, DefaultExecutorRunsOffTheCallingThread) {
     auto caller = std::this_thread::get_id();
     std::atomic<bool> ran_off_caller{false};
@@ -1984,6 +2032,90 @@ TEST_F(AsyncLoadPipelineTest, ComposesWithCallerCoroutine) {
     };
 
     EXPECT_EQ(Run(caller()), 1);
+}
+
+TEST_F(AsyncLoadPipelineTest,
+       ReadCellsOverlapsWindowsAndPreservesRequestSlots) {
+    budget_.SetCapacityBytes(2);
+    budget_.SetCapacitySlots(2);
+    auto reader = std::make_shared<DeferredWindowReader>();
+    std::vector<CellSpec> cells{
+        {2, 0, 2, 1, 1}, {0, 0, 0, 1, 1}, {1, 0, 1, 1, 1}};
+    std::vector<int64_t> results(3, -1);
+    auto options = Options();
+    options.read_window_bytes = 1;
+    auto future = Start(ReadCellsAsync(
+        nullptr,
+        kTestSegmentId,
+        std::move(cells),
+        reader,
+        [&results](auto batches, const CellSpec& cell, size_t request_index) {
+            EXPECT_EQ(batches.size(), 1);
+            const auto value = std::static_pointer_cast<arrow::Int64Array>(
+                                   batches.front()->column(0))
+                                   ->Value(0);
+            EXPECT_EQ(value, cell.cid);
+            results[request_index] = value;
+        },
+        std::move(options)));
+    // Two reads must start before either storage future completes; the third
+    // waits for admission. This fails if windows are awaited serially.
+    EXPECT_EQ(reader->requests.size(), 2);
+    EXPECT_FALSE(future.isReady());
+    if (reader->requests.size() == 2) {
+        reader->Complete(1);
+        executor_.drain();
+        EXPECT_EQ(reader->requests.size(), 3);
+        EXPECT_EQ(results[2], 1);
+        if (reader->requests.size() == 3) {
+            reader->Complete(2);
+            executor_.drain();
+        }
+        EXPECT_FALSE(future.isReady());
+        reader->Complete(0);
+    } else {
+        // Drain a serial regression before reporting the failed assertion.
+        for (size_t i = 0; i < reader->requests.size(); ++i) {
+            reader->Complete(i);
+            executor_.drain();
+        }
+    }
+    Get(std::move(future));
+    EXPECT_EQ(results, (std::vector<int64_t>{2, 0, 1}));
+    auto lease = folly::coro::blockingWait(
+        budget_.AcquireAsync({2, 2}, storage::LoadAdmissionPriority::High));
+}
+
+TEST_F(AsyncLoadPipelineTest, ReadCellsCancelsRefillAndDrainsPeersOnFailure) {
+    budget_.SetCapacityBytes(2);
+    budget_.SetCapacitySlots(2);
+    auto reader = std::make_shared<DeferredWindowReader>();
+    auto options = Options();
+    options.read_window_bytes = 1;
+    int finalized = 0;
+    auto future = Start(ReadCellsAsync(
+        nullptr,
+        kTestSegmentId,
+        {{0, 0, 0, 1, 1}, {1, 0, 1, 1, 1}, {2, 0, 2, 1, 1}},
+        reader,
+        [&finalized](auto, const CellSpec&, size_t) { ++finalized; },
+        std::move(options)));
+    EXPECT_EQ(reader->requests.size(), 2);
+    reader->promises[0].setException(
+        folly::make_exception_wrapper<SegcoreError>(ErrorCode::DataFormatBroken,
+                                                    "window read failed"));
+    executor_.drain();
+    EXPECT_FALSE(future.isReady());
+    EXPECT_EQ(reader->requests.size(), 2);
+    for (size_t i = 1; i < reader->requests.size(); ++i) {
+        reader->Complete(i);
+        executor_.drain();
+    }
+    ExpectClassifiedFailure([&] { Get(std::move(future)); },
+                            ErrorCode::DataFormatBroken);
+    EXPECT_EQ(finalized, 0);
+    auto lease = folly::coro::blockingWait(
+        budget_.AcquireAsync({2, 2}, storage::LoadAdmissionPriority::High));
 }
 
 TEST_F(AsyncLoadPipelineTest, SubmitsOnlyBudgetAdmittedWindowsToLoadExecutor) {

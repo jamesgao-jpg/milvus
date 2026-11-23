@@ -19,14 +19,11 @@ package querycoordv2
 import (
 	"context"
 
-	"github.com/cockroachdb/errors"
-
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster"
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/broadcast"
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/registry"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
-	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 )
 
 // RegisterDDLCallbacks registers the ddl callbacks.
@@ -53,30 +50,15 @@ func (c *DDLCallbacks) registerResourceGroupCallbacks() {
 	registry.RegisterDropResourceGroupV2AckCallback(c.dropResourceGroupV2AckCallback)
 }
 
-// shouldApplyLocallyOnNonPrimary checks if the error from broadcaster indicates a non-primary cluster
-// and the message type is configured to be skipped via streaming.replication.skipMessageTypes.
-// If true, the caller should bypass the broadcaster and apply the operation locally.
-func shouldApplyLocallyOnNonPrimary(err error, msgType message.MessageType) bool {
-	if !errors.Is(err, broadcast.ErrNotPrimary) {
-		return false
-	}
-	for _, t := range paramtable.Get().StreamingCfg.ReplicationSkipMessageTypes.GetAsStrings() {
-		if t == msgType.String() {
-			return true
-		}
-	}
-	return false
-}
-
 // startBroadcastWithCollectionIDLock starts a broadcast with collection id lock.
 func (c *Server) startBroadcastWithCollectionIDLock(ctx context.Context, collectionID int64) (broadcaster.BroadcastAPI, error) {
-	coll, err := c.broker.DescribeCollection(ctx, collectionID)
+	coll, err := c.meta.GetCollectionInfo(collectionID)
 	if err != nil {
 		return nil, err
 	}
 	broadcaster, err := broadcast.StartBroadcastWithResourceKeys(ctx,
-		message.NewSharedDBNameResourceKey(coll.GetDbName()),
-		message.NewExclusiveCollectionNameResourceKey(coll.GetDbName(), coll.GetCollectionName()),
+		message.NewSharedDBNameResourceKey(coll.DatabaseName),
+		message.NewExclusiveCollectionNameResourceKey(coll.DatabaseName, coll.Schema.GetName()),
 	)
 	if err != nil {
 		return nil, merr.Wrap(err, "failed to start broadcast with collection lock")

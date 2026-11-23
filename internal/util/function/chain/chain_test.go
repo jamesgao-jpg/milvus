@@ -31,6 +31,7 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/util/function/chain/types"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 )
 
 // =============================================================================
@@ -103,7 +104,7 @@ func (s *ChainTestSuite) createTestDataFrame() *DataFrame {
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, s.pool, []string{"age", "name"})
+	df, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "age", "name"))
 	s.Require().NoError(err)
 	return df
 }
@@ -878,6 +879,23 @@ func (s *ChainTestSuite) TestValidate_BuildError() {
 	s.Error(err)
 }
 
+func (s *ChainTestSuite) TestValidate_PreservesBuildErrorClassification() {
+	for _, cause := range []error{
+		merr.WrapErrParameterInvalidMsg("invalid limit"),
+		merr.WrapErrServiceInternalMsg("broken function"),
+	} {
+		fc := NewFuncChainWithAllocator(s.pool).SetStage(types.StageL2Rerank)
+		fc.addWithError(nil, cause)
+		err := fc.Validate()
+		s.ErrorIs(err, cause)
+		s.Equal(merr.Code(cause), merr.Code(err))
+		s.Equal(merr.GetErrorType(cause), merr.GetErrorType(err))
+	}
+	err := NewFuncChainWithAllocator(s.pool).SetStage(types.StageL2Rerank).Limit(0).Validate()
+	s.ErrorIs(err, merr.ErrParameterInvalid)
+	s.Equal(merr.InputError, merr.GetErrorType(err))
+}
+
 func (s *ChainTestSuite) TestValidate_MissingStage() {
 	// Chain without stage should fail validation
 	fc := NewFuncChainWithAllocator(s.pool).
@@ -1121,7 +1139,7 @@ func (s *ChainTestSuite) TestExecuteWithContext_Cancellation() {
 		ExecuteWithContext(goCtx, df)
 
 	s.Error(err)
-	s.Equal(context.Canceled, err)
+	s.ErrorIs(err, context.Canceled)
 }
 
 func (s *ChainTestSuite) TestExecuteWithContext_Success() {
@@ -1505,7 +1523,7 @@ func (s *ChainTestSuite) TestSortOp_StringColumn() {
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, s.pool, []string{"name"})
+	df, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "name"))
 	s.Require().NoError(err)
 	defer df.Release()
 
@@ -1566,7 +1584,7 @@ func (s *ChainTestSuite) TestSortOp_AllColumnsReordered() {
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, s.pool, []string{"age", "name"})
+	df, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "age", "name"))
 	s.Require().NoError(err)
 	defer df.Release()
 
@@ -1653,7 +1671,7 @@ func (s *ChainTestSuite) TestSortOp_MultipleChunksAllColumnsReordered() {
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, s.pool, []string{"value"})
+	df, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "value"))
 	s.Require().NoError(err)
 	defer df.Release()
 
@@ -2096,24 +2114,24 @@ func (s *MergeOpTestSuite) TestMergeOpMax_MixedMetrics_NoNormalize() {
 	s.InDelta(0.94, float64(scoreChunk.Value(0)), 0.01)
 }
 
-func (s *MergeOpTestSuite) TestClassifyMetricsOrder() {
-	mixed, desc := classifyMetricsOrder([]string{"COSINE", "L2"})
+func (s *MergeOpTestSuite) TestClassifyScoreOrder() {
+	mixed, desc := classifyScoreOrder([]string{"COSINE", "L2"}, nil)
 	s.True(mixed)
 	s.True(desc)
 
-	mixed, desc = classifyMetricsOrder([]string{"COSINE", "IP"})
+	mixed, desc = classifyScoreOrder([]string{"COSINE", "IP"}, nil)
 	s.False(mixed)
 	s.True(desc)
 
-	mixed, desc = classifyMetricsOrder([]string{"L2", "L2"})
+	mixed, desc = classifyScoreOrder([]string{"L2", "L2"}, nil)
 	s.False(mixed)
 	s.False(desc)
 
-	mixed, desc = classifyMetricsOrder([]string{"COSINE", "IP", "BM25"})
+	mixed, desc = classifyScoreOrder([]string{"COSINE", "IP", "BM25"}, nil)
 	s.False(mixed)
 	s.True(desc)
 
-	mixed, desc = classifyMetricsOrder([]string{"COSINE", "L2", "BM25"})
+	mixed, desc = classifyScoreOrder([]string{"COSINE", "L2", "BM25"}, nil)
 	s.True(mixed)
 	s.True(desc)
 }
@@ -2150,16 +2168,16 @@ func (s *MergeOpTestSuite) TestSortDescending() {
 }
 
 // =============================================================================
-// Additional MergeOp Tests: strategies, edge cases, Execute delegation
+// Additional MergeOp Tests: strategies, edge cases, single-input merging
 // =============================================================================
 
-func (s *MergeOpTestSuite) TestMergeOpExecuteDelegatesToExecuteMulti() {
+func (s *MergeOpTestSuite) TestMergeOpExecuteMultiSingleInput() {
 	df := s.createDataFrame([]int64{1, 2}, []float32{0.9, 0.8}, []int64{2})
 	defer df.Release()
 
 	op := NewMergeOp(MergeStrategyMax, WithNormalize(false))
 	ctx := types.NewFuncContextWithStage(s.pool, types.StageL2Rerank)
-	result, err := op.Execute(ctx, df)
+	result, err := op.ExecuteMulti(ctx, []*DataFrame{df})
 	s.Require().NoError(err)
 	defer result.Release()
 
@@ -2329,7 +2347,7 @@ func (s *MergeOpTestSuite) TestMergeOpFieldDataPropagated() {
 			},
 		},
 	}
-	df1, err := FromSearchResultData(resultData1, s.pool, []string{"category"})
+	df1, err := FromSearchResultData(resultData1, s.pool, testDataFrameInputPlan(resultData1, "category"))
 	s.Require().NoError(err)
 	defer df1.Release()
 
@@ -2348,7 +2366,7 @@ func (s *MergeOpTestSuite) TestMergeOpFieldDataPropagated() {
 			},
 		},
 	}
-	df2, err := FromSearchResultData(resultData2, s.pool, []string{"category"})
+	df2, err := FromSearchResultData(resultData2, s.pool, testDataFrameInputPlan(resultData2, "category"))
 	s.Require().NoError(err)
 	defer df2.Release()
 

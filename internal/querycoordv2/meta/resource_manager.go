@@ -35,9 +35,11 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v3/util/etcd"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/metricsinfo"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/retry"
 	"github.com/milvus-io/milvus/pkg/v3/util/syncutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
@@ -48,6 +50,9 @@ import (
 var errNodeNotEnough = errors.New("nodes not enough")
 
 type ResourceManager struct {
+	qviewListeners    map[uint64]func(string, []int64)
+	nextQViewListener uint64
+
 	incomingNode typeutil.UniqueSet // incomingNode is a temporary set for incoming hangup node,
 	// after node is assigned to resource group, it will be removed from this set.
 	groups    map[string]*ResourceGroup // primary index from resource group name to resource group
@@ -446,12 +451,15 @@ func (rm *ResourceManager) DropResourceGroup(ctx context.Context, rgName string)
 	// After recovering, all node assigned to these rg has been removed.
 	// no secondary index need to be removed.
 	delete(rm.groups, rgName)
+	rm.publishResourceGroupLocked(rgName, nil)
 	metrics.QueryCoordResourceGroupInfo.DeletePartialMatch(prometheus.Labels{
 		metrics.ResourceGroupLabelName: rgName,
 	})
 	metrics.QueryCoordResourceGroupReplicaTotal.DeletePartialMatch(prometheus.Labels{
 		metrics.ResourceGroupLabelName: rgName,
 	})
+	metrics.QueryCoordLoadDemandMemoryBytes.DeleteLabelValues(rgName)
+	metrics.QueryCoordLoadDemandDiskBytes.DeleteLabelValues(rgName)
 
 	mlog.Info(context.TODO(), "remove resource group",
 		mlog.String("rgName", rgName),
@@ -486,7 +494,7 @@ func (rm *ResourceManager) GetNodes(ctx context.Context, rgName string) ([]int64
 	return rm.groups[rgName].GetNodes(), nil
 }
 
-// GetResourceGroupByNodeID return whether resource group's node match required node count
+// VerifyNodeCount verifies that every required resource group has exactly the required number of nodes.
 func (rm *ResourceManager) VerifyNodeCount(ctx context.Context, requiredNodeCount map[string]int) error {
 	rm.rwmutex.RLock()
 	defer rm.rwmutex.RUnlock()
@@ -529,6 +537,18 @@ func (rm *ResourceManager) getResourceGroupByNodeID(nodeID int64) *ResourceGroup
 		return rm.groups[rgName]
 	}
 	return nil
+}
+
+// GetResourceGroupByNodeID returns the name of the resource group a node currently belongs to,
+// or an empty string if the node is not in any resource group (e.g. it already left the session).
+// The caller must hold no lock on rm when calling this.
+func (rm *ResourceManager) GetResourceGroupByNodeID(nodeID int64) string {
+	rm.rwmutex.RLock()
+	defer rm.rwmutex.RUnlock()
+	if rg := rm.getResourceGroupByNodeID(nodeID); rg != nil {
+		return rg.GetName()
+	}
+	return ""
 }
 
 // IsNodeSuspended checks whether a node is suspended.
@@ -1081,7 +1101,20 @@ func (rm *ResourceManager) unassignNode(ctx context.Context, node int64) (string
 		mrg.UnassignNode(node)
 		rg := mrg.ToResourceGroup()
 
-		if err := rm.catalog.SaveResourceGroup(ctx, rg.GetMeta()); err != nil {
+		// Saving the whole resource group is an unconditional overwrite, so it is
+		// safe to retry a transient etcd error (e.g. leader changed during an etcd
+		// restart) even if the failed attempt was applied. The retry is bounded
+		// because rm.rwmutex is held; a persistent failure still exits to reload
+		// a consistent state.
+		//
+		// A failed save exits the process, so the caller (e.g. a SuspendNode RPC
+		// whose client went away) must not decide it by canceling ctx. Each save
+		// keeps the metastore's own request timeout, which still aborts.
+		saveCtx := context.WithoutCancel(ctx)
+		err := retry.Do(saveCtx, func() error {
+			return rm.catalog.SaveResourceGroup(saveCtx, rg.GetMeta())
+		}, retry.RetryErr(etcd.IsRetriableEtcdErr))
+		if err != nil {
 			mlog.Fatal(context.TODO(), "unassign node from resource group",
 				mlog.String("rgName", rg.GetName()),
 				mlog.Int64("node", node),
@@ -1173,6 +1206,9 @@ func (rm *ResourceManager) validateResourceGroupIsDeletable(rgName string) error
 
 // setupInMemResourceGroup setup resource group in memory.
 func (rm *ResourceManager) setupInMemResourceGroup(r *ResourceGroup) {
+	metrics.QueryCoordLoadDemandMemoryBytes.WithLabelValues(r.GetName()).Add(0)
+	metrics.QueryCoordLoadDemandDiskBytes.WithLabelValues(r.GetName()).Add(0)
+
 	// clear old metrics and nodeIDMap entries.
 	// Use GetAllNodes (bypasses label filter) to ensure all physical nodes are cleaned up,
 	// even when the RG's label filter has changed.
@@ -1194,6 +1230,7 @@ func (rm *ResourceManager) setupInMemResourceGroup(r *ResourceGroup) {
 		rm.nodeIDMap[nodeID] = r.GetName()
 	}
 	rm.groups[r.GetName()] = r
+	rm.publishResourceGroupLocked(r.GetName(), r.GetNodes())
 }
 
 func (rm *ResourceManager) GetResourceGroupsJSON(ctx context.Context) string {
@@ -1243,5 +1280,28 @@ func (rm *ResourceManager) CheckNodesInResourceGroup(ctx context.Context) {
 		if !assignedNodes.Contain(node.ID()) {
 			rm.handleNodeUp(context.Background(), node.ID())
 		}
+	}
+}
+
+// RegisterResourceGroupListener atomically replays membership and subscribes to
+// committed changes. Callbacks must not re-enter the manager or perform I/O.
+func (rm *ResourceManager) RegisterResourceGroupListener(listener func(string, []int64)) func() {
+	rm.rwmutex.Lock()
+	if rm.qviewListeners == nil {
+		rm.qviewListeners = make(map[uint64]func(string, []int64))
+	}
+	rm.nextQViewListener++
+	id := rm.nextQViewListener
+	rm.qviewListeners[id] = listener
+	for name, group := range rm.groups {
+		listener(name, group.GetNodes())
+	}
+	rm.rwmutex.Unlock()
+	return func() { rm.rwmutex.Lock(); delete(rm.qviewListeners, id); rm.rwmutex.Unlock() }
+}
+
+func (rm *ResourceManager) publishResourceGroupLocked(name string, nodes []int64) {
+	for _, listener := range rm.qviewListeners {
+		listener(name, nodes)
 	}
 }

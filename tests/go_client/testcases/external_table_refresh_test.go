@@ -3,6 +3,7 @@ package testcases
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/url"
@@ -1318,12 +1319,12 @@ func TestExternalCollectionAdditionalVectorTakeOutput(t *testing.T) {
 	assertVectorRows(searchRes[0], "int8 search output")
 }
 
-func TestExternalCollectionSparseVectorCurrentlyRejected(t *testing.T) {
+func TestExternalCollectionSparseVectorSchema(t *testing.T) {
 	ctx := hp.CreateContext(t, time.Second*common.DefaultTimeout)
 	mc := hp.CreateDefaultMilvusClient(ctx, t)
 
 	minioCfg := getMinIOConfig()
-	collName := common.GenRandomString("ext_sparse_reject", 6)
+	collName := common.GenRandomString("ext_sparse", 6)
 	extPath := fmt.Sprintf("external-e2e-test/%s", collName)
 
 	schema := entity.NewSchema().
@@ -1335,8 +1336,16 @@ func TestExternalCollectionSparseVectorCurrentlyRejected(t *testing.T) {
 			WithExternalField("sparse_vec"))
 
 	err := mc.CreateCollection(ctx, client.NewCreateCollectionOption(collName, schema))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "does not support field type SparseFloatVector")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, mc.DropCollection(ctx, client.NewDropCollectionOption(collName)))
+	})
+	collection, err := mc.DescribeCollection(ctx, client.NewDescribeCollectionOption(collName))
+	require.NoError(t, err)
+	field := findFieldByName(collection.Schema.Fields, "sparse_vec")
+	require.NotNil(t, field)
+	require.Equal(t, entity.FieldTypeSparseVector, field.DataType)
+	require.Equal(t, "sparse_vec", field.ExternalField)
 }
 
 // TestExternalCollectionIncrementalRefresh tests that refreshing an external collection
@@ -2107,8 +2116,8 @@ func mapToEnvSlice(m map[string]string) []string {
 }
 
 // TestExternalCollectionLanceFormat tests external collections with lance-table format:
-//  1. Generate Lance dataset on MinIO using Python
-//  2. Create external collection with lance-table format
+//  1. Generate two Lance dataset versions with different rows on MinIO
+//  2. Create external collection with lance-table format pinned to the old version
 //  3. Refresh and wait for completion
 //  4. Create index and load collection
 //  5. Query count(*) and verify row count
@@ -2148,13 +2157,22 @@ func TestExternalCollectionLanceFormat(t *testing.T) {
 			fmt.Sprintf("%s/%s/", minioCfg.rootPath, extPath))
 	})
 
+	// Overwrite the fresh dataset to create v2 with only id=100000. Selecting
+	// v1 must still return the original 100000 rows, not the latest snapshot.
+	generateLanceDataOnMinIO(t, s3URI, externalDataSchemaBasic, 1, totalRows)
+	var spec map[string]any
+	require.NoError(t, json.Unmarshal([]byte(extTestSpec(minioCfg, "lance-table")), &spec))
+	spec["snapshot_id"] = "1"
+	specJSON, err := json.Marshal(spec)
+	require.NoError(t, err)
+
 	// ---------------------------------------------------------------
 	// Step 2: Create external collection with lance-table format
 	// ---------------------------------------------------------------
 	schema := entity.NewSchema().
 		WithName(collName).
 		WithExternalSource(extTestURI(minioCfg, extPath)).
-		WithExternalSpec(extTestSpec(minioCfg, "lance-table")).
+		WithExternalSpec(string(specJSON)).
 		WithField(
 			entity.NewField().
 				WithName("id").
@@ -3822,8 +3840,8 @@ func TestRefreshExternalCollectionMilvusTableSnapshot(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(deletedCount), delRes.DeleteCount)
 
-	// Wait for the standalone flush rate limiter to reset before flushing
-	// the delete log. The local default is 0.1 flush requests per second.
+	// Allow time for the deployment's per-collection flush quota to replenish
+	// before flushing the delete log.
 	time.Sleep(10 * time.Second)
 
 	flushTask, err = mc.Flush(ctx, client.NewFlushOption(sourceName))
@@ -3959,8 +3977,8 @@ func TestRefreshExternalCollectionMilvusTableSnapshotVirtualPK(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(deletedCount), delRes.DeleteCount)
 
-	// Wait for the standalone flush rate limiter to reset before flushing
-	// the delete log. The local default is 0.1 flush requests per second.
+	// Allow time for the deployment's per-collection flush quota to replenish
+	// before flushing the delete log.
 	time.Sleep(10 * time.Second)
 
 	flushTask, err = mc.Flush(ctx, client.NewFlushOption(sourceName))

@@ -1,4 +1,5 @@
 import random
+import time
 
 import numpy as np
 import pytest
@@ -114,6 +115,43 @@ class TestMilvusClientPartialUpdateValid(TestMilvusClientV2Base):
         assert len(result) == default_nb
 
         self.drop_collection(client, collection_name)
+
+    @pytest.mark.tags(CaseLabel.L1)
+    @pytest.mark.parametrize("string_pk", [False, True])
+    @pytest.mark.parametrize("existing_row", [False, True])
+    def test_milvus_client_partial_update_after_idle(self, string_pk, existing_row):
+        """An unchanged snapshot remains valid after the CAS history TTL expires."""
+        client = self._client()
+        name = cf.gen_collection_name_by_testcase_name(module_index=1)
+        schema = self.create_schema(client, enable_dynamic_field=False)[0]
+        if string_pk:
+            schema.add_field("id", DataType.VARCHAR, is_primary=True, max_length=64)
+        else:
+            schema.add_field("id", DataType.INT64, is_primary=True)
+        schema.add_field("vector", DataType.FLOAT_VECTOR, dim=PU_DEFAULT_DIM)
+        schema.add_field("value", DataType.INT64)
+        indexes = self.prepare_index_params(client)[0]
+        indexes.add_index("vector", index_type="FLAT", metric_type="L2")
+        self.create_collection(client, name, schema=schema, index_params=indexes, consistency_level="Strong")
+        pk = "idle-pk" if string_pk else 1
+        row = {"id": pk, "vector": [1.0, 0.0, 0.0, 0.0], "value": 1}
+        try:
+            if existing_row:
+                self.upsert(client, name, [row], partial_update=True)
+            # Exceed the SN PK-version index's 30-second reclamation TTL.
+            # Do not flush or write during this interval: either could advance
+            # the query frontier and hide the idle-snapshot regression.
+            time.sleep(36)
+            update = {"id": pk, "value": 2} if existing_row else dict(row, value=2)
+            result = self.upsert(client, name, [update], partial_update=True)[0]
+            assert result["upsert_count"] == 1
+            result = self.query(client, name, filter="", output_fields=["id", "value", "vector"], limit=10)[0]
+            assert len(result) == 1
+            assert result[0]["id"] == pk
+            assert result[0]["value"] == 2
+            assert result[0]["vector"] == row["vector"]
+        finally:
+            self.drop_collection(client, name)
 
     @pytest.mark.tags(CaseLabel.L1)
     def test_milvus_client_partial_update_with_all_datatype(self):
@@ -516,9 +554,20 @@ class TestMilvusClientPartialUpdateValid(TestMilvusClientV2Base):
         assert baseline["indexed_ids"] == [0]
         assert baseline["element_keys"] == [(0, 0), (0, 1), (3, 0)]
 
-        compact_id = self.compact(client, collection_name)[0]
-        assert compact_id > 0
+        # Flush does not wait for sort compaction. Index readiness lets sorting
+        # finish, but automatic compaction may still temporarily own the segments.
+        assert self.wait_for_index_ready(client, collection_name, index_name="vector", timeout=300), (
+            f"vector index still has pending rows for {collection_name}"
+        )
+        compact_id = -1
+        deadline = time.monotonic() + 120
+        while compact_id == -1 and (remaining := deadline - time.monotonic()) > 0:
+            compact_id, _ = self.compact(client, collection_name, timeout=remaining)
+            if compact_id == -1:
+                time.sleep(min(2, max(0, deadline - time.monotonic())))
+        assert compact_id > 0, f"no compaction accepted for {collection_name} within 120s: compact_id={compact_id}"
         assert self.wait_for_compaction_ready(client, compact_id, timeout=300)
+        assert collect_observations() == baseline
         self.release_collection(client, collection_name)
         self.load_collection(client, collection_name)
         assert collect_observations() == baseline
@@ -2682,7 +2731,7 @@ class TestMilvusClientPartialUpdateInvalid(TestMilvusClientV2Base):
         )
         error = {
             ct.err_code: 1100,
-            ct.err_msg: f"fieldSchema({default_vector_field_name}) has no corresponding fieldData pass in: invalid parameter",
+            ct.err_msg: f'missing required field "{default_vector_field_name}": invalid parameter',
         }
         self.upsert(
             client, collection_name, rows, partial_update=True, check_task=CheckTasks.err_res, check_items=error
@@ -2775,10 +2824,12 @@ class TestMilvusClientPartialUpdateInvalid(TestMilvusClientV2Base):
             schema=schema,
             desired_field_names=[default_primary_key_field_name, default_string_field_name],
         )
-        error = {ct.err_code: 101, ct.err_msg: "failed to query: collection not loaded"}
-        self.upsert(
+        error = {ct.err_code: 101, ct.err_msg: "collection not loaded"}
+        response, _ = self.upsert(
             client, collection_name, new_row, partial_update=True, check_task=CheckTasks.err_res, check_items=error
         )
+        # err_res checks the message only; also enforce the public business code.
+        assert response.code == error[ct.err_code], response
 
         self.drop_collection(client, collection_name)
 
@@ -2826,7 +2877,7 @@ class TestMilvusClientPartialUpdateInvalid(TestMilvusClientV2Base):
         )
         error = {
             ct.err_code: 1100,
-            ct.err_msg: f"fieldSchema({default_int32_field_name}) has no corresponding fieldData pass in: invalid parameter",
+            ct.err_msg: f'missing required field "{default_int32_field_name}": invalid parameter',
         }
         self.upsert(
             client, collection_name, new_rows, partial_update=True, check_task=CheckTasks.err_res, check_items=error
@@ -2928,7 +2979,7 @@ class TestMilvusClientPartialUpdateInvalid(TestMilvusClientV2Base):
         )
         error = {
             ct.err_code: 1100,
-            ct.err_msg: f"fieldSchema({default_int32_field_name}) has no corresponding fieldData pass in: invalid parameter",
+            ct.err_msg: f'missing required field "{default_int32_field_name}": invalid parameter',
         }
         self.upsert(
             client,
@@ -3044,7 +3095,7 @@ class TestMilvusClientPartialUpdateInvalid(TestMilvusClientV2Base):
         ]
         error = {
             ct.err_code: 1100,
-            ct.err_msg: f"fieldSchema({default_vector_field_name}) has no corresponding fieldData pass in: invalid parameter",
+            ct.err_msg: f'missing required field "{default_vector_field_name}": invalid parameter',
         }
         self.upsert(
             client, collection_name, mixed_rows, partial_update=True, check_task=CheckTasks.err_res, check_items=error

@@ -83,23 +83,19 @@ func NewMergeOpFromReprWithContext(repr *OperatorRepr, buildCtx types.FunctionBu
 		return nil, merr.WrapErrServiceInternal("merge_op: search runtime metric types are empty")
 	}
 
-	opts := []MergeOption{withExpectedInputs(len(metricTypes))}
+	opts := []MergeOption{withExpectedInputs(len(metricTypes)), WithScoresRewritten(buildCtx.Search.ScoresRewritten)}
 	switch spec.strategy {
 	case MergeStrategyRRF:
 		opts = append(opts, WithRRFK(spec.rrfK))
+		if err := validateMergeInputCount(spec, len(metricTypes)); err != nil {
+			return nil, err
+		}
 		if spec.weightsSet {
-			if len(spec.weights) != len(metricTypes) {
-				return nil, merr.WrapErrParameterInvalidMsg(
-					"merge_op: weights count %d does not match search input count %d",
-					len(spec.weights), len(metricTypes))
-			}
 			opts = append(opts, WithWeights(spec.weights))
 		}
 	case MergeStrategyWeighted:
-		if len(spec.weights) != len(metricTypes) {
-			return nil, merr.WrapErrParameterInvalidMsg(
-				"merge_op: weights count %d does not match search input count %d",
-				len(spec.weights), len(metricTypes))
+		if err := validateMergeInputCount(spec, len(metricTypes)); err != nil {
+			return nil, err
 		}
 		opts = append(opts,
 			WithWeights(spec.weights),
@@ -114,6 +110,29 @@ func NewMergeOpFromReprWithContext(repr *OperatorRepr, buildCtx types.FunctionBu
 	}
 
 	return NewMergeOp(spec.strategy, opts...), nil
+}
+
+// ValidateMergeOpRepr validates declarative Merge parameters without requiring
+// runtime search metrics. expectedInputs is supplied by the endpoint from the
+// number of recall inputs, allowing plans with explicit weights to fail before
+// execution.
+func ValidateMergeOpRepr(repr *OperatorRepr, expectedInputs int) error {
+	spec, err := parseMergeSpec(repr)
+	if err != nil {
+		return err
+	}
+	return validateMergeInputCount(spec, expectedInputs)
+}
+
+func validateMergeInputCount(spec *mergeSpec, expectedInputs int) error {
+	requiresMatchingWeights := spec.strategy == MergeStrategyWeighted ||
+		(spec.strategy == MergeStrategyRRF && spec.weightsSet)
+	if requiresMatchingWeights && len(spec.weights) != expectedInputs {
+		return merr.WrapErrParameterInvalidMsg(
+			"merge_op: weights count %d does not match search input count %d",
+			len(spec.weights), expectedInputs)
+	}
+	return nil
 }
 
 func parseMergeSpec(repr *OperatorRepr) (*mergeSpec, error) {
@@ -247,6 +266,7 @@ type mergeConfig struct {
 	weightsSet      bool
 	rrfK            float64
 	metricTypes     []string
+	scoresRewritten []bool
 	normalize       bool
 	forceDescending bool
 	expectedInputs  int
@@ -254,6 +274,12 @@ type mergeConfig struct {
 
 // MergeOption is a functional option for MergeOp.
 type MergeOption func(*mergeConfig)
+
+func WithScoresRewritten(rewritten []bool) MergeOption {
+	return func(cfg *mergeConfig) {
+		cfg.scoresRewritten = append([]bool(nil), rewritten...)
+	}
+}
 
 // WithWeights sets the per-input weights for weighted or RRF merge strategy.
 func WithWeights(weights []float64) MergeOption {
@@ -321,7 +347,7 @@ func NewMergeOp(strategy MergeStrategy, opts ...MergeOption) *MergeOp {
 	sortDesc := true
 	var normFuncs []normalizeFunc
 	if len(cfg.metricTypes) > 0 {
-		sortDesc, normFuncs = resolveMergeBehavior(cfg.normalize, cfg.forceDescending, cfg.metricTypes)
+		sortDesc, normFuncs = resolveMergeScoreBehavior(cfg.normalize, cfg.forceDescending, cfg.metricTypes, cfg.scoresRewritten)
 	}
 
 	return &MergeOp{
@@ -351,9 +377,10 @@ func (op *MergeOp) String() string {
 	return fmt.Sprintf("Merge(%s)", op.strategy)
 }
 
-// Execute delegates to ExecuteMulti with a single input.
-func (op *MergeOp) Execute(ctx *types.FuncContext, input *DataFrame) (*DataFrame, error) {
-	return op.ExecuteMulti(ctx, []*DataFrame{input})
+// Execute cannot describe multi-input fusion with single-input row selection.
+// FuncChain dispatches MergeOp through ExecuteMulti, including one-input merges.
+func (op *MergeOp) Execute(ctx *types.FuncContext, input *DataFrame) (*OperatorResult, error) {
+	return nil, merr.WrapErrServiceInternalMsg("merge_op: use ExecuteMulti for merge execution")
 }
 
 // ExecuteMulti merges multiple DataFrames into one.
@@ -875,7 +902,7 @@ func (op *MergeOp) scoreNormFunc(inputIdx int) normalizeFunc {
 	return nil
 }
 
-// resolveMergeBehavior pre-computes the sort direction and per-input normalization
+// resolveMergeScoreBehavior pre-computes the sort direction and per-input normalization
 // functions from the construction-time config. This is called once in NewMergeOp
 // so that the execution path has no metric-type branching.
 //
@@ -885,41 +912,54 @@ func (op *MergeOp) scoreNormFunc(inputIdx int) normalizeFunc {
 // can validate input count. Entries may be nil (no-op for that input).
 //
 // Decision matrix:
-//   - normalize=true: full range normalization per metric → DESC sort.
-//   - normalize=false, mixed metrics OR forceDescending=true: direction-only
-//     conversion (atan for distance metrics, identity for similarity metrics)
-//     → DESC sort.
-//   - normalize=false, single direction: no conversion, sort by metric's
-//     natural order.
-func resolveMergeBehavior(normalize, forceDescending bool, metricTypes []string) (bool, []normalizeFunc) {
+//   - normalize=true: rewritten scores use IP-style normalization; untouched
+//     scores use the original metric's normalization → DESC sort.
+//   - normalize=false, mixed effective directions OR forceDescending=true:
+//     convert only untouched distances via atan; rewritten scores and raw
+//     similarity scores retain their scale → DESC sort.
+//   - normalize=false, single effective direction: no conversion; sort by that
+//     direction. Rewritten scores are always larger-is-better.
+func resolveMergeScoreBehavior(normalize, forceDescending bool, metricTypes []string, rewritten []bool) (bool, []normalizeFunc) {
 	normFuncs := make([]normalizeFunc, len(metricTypes))
 
 	if normalize {
 		for i, m := range metricTypes {
-			normFuncs[i] = getNormalizeFunc(m)
+			if isScoreRewritten(rewritten, i) {
+				// Rewritten business scores are larger-is-better and may have
+				// any scale, regardless of the original search metric.
+				normFuncs[i] = getNormalizeFunc(metric.IP)
+			} else {
+				normFuncs[i] = getNormalizeFunc(m)
+			}
 		}
 		return true, normFuncs
 	}
 
-	mixed, sortDescending := classifyMetricsOrder(metricTypes)
+	mixed, sortDescending := classifyScoreOrder(metricTypes, rewritten)
 	if mixed || forceDescending {
 		for i, m := range metricTypes {
-			normFuncs[i] = getDirectionConvertFunc(m)
+			if !isScoreRewritten(rewritten, i) {
+				normFuncs[i] = getDirectionConvertFunc(m)
+			}
 		}
 		return true, normFuncs
 	}
 
-	// Non-mixed: all normFuncs stay nil (no-op), sort by metric's natural order.
+	// Non-mixed: no conversion; sort by the effective score direction.
 	return sortDescending, normFuncs
 }
 
-// classifyMetricsOrder inspects the given metrics and determines
-// whether they contain mixed types and what the sorting order should be.
-func classifyMetricsOrder(metricTypes []string) (mixed bool, sortDescending bool) {
+func isScoreRewritten(rewritten []bool, index int) bool {
+	return index < len(rewritten) && rewritten[index]
+}
+
+// classifyScoreOrder uses larger-is-better for rewritten scores and the
+// original metric direction for untouched scores. Mixed directions sort DESC.
+func classifyScoreOrder(metricTypes []string, rewritten []bool) (mixed bool, sortDescending bool) {
 	countLargerIsBetter := 0
 	countSmallerIsBetter := 0
-	for _, m := range metricTypes {
-		if metric.PositivelyRelated(m) {
+	for index, m := range metricTypes {
+		if isScoreRewritten(rewritten, index) || metric.PositivelyRelated(m) {
 			countLargerIsBetter++
 		} else {
 			countSmallerIsBetter++

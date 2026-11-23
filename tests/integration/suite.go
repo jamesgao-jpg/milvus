@@ -62,10 +62,11 @@ func caseTimeoutFromEnvironment(getenv func(string) string) (time.Duration, erro
 type MiniClusterSuite struct {
 	suite.Suite
 
-	envConfigs map[string]string
-	Cluster    *cluster.MiniClusterV3
-	cancelFunc context.CancelFunc
-	opt        clusterSuiteOption
+	envConfigs     map[string]string
+	clusterOptions []cluster.MiniClusterV3Option
+	Cluster        *cluster.MiniClusterV3
+	cancelFunc     context.CancelFunc
+	opt            clusterSuiteOption
 }
 
 // WorkDir returns the work directory of the cluster.
@@ -95,6 +96,11 @@ func (s *MiniClusterSuite) WithOptions(options ...ClusterSuiteOption) {
 	}
 }
 
+// WithClusterOptions configures subprocess fixtures before cluster creation.
+func (s *MiniClusterSuite) WithClusterOptions(options ...cluster.MiniClusterV3Option) {
+	s.clusterOptions = append(s.clusterOptions, options...)
+}
+
 // SetupSuite initializes the MiniClusterSuite by setting up the environment and starting the cluster.
 // After it is called, the cluster is ready for tests.
 func (s *MiniClusterSuite) SetupSuite() {
@@ -104,7 +110,7 @@ func (s *MiniClusterSuite) SetupSuite() {
 	ctx, cancel := context.WithTimeout(context.Background(), caseTimeout) //nolint:gosec // cancel is stored and called in TearDownSuite()
 	s.cancelFunc = cancel
 
-	s.Cluster = cluster.NewMiniClusterV3(ctx, cluster.WithExtraEnv(s.envConfigs), cluster.WithWorkDir(s.WorkDir()))
+	s.Cluster = cluster.NewMiniClusterV3(ctx, append([]cluster.MiniClusterV3Option{cluster.WithExtraEnv(s.envConfigs), cluster.WithWorkDir(s.WorkDir())}, s.clusterOptions...)...)
 	s.T().Log("Setup test success")
 }
 
@@ -125,25 +131,10 @@ func (s *MiniClusterSuite) TearDownSuite() {
 		Type: milvuspb.ShowType_InMemory,
 	})
 	if err == nil {
-		wg := sync.WaitGroup{}
-		for idx, collectionName := range resp.GetCollectionNames() {
-			wg.Add(1)
-			idx := idx
-			collectionName := collectionName
-			func() {
-				defer wg.Done()
-				if resp.GetInMemoryPercentages()[idx] == 100 || resp.GetQueryServiceAvailable()[idx] {
-					status, err := s.Cluster.MilvusClient.ReleaseCollection(context.Background(), &milvuspb.ReleaseCollectionRequest{
-						CollectionName: collectionName,
-					})
-					err = merr.CheckRPCCall(status, err)
-					s.NoError(err)
-					collectionID := resp.GetCollectionIds()[idx]
-					s.CheckCollectionCacheReleased(collectionID)
-				}
-			}()
+		for _, result := range releaseLoadedCollections(context.Background(), s.Cluster.MilvusClient, resp) {
+			s.NoError(result.err, "release collection %s", result.name)
+			s.CheckCollectionCacheReleased(result.id)
 		}
-		wg.Wait()
 	}
 	s.T().Log("Tear Down test...")
 	defer s.cancelFunc()
@@ -151,4 +142,39 @@ func (s *MiniClusterSuite) TearDownSuite() {
 		s.Cluster.Stop()
 		s.Cluster = nil
 	}
+}
+
+type collectionReleaseResult struct {
+	name string
+	id   int64
+	err  error
+}
+
+// releaseLoadedCollections returns every selected collection in the original
+// order, including failed releases. Cache checks and test assertions stay in
+// the calling test goroutine.
+func releaseLoadedCollections(ctx context.Context, client milvuspb.MilvusServiceClient, collections *milvuspb.ShowCollectionsResponse) []collectionReleaseResult {
+	results := make([]collectionReleaseResult, 0, len(collections.GetCollectionNames()))
+	for i, name := range collections.GetCollectionNames() {
+		if collections.GetInMemoryPercentages()[i] == 100 || collections.GetQueryServiceAvailable()[i] {
+			results = append(results, collectionReleaseResult{name: name, id: collections.GetCollectionIds()[i]})
+		}
+	}
+	const concurrency = 4
+	slots := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for i := range results {
+		slots <- struct{}{}
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-slots }()
+			status, err := client.ReleaseCollection(ctx, &milvuspb.ReleaseCollectionRequest{
+				CollectionName: results[i].name,
+			})
+			results[i].err = merr.CheckRPCCall(status, err)
+		}(i)
+	}
+	wg.Wait()
+	return results
 }

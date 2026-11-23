@@ -18,16 +18,25 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
 	"github.com/milvus-io/milvus/internal/datacoord"
+	pkindexservice "github.com/milvus-io/milvus/internal/datacoord/pkindex/service"
+	"github.com/milvus-io/milvus/internal/featureusage"
+	internalhttp "github.com/milvus-io/milvus/internal/http"
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
 	"github.com/milvus-io/milvus/internal/kv/tikv"
+	"github.com/milvus-io/milvus/internal/metacache"
+	dccatalog "github.com/milvus-io/milvus/internal/metastore/kv/datacoord"
 	"github.com/milvus-io/milvus/internal/querycoordv2"
 	"github.com/milvus-io/milvus/internal/rootcoord"
+	"github.com/milvus-io/milvus/internal/storage"
 	streamingcoord "github.com/milvus-io/milvus/internal/streamingcoord/server"
 	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/internal/util/adminauth"
 	"github.com/milvus-io/milvus/internal/util/dependency"
 	"github.com/milvus-io/milvus/internal/util/pathutil"
 	"github.com/milvus-io/milvus/internal/util/proxyutil"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
+	"github.com/milvus-io/milvus/internal/views/coord/balancer"
+	qvresource "github.com/milvus-io/milvus/internal/views/coord/resource"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/kv"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
@@ -35,9 +44,11 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/pkindexpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/proxypb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/rootcoordpb"
+	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v3/util"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/metricsinfo"
@@ -61,15 +72,25 @@ type mixCoordImpl struct {
 	tikvCli *txnkv.Client
 	address string
 
-	proxyCreator       proxyutil.ProxyCreator
-	proxyWatcher       *proxyutil.ProxyWatcher
-	proxyClientManager proxyutil.ProxyClientManagerInterface
+	// stopTiKVGC stops the GC of a TiKV meta store, which runs on the active
+	// replica only; see startTiKVGCWorker.
+	stopTiKVGC func()
+
+	proxyCreator proxyutil.ProxyCreator
+	proxyWatcher *proxyutil.ProxyWatcher
 
 	metricsCacheManager *metricsinfo.MetricsCacheManager
 	stateCode           atomic.Int32
-	initOnce            sync.Once
-	startOnce           sync.Once
-	session             *sessionutil.Session
+
+	// onActive holds callbacks to run once this replica becomes ACTIVE -
+	// after initInternal has built the sub-coordinators and the state moved
+	// to Healthy. A standby replica never fires them; see OnActive.
+	onActiveMu sync.Mutex
+	onActive   []func()
+	activated  bool
+	initOnce   sync.Once
+	startOnce  sync.Once
+	session    *sessionutil.Session
 
 	factory dependency.Factory
 
@@ -77,6 +98,19 @@ type mixCoordImpl struct {
 
 	metaKVCreator  func() kv.MetaKv
 	mixCoordClient types.MixCoordClient
+
+	// rootCredentialVerifier backs the management-plane HTTP basic-auth gate.
+	// Set in initInternal, unregistered in Stop.
+	rootCredentialVerifier *adminauth.CachedRootVerifier
+
+	// metaStore is the shared metacache backing DataCoord (read-write) and
+	// QueryCoord (read-only) segment/collection metadata.
+	metaStore metacache.MetaStore
+
+	// pkindexService is the primary key index manifest service. It exists
+	// before activation so that the gRPC server can register it, and it gets
+	// its manager when datacoord starts.
+	pkindexService *pkindexservice.Service
 
 	// POSIX directory cleanup task
 	posixCleanupCancel    context.CancelFunc
@@ -86,21 +120,25 @@ type mixCoordImpl struct {
 
 	// file resource observer
 	fileResourceObserver *FileResourceObserver
+
+	recoveryBarrier *recoveryBarrier
 }
 
 func NewMixCoordServer(c context.Context, factory dependency.Factory) (*mixCoordImpl, error) {
-	ctx, cancel := context.WithCancel(c)
+	ctx, cancel := context.WithCancel(c) //nolint:gosec // cancel is stored below and called in Stop
 	rootCoordServer, _ := rootcoord.NewCore(ctx, factory)
 	queryCoordServer, _ := querycoordv2.NewQueryCoord(c)
-	dataCoordServer := datacoord.CreateServer(c, factory)
+
+	recoveryBarrier := newRecoveryBarrier()
 
 	return &mixCoordImpl{
 		ctx:              ctx,
 		cancel:           cancel,
 		rootcoordServer:  rootCoordServer,
 		queryCoordServer: queryCoordServer,
-		datacoordServer:  dataCoordServer,
 		factory:          factory,
+		recoveryBarrier:  recoveryBarrier,
+		pkindexService:   pkindexservice.New(),
 	}, nil
 }
 
@@ -150,20 +188,44 @@ func (s *mixCoordImpl) activateFunc() error {
 		return err
 	}
 	mlog.Info(s.ctx, "mixCoord startup success", mlog.String("address", s.session.GetAddress()))
-	s.startAndUpdateHealthy()
+	s.enableExternalAccess()
 	return err
 }
 
 func (s *mixCoordImpl) initInternal() error {
+	// Create catalog and MetaStore — MetaStore owns the catalog.
+	metaKV := s.metaKVCreator()
+	var metaRootPath string
+	if Params.MetaStoreCfg.MetaStoreType.GetValue() == util.MetaStoreTypeTiKV {
+		metaRootPath = Params.TiKVCfg.MetaRootPath.GetValue()
+	} else {
+		metaRootPath = Params.EtcdCfg.MetaRootPath.GetValue()
+	}
+	// The catalog rebuilds text log paths against the chunk manager's root, so
+	// it must use the same root the persistent chunk manager is built with.
+	catalog := dccatalog.NewCatalog(metaKV, storage.PersistentStorageRootPath(Params), metaRootPath)
+	s.metaStore = metacache.NewMetaStore(catalog)
+
+	// Create DC server with MetaStore injected via constructor option.
+	s.datacoordServer = datacoord.CreateServer(s.ctx, s.factory, datacoord.WithMetaStore(s.metaStore), datacoord.WithCatalog(catalog),
+		datacoord.WithPKIndexService(s.pkindexService))
+	s.datacoordServer.SetRestoreCollectionManager(s.rootcoordServer)
+	s.datacoordServer.SetDataViewCollectionRecoveryValidator(s.rootcoordServer.ValidateDataViewCollectionForRecovery)
+	s.datacoordServer.SetCollectionDroppedChecker(s.rootcoordServer.IsCollectionDropped)
+	s.datacoordServer.SetSession(s.session)
+	s.datacoordServer.SetAddress(s.address)
+	s.datacoordServer.SetEtcdClient(s.etcdCli)
+	if s.tikvCli != nil {
+		s.datacoordServer.SetTiKVClient(s.tikvCli)
+	}
+
 	s.rootcoordServer.SetMixCoord(s)
 	s.datacoordServer.SetMixCoord(s)
 	s.queryCoordServer.SetMixCoord(s)
+	s.queryCoordServer.SetMetaView(s.metaStore)
 	s.fileResourceObserver = NewFileResourceObserver(s.ctx)
 
-	// Register WAL callbacks
-	RegisterWALCallbacks(s)
-
-	if err := s.streamingCoord.Start(s.ctx, s.fileResourceObserver); err != nil {
+	if err := s.streamingCoord.Start(s.ctx); err != nil {
 		mlog.Error(s.ctx, "streamCoord start failed", mlog.Err(err))
 		return err
 	}
@@ -175,44 +237,56 @@ func (s *mixCoordImpl) initInternal() error {
 	}
 	s.fileResourceObserver.InitProxy(s.rootcoordServer.GetProxyClientManager())
 
+	// RootCoord's MetaTable, loaded in Init, owns collection metadata.
+	// DataCoord and QueryCoord read it through the shared MetaStore.
+	collectionSource, err := s.rootcoordServer.CollectionSource()
+	if err != nil {
+		mlog.Error(s.ctx, "rootCoord collection source unavailable", mlog.Err(err))
+		return err
+	}
+	s.metaStore.SetCollectionSource(collectionSource)
+
 	if err := s.rootcoordServer.Start(); err != nil {
 		mlog.Error(s.ctx, "rootCoord start failed", mlog.Err(err))
 		return err
 	}
 
-	// DataCoord and QueryCoord are independent of each other;
-	// both only depend on RootCoord being ready. Initialize and start them in parallel.
-	g, _ := errgroup.WithContext(s.ctx)
-	g.Go(func() error {
-		s.datacoordServer.SetFileResourceObserver(s.fileResourceObserver)
-		if err := s.datacoordServer.Init(); err != nil {
-			mlog.Error(s.ctx, "dataCoord init failed", mlog.Err(err))
-			return err
-		}
-		if err := s.datacoordServer.Start(); err != nil {
-			mlog.Error(s.ctx, "dataCoord start failed", mlog.Err(err))
-			return err
-		}
-		return nil
-	})
-	g.Go(func() error {
-		s.queryCoordServer.SetFileResourceObserver(s.fileResourceObserver)
-		if err := s.queryCoordServer.Init(); err != nil {
-			mlog.Error(s.ctx, "queryCoord init failed", mlog.Err(err))
-			return err
-		}
-		if err := s.queryCoordServer.Start(); err != nil {
-			mlog.Error(s.ctx, "queryCoord start failed", mlog.Err(err))
-			return err
-		}
-		return nil
-	})
-	if err := g.Wait(); err != nil {
+	// Register a password verifier for /management/* HTTP basic auth: a mix
+	// coord process does not host the proxy package, where the verifier is
+	// otherwise registered, so without this the gate answers 503 to root as
+	// well as to attackers once adminAuthEnabled is on.
+	//
+	// It goes through the shared cache rather than straight to rootcoord's
+	// credential RPC, which reads the metastore on every call: the gated
+	// endpoints answer unauthenticated callers, so binding directly would let
+	// anyone who can reach port 9091 drive etcd load into the coordinator.
+	s.rootCredentialVerifier = adminauth.NewCachedRootVerifier(s.fetchRootHash)
+	internalhttp.RegisterManagementVerifier(internalhttp.VerifierSlotCoordinator, s.rootCredentialVerifier.Verify)
+
+	if err := s.initDataAndQueryCoord(); err != nil {
 		return err
 	}
 
 	s.fileResourceObserver.Start()
 	return nil
+}
+
+func (s *mixCoordImpl) enableExternalAccess() {
+	// Register the callback dependencies before RootCoord callbacks, which may
+	// invoke DataCoord or QueryCoord callbacks while handling collection DDLs.
+	datacoord.RegisterDDLCallbacks(s.datacoordServer)
+	querycoordv2.RegisterDDLCallbacks(s.queryCoordServer)
+	rootcoord.RegisterDDLCallbacks(s.rootcoordServer)
+	RegisterWALCallbacks(s)
+
+	// Publish Healthy only after every callback is registered. The distributed
+	// server waits on the barrier below before it starts serving external RPCs.
+	s.startAndUpdateHealthy()
+	s.recoveryBarrier.Ready()
+}
+
+func (s *mixCoordImpl) WaitForRecovery(ctx context.Context) error {
+	return s.recoveryBarrier.Wait(ctx)
 }
 
 func (s *mixCoordImpl) initKVCreator() {
@@ -241,14 +315,77 @@ func (s *mixCoordImpl) Start() error {
 // - `activateFunc` when enableActiveStandBy is true
 func (s *mixCoordImpl) startAndUpdateHealthy() {
 	s.UpdateStateCode(commonpb.StateCode_Healthy)
+	// task-creation feature counters (see internal/featureusage)
+	featureusage.SetEnabled(Params.CommonCfg.FeatureUsageCountersEnabled.GetAsBool())
 	s.startPosixCleanupTask()
+	s.startTiKVGCWorker()
 	RegisterMgrRoute(s)
+
+	s.onActiveMu.Lock()
+	s.activated = true
+	fns := s.onActive
+	s.onActive = nil
+	s.onActiveMu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
+}
+
+// OnActive runs fn once this replica is ACTIVE: sub-coordinators initialized,
+// state Healthy. A callback registered after activation runs immediately; one
+// registered on a replica that stays standby never runs, which is the point -
+// work hung off this hook (a coordinator engine doing resource-group
+// accounting, say) must run on exactly one replica, and before activation the
+// sub-coordinators it would read are not initialized at all.
+func (s *mixCoordImpl) OnActive(fn func()) {
+	s.onActiveMu.Lock()
+	if s.activated {
+		s.onActiveMu.Unlock()
+		fn()
+		return
+	}
+	s.onActive = append(s.onActive, fn)
+	s.onActiveMu.Unlock()
 }
 
 func (s *mixCoordImpl) IsServerActive(serverID int64) bool {
+	if s.datacoordServer != nil && s.datacoordServer.ServerExist(serverID) {
+		return true
+	}
 	return s.queryCoordServer.ServerExist(serverID) ||
-		s.datacoordServer.ServerExist(serverID) ||
 		s.rootcoordServer.ServerExist(serverID)
+}
+
+// fetchRootHash reads root's stored bcrypt hash from the rootcoord embedded in
+// this mix coord.
+//
+// This is not a cheap in-process getter: Catalog.GetCredential does an
+// unconditional Txn.Load against the metastore and bumps the DDL request
+// counters, so it must never run once per request. adminauth.CachedRootVerifier
+// is what keeps that from happening.
+func (s *mixCoordImpl) fetchRootHash(ctx context.Context) (string, error) {
+	resp, err := s.rootcoordServer.GetCredential(ctx, &rootcoordpb.GetCredentialRequest{
+		Username: util.UserRoot,
+	})
+	if err != nil {
+		mlog.Warn(ctx, "fetch root credential failed", mlog.Err(err))
+		return "", merr.Wrap(err, "GetCredential failed")
+	}
+	return adminauth.RootHashFromResponse(resp)
+}
+
+func (s *mixCoordImpl) DropCollectionDataView(ctx context.Context, collectionID int64) error {
+	return s.datacoordServer.DropCollectionDataView(ctx, collectionID)
+}
+
+func (s *mixCoordImpl) CreateCollectionDataView(ctx context.Context, collectionID int64, vchannels []string) error {
+	_, err := s.datacoordServer.CreateCollectionDataView(ctx, collectionID, vchannels)
+	return err
+}
+
+func (s *mixCoordImpl) CreateCollectionDataViewWithTransformStarts(ctx context.Context, result message.BroadcastResultCreateCollectionMessageV1) error {
+	_, err := s.datacoordServer.CreateCollectionDataViewWithTransformStarts(ctx, result)
+	return err
 }
 
 func (s *mixCoordImpl) checkExpiredPOSIXDIR() {
@@ -318,6 +455,18 @@ func (s *mixCoordImpl) stopPosixCleanupTask() {
 	})
 }
 
+// startTiKVGCWorker starts the GC of a TiKV meta store. Only the active
+// replica calls it, so one worker runs per Milvus cluster. The TiKV cluster
+// must not also serve a TiDB or another system with a GC worker of its own:
+// both register the gc_worker service safe point, so each would replace the
+// other's life time.
+func (s *mixCoordImpl) startTiKVGCWorker() {
+	if Params.MetaStoreCfg.MetaStoreType.GetValue() != util.MetaStoreTypeTiKV || s.tikvCli == nil {
+		return
+	}
+	s.stopTiKVGC = tikv.StartGCWorker(s.ctx, s.tikvCli)
+}
+
 func (s *mixCoordImpl) posixCleanupLoop(ctx context.Context) {
 	defer s.posixCleanupWg.Done()
 
@@ -339,8 +488,20 @@ func (s *mixCoordImpl) posixCleanupLoop(ctx context.Context) {
 
 func (s *mixCoordImpl) Stop() error {
 	mlog.Info(s.ctx, "graceful stop")
+	// Deferred, not done first: /management/* is how an operator drives a
+	// drain, and unregistering up front would make this coordinator answer 503
+	// to the very requests that are shutting it down.
+	defer func() {
+		internalhttp.RegisterManagementVerifier(internalhttp.VerifierSlotCoordinator, nil)
+		if s.rootCredentialVerifier != nil {
+			s.rootCredentialVerifier.Forget()
+		}
+	}()
 
 	s.stopPosixCleanupTask()
+	if s.stopTiKVGC != nil {
+		s.stopTiKVGC()
+	}
 
 	s.GracefulStop()
 	mlog.Info(s.ctx, "graceful stop done")
@@ -349,20 +510,31 @@ func (s *mixCoordImpl) Stop() error {
 		mlog.Error(s.ctx, "Failed to stop queryCoord", mlog.Err(err))
 	}
 
-	if err := s.datacoordServer.Stop(); err != nil {
-		mlog.Error(s.ctx, "Failed to stop dataCoord", mlog.Err(err))
+	if s.datacoordServer != nil {
+		if err := s.datacoordServer.Stop(); err != nil {
+			mlog.Error(s.ctx, "Failed to stop dataCoord", mlog.Err(err))
+		}
 	}
 
 	if err := s.rootcoordServer.Stop(); err != nil {
 		mlog.Error(s.ctx, "Failed to stop rootCoord", mlog.Err(err))
 	}
 
+	// Created only on activation, so a standby that never became active has none.
+	if s.fileResourceObserver != nil {
+		s.fileResourceObserver.Stop()
+	}
+
+	// Cancel before stopping the session: on a standby, canceling the session
+	// makes ProcessActiveStandBy return context.Canceled, and the goroutine
+	// started in Register only treats that as a shutdown once s.ctx is done.
+	// The session context derives from s.ctx, and the lease is revoked with a
+	// background context, so the session still shuts down cleanly.
+	s.cancel()
+
 	// All coordinators have stopped. Now stop the session.
 	s.session.SetMixCoordMode(false)
 	s.session.Stop()
-
-	s.fileResourceObserver.Stop()
-	s.cancel()
 	return nil
 }
 
@@ -386,7 +558,6 @@ func (s *mixCoordImpl) initSession() error {
 	// MixCoord owns the session lifecycle and stops it after all coordinators have stopped.
 	s.session.SetMixCoordMode(true)
 	s.rootcoordServer.SetSession(s.session)
-	s.datacoordServer.SetSession(s.session)
 	s.queryCoordServer.SetSession(s.session)
 
 	return nil
@@ -395,21 +566,18 @@ func (s *mixCoordImpl) initSession() error {
 func (s *mixCoordImpl) SetAddress(address string) {
 	s.address = address
 	s.rootcoordServer.SetAddress(address)
-	s.datacoordServer.SetAddress(address)
 	s.queryCoordServer.SetAddress(address)
 }
 
 func (s *mixCoordImpl) SetEtcdClient(client *clientv3.Client) {
 	s.etcdCli = client
 	s.rootcoordServer.SetEtcdClient(client)
-	s.datacoordServer.SetEtcdClient(client)
 	s.queryCoordServer.SetEtcdClient(client)
 }
 
 func (s *mixCoordImpl) SetTiKVClient(client *txnkv.Client) {
 	s.tikvCli = client
 	s.rootcoordServer.SetTiKVClient(client)
-	s.datacoordServer.SetTiKVClient(client)
 	s.queryCoordServer.SetTiKVClient(client)
 }
 
@@ -453,12 +621,20 @@ func (s *mixCoordImpl) DescribeCollection(ctx context.Context, req *milvuspb.Des
 	return s.rootcoordServer.DescribeCollection(ctx, req)
 }
 
+func (s *mixCoordImpl) GetCollectionProperties(ctx context.Context, collectionID int64) ([]*commonpb.KeyValuePair, error) {
+	return s.rootcoordServer.GetCollectionProperties(ctx, collectionID)
+}
+
 func (s *mixCoordImpl) ShowCollections(ctx context.Context, req *milvuspb.ShowCollectionsRequest) (*milvuspb.ShowCollectionsResponse, error) {
 	return s.rootcoordServer.ShowCollections(ctx, req)
 }
 
 func (s *mixCoordImpl) ShowCollectionIDs(ctx context.Context, req *rootcoordpb.ShowCollectionIDsRequest) (*rootcoordpb.ShowCollectionIDsResponse, error) {
 	return s.rootcoordServer.ShowCollectionIDs(ctx, req)
+}
+
+func (s *mixCoordImpl) GetRLSMetadata(ctx context.Context, req *rootcoordpb.GetRLSMetadataRequest) (*rootcoordpb.GetRLSMetadataResponse, error) {
+	return s.rootcoordServer.GetRLSMetadata(ctx, req)
 }
 
 func (s *mixCoordImpl) AlterCollection(ctx context.Context, req *milvuspb.AlterCollectionRequest) (*commonpb.Status, error) {
@@ -683,6 +859,38 @@ func (s *mixCoordImpl) ListPrivilegeGroups(ctx context.Context, req *milvuspb.Li
 
 func (s *mixCoordImpl) OperatePrivilegeGroup(ctx context.Context, req *milvuspb.OperatePrivilegeGroupRequest) (*commonpb.Status, error) {
 	return s.rootcoordServer.OperatePrivilegeGroup(ctx, req)
+}
+
+func (s *mixCoordImpl) CreateRowPolicy(ctx context.Context, req *milvuspb.CreateRowPolicyRequest) (*commonpb.Status, error) {
+	return s.rootcoordServer.CreateRowPolicy(ctx, req)
+}
+
+func (s *mixCoordImpl) UpdateRowPolicy(ctx context.Context, req *milvuspb.UpdateRowPolicyRequest) (*commonpb.Status, error) {
+	return s.rootcoordServer.UpdateRowPolicy(ctx, req)
+}
+
+func (s *mixCoordImpl) DropRowPolicy(ctx context.Context, req *milvuspb.DropRowPolicyRequest) (*commonpb.Status, error) {
+	return s.rootcoordServer.DropRowPolicy(ctx, req)
+}
+
+func (s *mixCoordImpl) ListRowPolicies(ctx context.Context, req *milvuspb.ListRowPoliciesRequest) (*milvuspb.ListRowPoliciesResponse, error) {
+	return s.rootcoordServer.ListRowPolicies(ctx, req)
+}
+
+func (s *mixCoordImpl) SetRLSPrincipalTags(ctx context.Context, req *milvuspb.SetRLSPrincipalTagsRequest) (*commonpb.Status, error) {
+	return s.rootcoordServer.SetRLSPrincipalTags(ctx, req)
+}
+
+func (s *mixCoordImpl) GetRLSPrincipalTags(ctx context.Context, req *milvuspb.GetRLSPrincipalTagsRequest) (*milvuspb.GetRLSPrincipalTagsResponse, error) {
+	return s.rootcoordServer.GetRLSPrincipalTags(ctx, req)
+}
+
+func (s *mixCoordImpl) ListRLSPrincipals(ctx context.Context, req *milvuspb.ListRLSPrincipalsRequest) (*milvuspb.ListRLSPrincipalsResponse, error) {
+	return s.rootcoordServer.ListRLSPrincipals(ctx, req)
+}
+
+func (s *mixCoordImpl) DeleteRLSPrincipalTags(ctx context.Context, req *milvuspb.DeleteRLSPrincipalTagsRequest) (*commonpb.Status, error) {
+	return s.rootcoordServer.DeleteRLSPrincipalTags(ctx, req)
 }
 
 // GetComponentStates get states of components
@@ -930,6 +1138,10 @@ func (s *mixCoordImpl) DeactivateChecker(ctx context.Context, req *querypb.Deact
 
 func (s *mixCoordImpl) ListCheckers(ctx context.Context, req *querypb.ListCheckersRequest) (*querypb.ListCheckersResponse, error) {
 	return s.queryCoordServer.ListCheckers(ctx, req)
+}
+
+func (s *mixCoordImpl) EnsureCollectionReady(ctx context.Context, req *querypb.EnsureCollectionReadyRequest) (*commonpb.Status, error) {
+	return s.queryCoordServer.EnsureCollectionReady(ctx, req)
 }
 
 func (s *mixCoordImpl) ShowLoadCollections(ctx context.Context, req *querypb.ShowCollectionsRequest) (*querypb.ShowCollectionsResponse, error) {
@@ -1237,13 +1449,20 @@ func (s *mixCoordImpl) AllocSegment(ctx context.Context, req *datapb.AllocSegmen
 	return s.datacoordServer.AllocSegment(ctx, req)
 }
 
-func (s *mixCoordImpl) NotifyDropPartition(ctx context.Context, channel string, partitionIDs []int64) error {
-	return s.datacoordServer.NotifyDropPartition(ctx, channel, partitionIDs)
+func (s *mixCoordImpl) NotifyDropPartition(ctx context.Context, channel string, collectionID int64, partitionIDs []int64) error {
+	return s.datacoordServer.NotifyDropPartition(ctx, channel, collectionID, partitionIDs)
 }
 
 // RegisterStreamingCoordGRPCService registers the grpc service of streaming coordinator.
 func (s *mixCoordImpl) RegisterStreamingCoordGRPCService(server *grpc.Server) {
 	s.streamingCoord.RegisterGRPCService(server)
+}
+
+// RegisterPKIndexCoordGRPCService registers the grpc service of the primary
+// key index manifests. It can be called before activation; the service answers
+// ServiceNotReady until datacoord starts.
+func (s *mixCoordImpl) RegisterPKIndexCoordGRPCService(server *grpc.Server) {
+	pkindexpb.RegisterPKIndexCoordServiceServer(server, s.pkindexService)
 }
 
 func (s *mixCoordImpl) GetQuotaMetrics(ctx context.Context, req *internalpb.GetQuotaMetricsRequest) (*internalpb.GetQuotaMetricsResponse, error) {
@@ -1266,50 +1485,19 @@ func (s *mixCoordImpl) ComputePhraseMatchSlop(ctx context.Context, req *querypb.
 	return s.queryCoordServer.ComputePhraseMatchSlop(ctx, req)
 }
 
+func (s *mixCoordImpl) ListRunningRequests(ctx context.Context, req *milvuspb.ListRunningRequestsRequest) (*milvuspb.ListRunningRequestsResponse, error) {
+	return s.rootcoordServer.ListRunningRequests(ctx, req)
+}
+
+func (s *mixCoordImpl) CancelRequests(ctx context.Context, req *milvuspb.CancelRequestsRequest) (*milvuspb.CancelRequestsResponse, error) {
+	return s.rootcoordServer.CancelRequests(ctx, req)
+}
+
+// Deprecated: QueryView does not use the legacy cluster read-task queues.
 func (s *mixCoordImpl) ClearReadTaskQueue(ctx context.Context, req *internalpb.ClearReadTaskQueueRequest) (*internalpb.ClearReadTaskQueueResponse, error) {
-	resp := &internalpb.ClearReadTaskQueueResponse{Status: merr.Success()}
-	if err := merr.CheckHealthy(s.GetStateCode()); err != nil {
-		resp.Status = merr.Status(err)
-		return resp, nil
-	}
-
-	var errs []error
-	proxyResp, err := s.rootcoordServer.ClearReadTaskQueue(ctx, req)
-	if err != nil {
-		errs = append(errs, err)
-	} else if proxyResp != nil {
-		resp.Results = append(resp.Results, proxyResp.GetResults()...)
-		resp.ProxyQueuedCleared += proxyResp.GetProxyQueuedCleared()
-		if !merr.Ok(proxyResp.GetStatus()) {
-			errs = append(errs, merr.Error(proxyResp.GetStatus()))
-		}
-	}
-
-	queryNodeResp, err := s.queryCoordServer.ClearReadTaskQueue(ctx, req)
-	if err != nil {
-		errs = append(errs, err)
-	} else if queryNodeResp != nil {
-		resp.Results = append(resp.Results, queryNodeResp.GetResults()...)
-		resp.QuerynodeQueuedCleared += queryNodeResp.GetQuerynodeQueuedCleared()
-		resp.QueuedNqCleared += queryNodeResp.GetQueuedNqCleared()
-		if !merr.Ok(queryNodeResp.GetStatus()) {
-			errs = append(errs, merr.Error(queryNodeResp.GetStatus()))
-		}
-	}
-
-	if err := merr.Combine(errs...); err != nil {
-		resp.Status = merr.Status(err)
-	}
-
-	mlog.Info(ctx, "cleared cluster read task queues",
-		mlog.String("taskType", req.GetTaskType()),
-		mlog.String("reason", req.GetReason()),
-		mlog.Int64("proxyQueuedCleared", resp.GetProxyQueuedCleared()),
-		mlog.Int64("queryNodeQueuedCleared", resp.GetQuerynodeQueuedCleared()),
-		mlog.Int64("queuedNQCleared", resp.GetQueuedNqCleared()),
-		mlog.Int("results", len(resp.GetResults())),
-		mlog.Err(merr.Error(resp.GetStatus())))
-	return resp, nil
+	return &internalpb.ClearReadTaskQueueResponse{
+		Status: merr.Status(merr.Wrap(merr.ErrServiceUnimplemented, "ClearReadTaskQueue is deprecated; no queues were cleared")),
+	}, nil
 }
 
 func (s *mixCoordImpl) FlushAll(ctx context.Context, req *datapb.FlushAllRequest) (*datapb.FlushAllResponse, error) {
@@ -1346,9 +1534,9 @@ func (s *mixCoordImpl) DropSegmentsByTime(ctx context.Context, collectionID int6
 	return s.datacoordServer.DropSegmentsByTime(ctx, collectionID, flushTsList)
 }
 
-// ManualUpdateCurrentTarget manually update current target for TruncateCollection
-func (s *mixCoordImpl) ManualUpdateCurrentTarget(ctx context.Context, collectionID int64) error {
-	return s.queryCoordServer.ManualUpdateCurrentTarget(ctx, collectionID)
+// QueryViewDataReconciler supplies DataCoord directly during resource wiring.
+func (s *mixCoordImpl) QueryViewDataReconciler() qvresource.DataViewReconciler {
+	return s.datacoordServer
 }
 
 func (s *mixCoordImpl) CreateSnapshot(ctx context.Context, req *datapb.CreateSnapshotRequest) (*commonpb.Status, error) {
@@ -1435,4 +1623,86 @@ func (s *mixCoordImpl) GetRefreshExternalCollectionProgress(ctx context.Context,
 
 func (s *mixCoordImpl) ListRefreshExternalCollectionJobs(ctx context.Context, req *datapb.ListRefreshExternalCollectionJobsRequest) (*datapb.ListRefreshExternalCollectionJobsResponse, error) {
 	return s.datacoordServer.ListRefreshExternalCollectionJobs(ctx, req)
+}
+
+func (s *mixCoordImpl) GetQueryViewLoadInfo(ctx context.Context, req *querypb.GetQueryViewLoadInfoRequest) (*querypb.GetQueryViewLoadInfoResponse, error) {
+	return s.queryCoordServer.GetQueryViewLoadInfo(ctx, req)
+}
+
+// QueryViewCollectionIndexInfos supplies current index descriptors to the load-info
+// store, which filters them by the retained required field scope on every read.
+func (s *mixCoordImpl) QueryViewCollectionIndexInfos(collectionID int64, indexIDs ...int64) []*indexpb.IndexInfo {
+	return s.datacoordServer.GetQueryViewCollectionIndexInfos(collectionID, indexIDs...)
+}
+
+func (s *mixCoordImpl) GetStreamingNodeQueryViewResources(ctx context.Context, req *datapb.GetStreamingNodeQueryViewResourcesRequest) (*datapb.GetStreamingNodeQueryViewResourcesResponse, error) {
+	if req.GetLoadInfoVersion() != 0 {
+		loadInfo, err := s.queryCoordServer.GetQueryViewLoadInfo(ctx, &querypb.GetQueryViewLoadInfoRequest{
+			CollectionID: req.GetCollectionId(),
+			Version:      req.GetLoadInfoVersion(),
+		})
+		if err := merr.CheckRPCCall(loadInfo, err); err != nil {
+			return &datapb.GetStreamingNodeQueryViewResourcesResponse{
+				Status:       merr.Status(err),
+				CollectionId: req.GetCollectionId(),
+				Vchannel:     req.GetVchannel(),
+				DataVersion:  req.GetDataVersion(),
+			}, nil
+		}
+		req = &datapb.GetStreamingNodeQueryViewResourcesRequest{
+			Base:            req.GetBase(),
+			CollectionId:    req.GetCollectionId(),
+			Vchannel:        req.GetVchannel(),
+			DataVersion:     req.GetDataVersion(),
+			LoadInfoVersion: req.GetLoadInfoVersion(),
+			PartitionIds:    append([]int64(nil), loadInfo.GetPartitionIDs()...),
+		}
+	}
+	return s.datacoordServer.GetStreamingNodeQueryViewResources(ctx, req)
+}
+
+func (s *mixCoordImpl) DataViewProvider() balancer.DataViewProvider {
+	return s.datacoordServer.DataViewProvider()
+}
+
+func (s *mixCoordImpl) GetQueryViewSegmentLoadInfos(ctx context.Context, collectionID int64, segmentIDs []int64) ([]*querypb.QueryViewSegmentLoadInfoResult, []*indexpb.IndexInfo, error) {
+	return s.datacoordServer.GetQueryViewSegmentLoadInfos(ctx, collectionID, segmentIDs)
+}
+
+func (s *mixCoordImpl) GetQueryViewSegmentLoadInfo(ctx context.Context, req *querypb.GetQueryViewSegmentLoadInfoRequest) (*querypb.GetQueryViewSegmentLoadInfoResponse, error) {
+	return s.queryCoordServer.GetQueryViewSegmentLoadInfo(ctx, req)
+}
+
+func (s *mixCoordImpl) initDataAndQueryCoord() error {
+	// Recover DataViews before QueryViews acquire their exact-version references.
+	// Neither coordinator starts background GC/balancing until both have recovered.
+	s.datacoordServer.SetFileResourceObserver(s.fileResourceObserver)
+	if err := s.datacoordServer.Init(); err != nil {
+		return err
+	}
+	s.queryCoordServer.SetFileResourceObserver(s.fileResourceObserver)
+	if err := s.queryCoordServer.Init(); err != nil {
+		return err
+	}
+	g, _ := errgroup.WithContext(s.ctx)
+
+	g.Go(func() error {
+		if err := s.datacoordServer.Start(); err != nil {
+			mlog.Error(s.ctx, "dataCoord start failed", mlog.Err(err))
+			return err
+		}
+		return nil
+	})
+	g.Go(func() error {
+		if err := s.queryCoordServer.Start(); err != nil {
+			mlog.Error(s.ctx, "queryCoord start failed", mlog.Err(err))
+			return err
+		}
+		return nil
+	})
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	return nil
 }

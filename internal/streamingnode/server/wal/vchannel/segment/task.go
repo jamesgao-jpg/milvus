@@ -7,10 +7,14 @@ import (
 	"go.uber.org/atomic"
 	"golang.org/x/time/rate"
 
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/moduleapi"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
+	"github.com/milvus-io/milvus/pkg/v3/proto/streamingpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/viewpb"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v3/util/nodescheduler"
 	"github.com/milvus-io/milvus/pkg/v3/util/retry"
+	"github.com/milvus-io/milvus/pkg/v3/util/tsoutil"
 )
 
 // retryLogRate throttles the retry log of a task. The limiter is shared
@@ -26,14 +30,19 @@ type segmentTask interface {
 	Done() bool
 	Submitted() bool
 	markSubmitted()
+	taskPriority() *moduleapi.DataTaskPriority
+	timeTick() uint64
 }
 
 type segmentTaskBase struct {
+	priority  moduleapi.DataTaskPriority
 	segment   *SegmentView
 	taskName  string
 	done      atomic.Bool
 	submitted atomic.Bool
 }
+
+func (t *segmentTaskBase) taskPriority() *moduleapi.DataTaskPriority { return &t.priority }
 
 func (t *segmentTaskBase) Done() bool {
 	return t.done.Load()
@@ -103,6 +112,8 @@ type ensureGrowingSegmentTask struct {
 	timetick uint64
 }
 
+func (t *ensureGrowingSegmentTask) timeTick() uint64 { return t.timetick }
+
 func (t *ensureGrowingSegmentTask) Execute(ctx context.Context) error {
 	return t.execute(ctx, func(ctx context.Context) error {
 		segment := t.segment
@@ -129,6 +140,8 @@ type flushL1BufferTask struct {
 	timetick uint64
 }
 
+func (t *flushL1BufferTask) timeTick() uint64 { return t.timetick }
+
 func (t *flushL1BufferTask) Execute(ctx context.Context) error {
 	return t.execute(ctx, func(ctx context.Context) error {
 		return t.segment.FlushInsertChunk(ctx, t.timetick)
@@ -140,6 +153,8 @@ type commitL1SegmentTask struct {
 	timetick      uint64
 	flushTimeTick uint64
 }
+
+func (t *commitL1SegmentTask) timeTick() uint64 { return t.timetick }
 
 func (t *commitL1SegmentTask) Execute(ctx context.Context) error {
 	return t.execute(ctx, func(ctx context.Context) error {
@@ -154,7 +169,18 @@ func (t *commitL1SegmentTask) Execute(ctx context.Context) error {
 			return err
 		}
 		meta := segment.AssignmentMeta()
-		if err := segment.lifecycle.CommitL1Segment(ctx, meta); err != nil {
+		var version *viewpb.DataVersion
+		var err error
+		if committer, ok := segment.lifecycle.(TransformFrontierCommitter); ok {
+			var startAfter uint64
+			if provider, ok := segment.owner.(GrowingTransformFrontierProvider); ok {
+				startAfter = provider.GrowingTransformStartAfterTimeTick(segment.ID())
+			}
+			version, err = committer.CommitL1SegmentWithTransformStart(ctx, meta, startAfter)
+		} else {
+			version, err = segment.lifecycle.CommitL1Segment(ctx, meta)
+		}
+		if err != nil {
 			// Same as ensure: classification is execute's job, marking ErrDelay
 			// here would requeue a terminally-failed task.
 			return err
@@ -163,10 +189,15 @@ func (t *commitL1SegmentTask) Execute(ctx context.Context) error {
 		segment.mu.Lock()
 		handles := segment.markPendingDataDurableLocked(t.timetick)
 		segment.finalCommitDone.Store(true)
-		segment.meta.L1CommitDone = true
+		segment.meta.SealedAtDataVersion = version
+		// Publication and retirement are one stable transition; a snapshot can
+		// never capture an intermediate FLUSHED state before the owner callback.
+		segment.meta.State = streamingpb.SegmentAssignmentState_SEGMENT_ASSIGNMENT_STATE_TOMBSTONED
+		segment.meta.CheckpointTimeTick = max(segment.meta.GetCheckpointTimeTick(), t.timetick)
 		segment.durableMeta.State = segment.meta.State
-		segment.durableMeta.L1CommitDone = true
+		segment.durableMeta.SealedAtDataVersion = version
 		if stat := segment.meta.GetStat(); stat != nil && segment.durableMeta.GetStat() != nil {
+			stat.LastModifiedTimestamp = tsoutil.PhysicalTime(t.timetick).Unix()
 			segment.durableMeta.Stat.LastModifiedTimestamp = stat.GetLastModifiedTimestamp()
 		}
 		segment.dirty = true
@@ -270,7 +301,7 @@ func (s *SegmentView) maybeSubmitNextLocked() {
 		return
 	}
 	head.markSubmitted()
-	s.runtime.Scheduler.Submit(head)
+	head.taskPriority().Submit(s.runtime.Scheduler, head)
 }
 
 // finishTask pops the finished (success or terminal failure) task from the
@@ -299,13 +330,10 @@ func (s *SegmentView) finishTask() {
 // created tasks fail fast with the same error instead of executing, and observations are poisoned
 // instead of buffered (see ObserveInsert / ObserveCreateSegmentMessageV2 / Flush).
 //
-// Every retained message in the three pending structures is poisoned and released, so a failed
-// segment pins nothing in memory and leaves no message silently dropped: each poisoned message
-// carries a marker a consumer can observe and handle separately (reassign / replay), instead of
-// the failure becoming invisible. The poison is message-level and survives in the shared core, so
-// any handle to the same message can observe it. Reclaiming the view itself is the concern of the
-// future owner that wires this package into the vchannel module; until then the view stays, which
-// is the intended fail-safe. The failure is logged loudly for upper-layer accounting.
+// Retained messages are poisoned and released to free payload memory. Tracker leaves their
+// positions incomplete, keeping the WAL available for replay; BroadcastAck must not acknowledge
+// failed local work. The VChannel-owned view retains its terminal state and rejects subsequent
+// work until recovery replaces it. The failure is logged for upper-layer accounting.
 func (s *SegmentView) markUnrecoverable(ctx context.Context, err error) {
 	// Record the terminal error and snapshot the retained handles under the
 	// same lock, so the logged count is an exact snapshot of the terminal

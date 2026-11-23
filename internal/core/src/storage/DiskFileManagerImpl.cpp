@@ -23,7 +23,8 @@
 #include <cstdint>
 #include <exception>
 #include <filesystem>
-#include <future>
+#include <functional>
+#include <folly/futures/Future.h>
 #include <iosfwd>
 #include <memory>
 #include <optional>
@@ -64,7 +65,6 @@
 #include "storage/LocalChunkManager.h"
 #include "storage/LocalChunkManagerSingleton.h"
 #include "storage/RemoteOutputStream.h"
-#include "storage/ThreadPool.h"
 #include "storage/ThreadPools.h"
 #include "storage/Types.h"
 #include "storage/Util.h"
@@ -138,7 +138,8 @@ DiskFileManagerImpl::LocalDirWriteLease::Release() noexcept {
 DiskFileManagerImpl::DiskFileManagerImpl(
     const FileManagerContext& fileManagerContext)
     : FileManagerImpl(fileManagerContext.fieldDataMeta,
-                      fileManagerContext.indexMeta),
+                      fileManagerContext.indexMeta,
+                      fileManagerContext.use_async_load),
       file_path_generation_(
           g_file_path_generation.fetch_add(1, std::memory_order_relaxed)) {
     rcm_ = fileManagerContext.chunkManagerPtr;
@@ -303,17 +304,15 @@ DiskFileManagerImpl::CloseAndRemoveLocalDir(const std::string& dir) noexcept {
     }
 }
 
-bool
-DiskFileManagerImpl::AddFileInternal(
+void
+DiskFileManagerImpl::UploadFileInternal(
     const std::string& file,
     const std::function<std::string(const std::string&, int)>&
-        get_remote_path) noexcept {
+        get_remote_path) {
     auto local_chunk_manager =
         LocalChunkManagerSingleton::GetInstance().GetChunkManager();
-    FILEMANAGER_TRY
     if (!local_chunk_manager->Exist(file)) {
-        LOG_ERROR("local file {} not exists", file);
-        return false;
+        ThrowInfo(ErrorCode::PathNotExist, "local file {} not exists", file);
     }
 
     // record local file path
@@ -352,18 +351,24 @@ DiskFileManagerImpl::AddFileInternal(
         AddBatchIndexFiles(
             file, local_file_offsets, batch_remote_files, remote_file_sizes);
     }
+}
+
+bool
+DiskFileManagerImpl::AddFile(const std::string& file) noexcept {
+    FILEMANAGER_TRY
+    AddFileOrThrow(file);
     FILEMANAGER_CATCH
     FILEMANAGER_END
 
     return true;
-}  // namespace knowhere
+}
 
-bool
-DiskFileManagerImpl::AddFile(const std::string& file) noexcept {
-    return AddFileInternal(file,
-                           [this](const std::string& file_name, int slice_num) {
-                               return GetRemoteIndexPath(file_name, slice_num);
-                           });
+void
+DiskFileManagerImpl::AddFileOrThrow(const std::string& file) {
+    UploadFileInternal(file,
+                       [this](const std::string& file_name, int slice_num) {
+                           return GetRemoteIndexPath(file_name, slice_num);
+                       });
 }
 
 bool
@@ -375,22 +380,21 @@ DiskFileManagerImpl::AddFileMeta(const FileMeta& file_meta) {
     return true;
 }
 
-bool
-DiskFileManagerImpl::AddJsonSharedIndexLog(const std::string& file) noexcept {
-    return AddFileInternal(
+void
+DiskFileManagerImpl::AddJsonSharedIndexLog(const std::string& file) {
+    UploadFileInternal(
         file, [this](const std::string& file_name, int slice_num) {
             return GetRemoteJsonStatsSharedIndexPath(file_name, slice_num);
         });
 }
 
-bool
-DiskFileManagerImpl::AddJsonStatsMetaLog(const std::string& file) noexcept {
+void
+DiskFileManagerImpl::AddJsonStatsMetaLog(const std::string& file) {
     auto local_chunk_manager =
         LocalChunkManagerSingleton::GetInstance().GetChunkManager();
-    FILEMANAGER_TRY
     if (!local_chunk_manager->Exist(file)) {
-        LOG_ERROR("local meta file {} not exists", file);
-        return false;
+        ThrowInfo(
+            ErrorCode::PathNotExist, "local meta file {} not exists", file);
     }
 
     local_paths_.emplace_back(file);
@@ -409,18 +413,14 @@ DiskFileManagerImpl::AddJsonStatsMetaLog(const std::string& file) noexcept {
              file,
              remote_path,
              fileSize);
-
-    FILEMANAGER_CATCH
-    FILEMANAGER_END
-    return true;
 }
 
-bool
-DiskFileManagerImpl::AddTextLog(const std::string& file) noexcept {
-    return AddFileInternal(
-        file, [this](const std::string& file_name, int slice_num) {
-            return GetRemoteTextLogPath(file_name, slice_num);
-        });
+void
+DiskFileManagerImpl::AddTextLog(const std::string& file) {
+    UploadFileInternal(file,
+                       [this](const std::string& file_name, int slice_num) {
+                           return GetRemoteTextLogPath(file_name, slice_num);
+                       });
 }
 
 void
@@ -431,9 +431,9 @@ DiskFileManagerImpl::AddBatchIndexFiles(
     const std::vector<int64_t>& remote_file_sizes) {
     auto local_chunk_manager =
         LocalChunkManagerSingleton::GetInstance().GetChunkManager();
-    auto& pool = ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::HIGH);
+    auto& pool = ThreadPools::GetExecutor(milvus::ThreadPoolPriority::HIGH);
 
-    std::vector<std::future<std::shared_ptr<uint8_t[]>>> futures;
+    std::vector<folly::SemiFuture<std::shared_ptr<uint8_t[]>>> futures;
     futures.reserve(remote_file_sizes.size());
     AssertInfo(local_file_offsets.size() == remote_files.size(),
                "inconsistent size of offset slices with file slices");
@@ -441,18 +441,24 @@ DiskFileManagerImpl::AddBatchIndexFiles(
                "inconsistent size of file slices with size slices");
 
     for (int64_t i = 0; i < remote_files.size(); ++i) {
-        futures.push_back(pool.Submit(
-            [local_chunk_manager](
-                const std::string& file,
-                const int64_t offset,
-                const int64_t data_size) -> std::shared_ptr<uint8_t[]> {
-                auto buf = std::shared_ptr<uint8_t[]>(new uint8_t[data_size]);
-                local_chunk_manager->Read(file, offset, buf.get(), data_size);
-                return buf;
-            },
-            local_file_name,
-            local_file_offsets[i],
-            remote_file_sizes[i]));
+        futures.push_back(
+            folly::via(
+                &pool,
+                std::bind(
+                    [local_chunk_manager](
+                        const std::string& file,
+                        const int64_t offset,
+                        const int64_t data_size) -> std::shared_ptr<uint8_t[]> {
+                        auto buf =
+                            std::shared_ptr<uint8_t[]>(new uint8_t[data_size]);
+                        local_chunk_manager->Read(
+                            file, offset, buf.get(), data_size);
+                        return buf;
+                    },
+                    local_file_name,
+                    local_file_offsets[i],
+                    remote_file_sizes[i]))
+                .semi());
     }
 
     // hold index data util upload index file done.
@@ -497,7 +503,8 @@ DiskFileManagerImpl::CacheIndexToDiskInternal(
             auto err_message = fmt::format(
                 "invalided index file path:{}, error:{}", file_path, e.what());
             LOG_ERROR("{}", err_message);
-            throw std::logic_error(err_message);
+            ThrowInfo(
+                ErrorCode::UnexpectedError, "{}", std::string(err_message));
         }
     }
 
@@ -658,7 +665,7 @@ DiskFileManagerImpl::cache_raw_data_to_disk_internal(const Config& config) {
         config, INSERT_FILES_KEY);
     AssertInfo(insert_files.has_value(),
                "insert file paths is empty when build index");
-    auto remote_files = insert_files.value();
+    auto& remote_files = insert_files.value();
     SortByPath(remote_files);
 
     auto local_chunk_manager =
@@ -758,11 +765,13 @@ DiskFileManagerImpl::cache_raw_data_to_disk_internal(const Config& config) {
 
     // Write offsets file for VECTOR_ARRAY
     if (is_vector_array) {
-        AssertInfo(
-            !offsets.empty() && offsets.front() == 0,
-            "invalid emb_list offsets: size {}, front {}",
-            offsets.size(),
-            offsets.empty() ? -1 : static_cast<int64_t>(offsets.front()));
+        if (!(!offsets.empty() && offsets.front() == 0)) {
+            ThrowInfo(
+                ErrorCode::DataFormatBroken,
+                "invalid emb_list offsets: size {}, front {}",
+                offsets.size(),
+                offsets.empty() ? -1 : static_cast<int64_t>(offsets.front()));
+        }
         if (offsets.size() == 1) {
             AssertInfo(nullable || total_num_rows == 0,
                        "non-nullable emb_list offsets must include rows");
@@ -846,8 +855,10 @@ DiskFileManagerImpl::cache_raw_data_to_disk_common(
         // Handle VECTOR_ARRAY - need to flatten the array data
         auto vec_array_data =
             dynamic_cast<FieldData<VectorArray>*>(field_data.get());
-        AssertInfo(vec_array_data != nullptr,
-                   "failed to cast field data to vector array");
+        if (!(vec_array_data != nullptr)) {
+            ThrowInfo(ErrorCode::DataFormatBroken,
+                      "failed to cast field data to vector array");
+        }
 
         dim = field_data->get_dim();
         auto rows = vec_array_data->get_num_rows();
@@ -875,7 +886,7 @@ DiskFileManagerImpl::cache_raw_data_to_disk_common(
             if (offsets != nullptr) {
                 // Add cumulative offset (number of vectors processed so far)
                 size_t last_offset = offsets->back();
-                offsets->push_back(last_offset + vec_array->length());
+                offsets->push_back(last_offset + vec_array->physical_length());
             }
 
             if (size > 0) {
@@ -936,10 +947,7 @@ DiskFileManagerImpl::cache_raw_data_to_disk_storage_v2(const Config& config) {
             config, SEGMENT_INSERT_FILES_KEY);
     AssertInfo(segment_insert_files.has_value(),
                "segment insert files is empty when build index");
-    auto all_remote_files = segment_insert_files.value();
-    for (auto& remote_files : all_remote_files) {
-        SortByPath(remote_files);
-    }
+    auto& all_remote_files = segment_insert_files.value();
 
     auto local_chunk_manager =
         LocalChunkManagerSingleton::GetInstance().GetChunkManager();
@@ -1061,6 +1069,12 @@ DiskFileManagerImpl::cache_raw_data_to_disk_storage_v2(const Config& config) {
         }
     } else {
         for (auto& remote_files_group : all_remote_files) {
+            // Dense-vector pagination splits the group into single-file
+            // reads. Order the complete group before that split; the shared
+            // reader can only validate each single-file page afterwards.
+            if (manifest_path_str.empty()) {
+                SortBinlogPaths(remote_files_group);
+            }
             if (dim >
                 0) {  // for vector indices try to use limited RAM when loading
                 cached_already = true;
@@ -1160,11 +1174,13 @@ DiskFileManagerImpl::cache_raw_data_to_disk_storage_v2(const Config& config) {
         // offsets must contain at least the initial sentinel (0).  When all
         // rows are null or contain empty embedding lists the vector is {0}
         // which is valid — VectorDiskAnnIndex handles the empty-input case.
-        AssertInfo(
-            offsets.size() >= 1 && offsets.front() == 0,
-            "invalid emb_list offsets: size {}, front {}",
-            offsets.size(),
-            offsets.empty() ? -1 : static_cast<int64_t>(offsets.front()));
+        if (!(offsets.size() >= 1 && offsets.front() == 0)) {
+            ThrowInfo(
+                ErrorCode::DataFormatBroken,
+                "invalid emb_list offsets: size {}, front {}",
+                offsets.size(),
+                offsets.empty() ? -1 : static_cast<int64_t>(offsets.front()));
+        }
         // Get offsets path from config if provided, otherwise use default
         auto offsets_path = index::GetValueFromConfig<std::string>(
                                 config, index::EMB_LIST_OFFSETS_PATH)
@@ -1362,7 +1378,7 @@ DiskFileManagerImpl::CacheOptFieldToDisk(const Config& config) {
     }
 
     // legacy path
-    auto fields_map = opt_fields.value();
+    auto& fields_map = opt_fields.value();
     const uint32_t num_of_fields = fields_map.size();
     if (num_of_fields > 1) {
         ThrowInfo(
@@ -1431,12 +1447,9 @@ DiskFileManagerImpl::cache_opt_field_to_disk_v2(const Config& config) {
     AssertInfo(segment_insert_files.has_value(),
                "segment insert files is empty when build index while "
                "caching opt fields");
-    auto remote_files_storage_v2 = segment_insert_files.value();
-    for (auto& remote_files : remote_files_storage_v2) {
-        SortByPath(remote_files);
-    }
+    auto& remote_files_storage_v2 = segment_insert_files.value();
 
-    auto fields_map = opt_fields.value();
+    auto& fields_map = opt_fields.value();
     const uint32_t num_of_fields = fields_map.size();
     if (0 == num_of_fields) {
         return "";
@@ -1498,7 +1511,7 @@ DiskFileManagerImpl::cache_opt_field_to_disk_v3(const Config& config) {
     if (!opt_fields.has_value()) {
         return "";
     }
-    auto fields_map = opt_fields.value();
+    auto& fields_map = opt_fields.value();
     const uint32_t num_of_fields = fields_map.size();
     if (0 == num_of_fields) {
         return "";

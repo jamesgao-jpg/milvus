@@ -31,7 +31,6 @@ import (
 	"github.com/apache/arrow/go/v17/arrow/memory"
 	"github.com/apache/arrow/go/v17/parquet"
 	"github.com/apache/arrow/go/v17/parquet/pqarrow"
-	"github.com/cockroachdb/errors"
 	"github.com/google/uuid"
 	"github.com/samber/lo"
 	"github.com/sbinet/npyio"
@@ -40,6 +39,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	pq "github.com/milvus-io/milvus/internal/util/importutilv2/parquet"
 	"github.com/milvus-io/milvus/internal/util/testutil"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
@@ -51,15 +51,28 @@ import (
 
 const dim = 128
 
-func CheckLogID(fieldBinlogs []*datapb.FieldBinlog) error {
-	for _, fieldBinlog := range fieldBinlogs {
-		for _, l := range fieldBinlog.GetBinlogs() {
-			if l.GetLogID() == 0 {
-				return errors.New("unexpected log id 0")
-			}
-		}
+func (s *importTestBase) assertImportedSegmentMetadata(segment *datapb.SegmentInfo, pkFieldID int64) {
+	s.T().Helper()
+	if segment.GetNumOfRows() == 0 {
+		// Import drops unused preallocated segments rather than writing
+		// empty data and statistics files for them.
+		s.Equal(commonpb.SegmentState_Dropped, segment.GetState())
+		return
 	}
-	return nil
+	s.Require().EqualValues(storage.StorageV3, segment.GetStorageVersion())
+	s.Require().NotEmpty(segment.GetManifestPath())
+	// Import V3 stores file references in the manifest, not the legacy
+	// Binlogs/Statslogs catalog keys. Verify the actual data and PK stats.
+	groups, err := packed.ReadManifestColumnGroups(segment.GetManifestPath(), packed.CreateStorageConfig())
+	s.Require().NoError(err)
+	s.NotEmpty(groups)
+	for _, group := range groups {
+		s.NotEmpty(group.Files)
+	}
+	stats, err := packed.GetManifestStats(segment.GetManifestPath(), packed.CreateStorageConfig())
+	s.Require().NoError(err)
+	s.NotEmpty(stats[fmt.Sprintf("bloom_filter.%d", pkFieldID)].Paths)
+	s.Empty(segment.GetDeltalogs())
 }
 
 func GenerateParquetFile(c *cluster.MiniClusterV3, schema *schemapb.CollectionSchema, numRows int) (string, error) {
@@ -72,17 +85,24 @@ func GenerateParquetFileAndReturnInsertData(c *cluster.MiniClusterV3, schema *sc
 	if err != nil {
 		panic(err)
 	}
+	filePath, err := writeParquetFile(c, schema, insertData)
+	if err != nil {
+		return nil, "", err
+	}
+	return insertData, filePath, nil
+}
 
-	buf, err := searilizeParquetFile(schema, insertData, numRows)
+func writeParquetFile(c *cluster.MiniClusterV3, schema *schemapb.CollectionSchema, insertData *storage.InsertData) (string, error) {
+	buf, err := searilizeParquetFile(schema, insertData, insertData.GetRowNum())
 	if err != nil {
 		panic(err)
 	}
 
 	filePath := path.Join(c.RootPath(), "parquet", uuid.New().String()+".parquet")
 	if err := c.ChunkManager.Write(context.Background(), filePath, buf.Bytes()); err != nil {
-		return nil, "", err
+		return "", err
 	}
-	return insertData, filePath, err
+	return filePath, nil
 }
 
 func searilizeParquetFile(schema *schemapb.CollectionSchema, insertData *storage.InsertData, numRows int) (*bytes.Buffer, error) {
@@ -123,9 +143,12 @@ func generateFixedSizeListParquetFile(
 	float32List := buildFixedSizeFloat32List(mem, int32(vectorDim), rowCount)
 	defer float32List.Release()
 
+	// Arrow v17 inherits the outer field nullability when writing FixedSizeList
+	// element definition levels, while its Parquet schema always uses optional
+	// elements. Use nullable outer fields to encode the non-null values correctly.
 	pqSchema := arrow.NewSchema([]arrow.Field{
-		{Name: arrayFieldName, Type: int32List.DataType(), Nullable: false},
-		{Name: vectorFieldName, Type: float32List.DataType(), Nullable: false},
+		{Name: arrayFieldName, Type: int32List.DataType(), Nullable: true},
+		{Name: vectorFieldName, Type: float32List.DataType(), Nullable: true},
 	}, nil)
 
 	buf := bytes.NewBuffer(make([]byte, 0, 10240))
@@ -202,17 +225,20 @@ func buildFixedSizeFloat32List(mem memory.Allocator, listSize int32, rowCount in
 }
 
 func GenerateNumpyFiles(c *cluster.MiniClusterV3, schema *schemapb.CollectionSchema, rowCount int) (*internalpb.ImportFile, error) {
+	insertData, err := testutil.CreateInsertData(schema, rowCount)
+	if err != nil {
+		return nil, err
+	}
+	return writeNumpyFiles(c, schema, insertData)
+}
+
+func writeNumpyFiles(c *cluster.MiniClusterV3, schema *schemapb.CollectionSchema, insertData *storage.InsertData) (*internalpb.ImportFile, error) {
 	writeFn := func(path string, data interface{}) error {
 		buf := bytes.NewBuffer(make([]byte, 0, 10240))
 		if err := npyio.Write(buf, data); err != nil {
 			return err
 		}
 		return c.ChunkManager.Write(context.Background(), path, buf.Bytes())
-	}
-
-	insertData, err := testutil.CreateInsertData(schema, rowCount)
-	if err != nil {
-		return nil, err
 	}
 
 	var data interface{}
@@ -304,7 +330,10 @@ func GenerateNumpyFiles(c *cluster.MiniClusterV3, schema *schemapb.CollectionSch
 func GenerateJSONFile(t *testing.T, c *cluster.MiniClusterV3, schema *schemapb.CollectionSchema, count int) string {
 	insertData, err := testutil.CreateInsertData(schema, count)
 	assert.NoError(t, err)
+	return writeJSONFile(t, c, schema, insertData)
+}
 
+func writeJSONFile(t *testing.T, c *cluster.MiniClusterV3, schema *schemapb.CollectionSchema, insertData *storage.InsertData) string {
 	rows, err := testutil.CreateInsertDataRowsForJSON(schema, insertData)
 	assert.NoError(t, err)
 
@@ -320,11 +349,13 @@ func GenerateJSONFile(t *testing.T, c *cluster.MiniClusterV3, schema *schemapb.C
 }
 
 func GenerateCSVFile(t *testing.T, c *cluster.MiniClusterV3, schema *schemapb.CollectionSchema, count int) (string, rune) {
-	filePath := path.Join(c.RootPath(), "csv", uuid.New().String()+".csv")
-
 	insertData, err := testutil.CreateInsertData(schema, count)
 	assert.NoError(t, err)
+	return writeCSVFile(t, c, schema, insertData)
+}
 
+func writeCSVFile(t *testing.T, c *cluster.MiniClusterV3, schema *schemapb.CollectionSchema, insertData *storage.InsertData) (string, rune) {
+	filePath := path.Join(c.RootPath(), "csv", uuid.New().String()+".csv")
 	sep := ','
 	nullkey := ""
 
@@ -379,7 +410,7 @@ func WaitForImportDone(ctx context.Context, c *cluster.MiniClusterV3, jobID stri
 			mlog.Info(ctx, "import progress", mlog.String("jobID", jobID),
 				mlog.Int64("progress", resp.GetProgress()),
 				mlog.String("state", resp.GetState().String()))
-			time.Sleep(1 * time.Second)
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 }

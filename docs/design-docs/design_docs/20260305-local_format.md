@@ -198,8 +198,9 @@ Raw remains the compatibility and default path:
 - variable-width access returns views whose lifetime is protected by the
   corresponding pin;
 - Raw Scan stops at a chunk boundary so it can return a zero-copy batch;
-- Raw Take resolves input offsets lazily and reuses the current chunk pin while
-  consecutive accesses remain in that chunk;
+- Raw Take defaults to lazy offset resolution and reuses the current chunk pin
+  while consecutive accesses remain in that chunk. Batch-pin callers instead
+  resolve the request once and pin its required Cells together;
 - statistics that require loaded Raw payload remain an execution-time filter.
   They may skip comparison/value construction, but are not used to avoid the
   preceding load or pin.
@@ -219,7 +220,13 @@ For every file it owns:
 - one footer reader;
 - immutable footer-backed planners for the projected fields;
 - one cache slot and Cell translator;
-- metadata memory accounting.
+- physical file-size accounting.
+
+`DataByteSize` for a Vortex group means the physical bytes of its files, not
+the decoded in-memory size of any logical field. Those shared file bytes are
+attributed across the group's logical columns only so additive segment
+accounting counts the files once; the per-column value is not a decoded-size
+estimate.
 
 Footer and optional zone-map bytes are loaded when the group is initialized,
 not once per field or query. Field-level `VortexColumn` objects reuse this group
@@ -278,7 +285,8 @@ contract for local format, not a new user-visible query API.
 
 ### Scan
 
-`Scan(options)` creates one cursor for one expression leaf. Options fix the
+`Scan(options)` creates a cursor for one column traversal; each expression leaf
+retains its own cursor. Options fix the
 initial absolute segment position, target value type, output/predicate form,
 filter, prefetch choice, and pin policy. The execution window and whether a
 nullable data batch needs values or validity only are supplied later through
@@ -298,19 +306,42 @@ successive batches until the window is complete. A batch never crosses a
 skipped range silently: it carries aligned `data_skipped` state and, for a
 nullable field, authoritative validity.
 
+Borrowed batch values and validity must be consumed before the next `Next`,
+`Seek`, or cursor destruction, regardless of backend or pin policy. Retaining
+source pins is not an owned-data conversion and does not extend that contract.
+
 Pin policy is selected once at `Scan` creation:
 
 - `ResultOwned` (default) transfers the Cell pin to each returned batch. The
-  batch remains valid until its owner is released; the cursor holds no pin.
+  pin is released with the batch owner; the cursor holds no pin.
 - `CursorOwned` keeps the current physical Cell or planned Cell-set pin in the
   cursor, reuses an identical pin plan, and releases it before pinning a
-  different plan. The batch is borrowed only until the next `Next` or `Seek`.
+  different plan.
+- `AllCells` pins all source Cells for the column before data traversal and
+  retains those pins until cursor destruction, including after `Seek` or EOF.
+  It applies equally to Raw and Vortex data scans, does not retain decoded
+  history or copy Raw payload, and does not change the batch lifetime.
 
 The caller never pins Cells directly. Optional prefetch submits the remaining
 planned Scan Cells for parallel cache loading and immediately releases those
 prefetch pins; normal batch reads still acquire their configured pin owner. It
 is enabled only on paths that intentionally preserve prior prefetch behavior,
 not implicitly for validity-only reads.
+
+Full-column traversal is an ordinary data Scan starting at zero. Compatibility
+callers select the prior source pin strategy explicitly: temporary text-index
+construction uses `AllCells` for Raw V1 and `CursorOwned` for grouped Raw and
+Vortex; geometry-cache construction uses `CursorOwned`. Expression defaults
+are unchanged. Vortex continues to open a bounded range reader per `Next`;
+reader reuse is a separate follow-up, not a full-column option.
+
+Temporary text-index construction loops over Scan batches and calls the
+incremental builder's `AddBatch` synchronously, then `Finish` with the declared
+row count. VARCHAR views go directly to the builder; internal TEXT references
+are first resolved through the existing batched LOB reader. Neither path
+retains borrowed Scan values across `Next`, collects previous batches, or uses
+`GetOwn` to prolong their lifetime. The builder does not depend on Column or
+ScanCursor types.
 
 ### Take
 
@@ -323,8 +354,39 @@ duplicates are preserved. Filtered positions stay aligned and carry
 `IsValid(i)` reads validity without constructing data. `GetOwn()` materializes
 an ordered, contiguous result independent of backend pins.
 
-Raw keeps at most the currently accessed Cell pinned and copies only when owned
-output is requested. Vortex may sort, group, and deduplicate offsets internally
+A Take caller that needs both values and validity obtains both from the same
+`TakeResult`; it must not issue a separate validity read. `BulkIsValid` remains
+for paths that need validity alone.
+
+`TakeOptions.candidate_mask` optionally borrows the executor's existing
+per-input-position selection. Only selected offsets participate in Cell
+planning, pinning, and decoding. Result indexing still matches the original
+offsets, but unselected positions must not be read, including in `GetOwn()`
+output. The immutable offsets and mask must outlive the result. This selection
+is independent of the Cell data filter: a selected nullable row skipped by that
+filter still requires its real validity. Raw retains the input references;
+Vortex applies selection while building its internal sorted decode groups.
+
+`TakeOptions.pin_policy` selects the source pin strategy for either backend:
+
+- `CurrentCell` (default): Raw lazily pins the currently accessed Cell, reuses
+  it while accesses stay in that Cell, and releases it before accessing another.
+  Vortex pins, decodes, and releases the required Cells one file at a time.
+- `Batch` resolves the requested offsets and pins all required source Cells
+  before reading. Raw reads directly from that pinned set and retains its pins
+  until `TakeResult` destruction, including across `GetOwn()`. Vortex decodes
+  the selected offsets and releases all source pins when Take completes.
+  Neither backend pins unrelated Cells. Scalar bulk output selects this mode to
+  preserve its previous batch-pin behavior on Raw. It reads values and validity
+  together and copies directly into the final output while the result is alive,
+  without first materializing another Raw owned collection.
+
+Both modes preserve input order, duplicates, and filter/validity semantics.
+Preloaded filters can omit non-nullable skipped Cells from a batch pin;
+nullable Cells remain pinned for authoritative validity. Raw copies payload
+only when owned output is requested. Vortex owns its decoded Take output under
+either policy, so subsequent `Get`/`GetOwn` calls do not pin source Cells again.
+Vortex may sort, group, and deduplicate offsets internally
 to reduce decode work, then restores input order in its already-owned result.
 Neither backend exposes Cell ids, chunk ids, or file-local offsets to callers.
 
@@ -462,6 +524,14 @@ main paths. Legacy Chunk access remains only for consumers not yet migrated.
 Phase 2 removes external Chunk access from sealed columns, leaves Chunk-specific
 APIs only behind concrete Raw/Growing implementations, and renames the common
 abstraction to `ColumnInterface`.
+
+Finite-offset ordinary scalar recall uses Take. Native-list ARRAY output keeps
+its existing Raw `BulkArrayValueAt` and validity adapter; Vortex uses
+`ArrayValueView` Take, including element-nullable values.
+Full-column text-index and geometry-cache construction use Scan. Random group-by
+caches and pointer-based vector/primary-key/system consumers retain their
+existing adapters until their pin and ownership lifetimes are migrated;
+removing the scalar bulk APIs does not imply those consumers are already unified.
 
 Known follow-ups:
 

@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <folly/futures/Future.h>
 #include "storage/IndexEntryEncryptedLocalWriter.h"
 
 #include <fcntl.h>
@@ -56,7 +57,7 @@ IndexEntryEncryptedLocalWriter::IndexEntryEncryptedLocalWriter(
       ez_id_(ez_id),
       collection_id_(collection_id),
       slice_size_(slice_size),
-      pool_(ThreadPools::GetThreadPool(ThreadPoolPriority::MIDDLE)) {
+      pool_(ThreadPools::GetExecutor(ThreadPoolPriority::MIDDLE)) {
     AssertInfo(IsStreamSliceSizeAligned(slice_size_),
                "Encrypted entry slice_size must be {}-byte aligned, got {}",
                kStreamSliceAlignment,
@@ -79,14 +80,20 @@ IndexEntryEncryptedLocalWriter::IndexEntryEncryptedLocalWriter(
     local_path_ = dir + "/milvus_enc_" + boost::uuids::to_string(uuid);
 
     local_fd_ = ::open(local_path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    AssertInfo(
-        local_fd_ != -1, "Failed to create temp file: {}", strerror(errno));
+    if (local_fd_ == -1) {
+        ThrowInfo(ErrorCode::FileCreateFailed,
+                  "Failed to create temp file: {}",
+                  strerror(errno));
+    }
 
     try {
         auto written =
             ::write(local_fd_, MILVUS_V3_MAGIC, MILVUS_V3_MAGIC_SIZE);
-        AssertInfo(written == static_cast<ssize_t>(MILVUS_V3_MAGIC_SIZE),
-                   "Failed to write magic number");
+        if (written != static_cast<ssize_t>(MILVUS_V3_MAGIC_SIZE)) {
+            ThrowInfo(ErrorCode::FileWriteFailed,
+                      "Failed to write magic number: {}",
+                      strerror(errno));
+        }
     } catch (...) {
         ::close(local_fd_);
         local_fd_ = -1;
@@ -120,8 +127,11 @@ ReadExact(int fd, size_t len) {
         if (n == -1 && errno == EINTR) {
             continue;
         }
-        AssertInfo(
-            n > 0, "Failed to read from file descriptor: {}", strerror(errno));
+        if (n <= 0) {
+            ThrowInfo(ErrorCode::FileReadFailed,
+                      "Failed to read from file descriptor: {}",
+                      strerror(errno));
+        }
         total_read += n;
     }
     return buf;
@@ -135,9 +145,9 @@ IndexEntryEncryptedLocalWriter::WriteEntry(const std::string& name,
     CheckDuplicateName(name);
 
     std::vector<SliceMeta> slices;
-    const size_t W = std::max(static_cast<size_t>(pool_.GetMaxThreadNum()),
+    const size_t W = std::max(static_cast<size_t>(pool_.numThreads()),
                               static_cast<size_t>(1));
-    std::deque<std::future<std::string>> pending;
+    std::deque<folly::SemiFuture<std::string>> pending;
     size_t remaining = size;
     uint32_t crc = 0;
 
@@ -153,19 +163,22 @@ IndexEntryEncryptedLocalWriter::WriteEntry(const std::string& name,
             auto slice_data = ReadExact(fd, len);
             crc = Crc32cUpdate(
                 crc, reinterpret_cast<const uint8_t*>(slice_data.data()), len);
-            pending.push_back(pool_.Submit([this, s = std::move(slice_data)]() {
-                return encryptor_->Encrypt(s);
-            }));
+            pending.push_back(
+                folly::via(&pool_, [this, s = std::move(slice_data)]() {
+                    return encryptor_->Encrypt(s);
+                }).semi());
             remaining -= len;
         }
         // Drain the oldest completed future
         if (!pending.empty()) {
-            auto encrypted = pending.front().get();
+            auto encrypted = std::move(pending.front()).get();
             pending.pop_front();
             auto written =
                 ::write(local_fd_, encrypted.data(), encrypted.size());
-            AssertInfo(written == static_cast<ssize_t>(encrypted.size()),
-                       "Failed to write encrypted slice");
+            if (!(written == static_cast<ssize_t>(encrypted.size()))) {
+                ThrowInfo(ErrorCode::FileWriteFailed,
+                          "Failed to write encrypted slice");
+            }
             slices.push_back(
                 {current_offset_, static_cast<uint64_t>(encrypted.size())});
             current_offset_ += encrypted.size();
@@ -180,9 +193,9 @@ IndexEntryEncryptedLocalWriter::EncryptAndWriteSlices(const std::string& name,
                                                       const uint8_t* data,
                                                       size_t size) {
     std::vector<SliceMeta> slices;
-    const size_t W = std::max(static_cast<size_t>(pool_.GetMaxThreadNum()),
+    const size_t W = std::max(static_cast<size_t>(pool_.numThreads()),
                               static_cast<size_t>(1));
-    std::deque<std::future<std::string>> pending;
+    std::deque<folly::SemiFuture<std::string>> pending;
     size_t remaining = size;
     size_t read_offset = 0;
     uint32_t crc = 0;
@@ -198,19 +211,22 @@ IndexEntryEncryptedLocalWriter::EncryptAndWriteSlices(const std::string& name,
             crc = Crc32cUpdate(crc, data + read_offset, len);
             auto slice_data = std::string(
                 reinterpret_cast<const char*>(data + read_offset), len);
-            pending.push_back(pool_.Submit([this, s = std::move(slice_data)]() {
-                return encryptor_->Encrypt(s);
-            }));
+            pending.push_back(
+                folly::via(&pool_, [this, s = std::move(slice_data)]() {
+                    return encryptor_->Encrypt(s);
+                }).semi());
             read_offset += len;
             remaining -= len;
         }
         if (!pending.empty()) {
-            auto encrypted = pending.front().get();
+            auto encrypted = std::move(pending.front()).get();
             pending.pop_front();
             auto written =
                 ::write(local_fd_, encrypted.data(), encrypted.size());
-            AssertInfo(written == static_cast<ssize_t>(encrypted.size()),
-                       "Failed to write encrypted slice");
+            if (!(written == static_cast<ssize_t>(encrypted.size()))) {
+                ThrowInfo(ErrorCode::FileWriteFailed,
+                          "Failed to write encrypted slice");
+            }
             slices.push_back(
                 {current_offset_, static_cast<uint64_t>(encrypted.size())});
             current_offset_ += encrypted.size();
@@ -257,8 +273,10 @@ IndexEntryEncryptedLocalWriter::Finish() {
 
     auto dir_str = dir_json.dump();
     auto written = ::write(local_fd_, dir_str.data(), dir_str.size());
-    AssertInfo(written == static_cast<ssize_t>(dir_str.size()),
-               "Failed to write directory table");
+    if (!(written == static_cast<ssize_t>(dir_str.size()))) {
+        ThrowInfo(ErrorCode::FileWriteFailed,
+                  "Failed to write directory table");
+    }
 
     // Write 32-byte Footer
     uint8_t footer[MILVUS_V3_FOOTER_SIZE] = {};
@@ -271,8 +289,9 @@ IndexEntryEncryptedLocalWriter::Finish() {
     milvus::fastmem::FastMemcpy(footer + 28, &dir_size_u32, sizeof(uint32_t));
 
     written = ::write(local_fd_, footer, MILVUS_V3_FOOTER_SIZE);
-    AssertInfo(written == static_cast<ssize_t>(MILVUS_V3_FOOTER_SIZE),
-               "Failed to write footer");
+    if (!(written == static_cast<ssize_t>(MILVUS_V3_FOOTER_SIZE))) {
+        ThrowInfo(ErrorCode::FileWriteFailed, "Failed to write footer");
+    }
 
     ::close(local_fd_);
     local_fd_ = -1;
@@ -290,15 +309,20 @@ IndexEntryEncryptedLocalWriter::Finish() {
 void
 IndexEntryEncryptedLocalWriter::UploadLocalFile() {
     auto result = fs_->OpenOutputStream(remote_path_);
-    AssertInfo(result.ok(),
-               "Failed to open remote output stream: {}",
-               result.status().ToString());
+    if (!result.ok()) {
+        ThrowInfo(ArrowStatusToErrorCode(result.status()),
+                  "failed to open remote output stream: {}",
+                  result.status().ToString());
+    }
     auto remote_stream =
         std::make_shared<RemoteOutputStream>(std::move(result.ValueOrDie()));
 
     int read_fd = ::open(local_path_.c_str(), O_RDONLY);
-    AssertInfo(
-        read_fd != -1, "Failed to open local file for upload: {}", local_path_);
+    if (!(read_fd != -1)) {
+        ThrowInfo(ErrorCode::FileOpenFailed,
+                  "Failed to open local file for upload: {}",
+                  local_path_);
+    }
     auto close_read_fd = folly::makeGuard([read_fd]() { ::close(read_fd); });
 
     constexpr size_t kBufSize = 16 * 1024 * 1024;
@@ -313,7 +337,7 @@ IndexEntryEncryptedLocalWriter::UploadLocalFile() {
             if (errno == EINTR) {
                 continue;
             }
-            ThrowInfo(ErrorCode::UnexpectedError,
+            ThrowInfo(ErrorCode::FileReadFailed,
                       fmt::format("Failed to read local file {}: {}",
                                   local_path_,
                                   strerror(errno)));

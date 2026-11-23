@@ -33,8 +33,13 @@ const (
 	SubTypeKey      = "task_sub_type" // optional, only for Stats
 	SlotKey         = "task_slot"
 	NumRowsKey      = "num_row"      // optional, only for Index, Stats
-	TaskVersionKey  = "task_version" // optional, only for Index, Stats and Analyze
+	TaskVersionKey  = "task_version" // optional, for version-aware tasks
 	CollectionIDKey = "collection_id"
+	// optional: the names of the collection a task works on; absent when the
+	// coordinator cannot resolve the collection.
+	CollectionNameKey = "collection_name"
+	DatabaseIDKey     = "database_id"
+	DatabaseNameKey   = "database_name"
 
 	// result
 	StateKey      = "task_state"
@@ -69,7 +74,7 @@ func (p Properties) AppendTaskID(taskID int64) {
 
 func (p Properties) AppendType(t Type) {
 	switch t {
-	case PreImport, Import, Compaction, Index, Stats, Analyze, RefreshExternalCollection, CopySegment, ExternalCopySegment:
+	case PreImport, PreImportV3, Import, Reshard, ImportV3, Compaction, Index, Stats, Analyze, RefreshExternalCollection, CopySegment, ExternalCopySegment:
 		p[TypeKey] = t
 	default:
 		p[TypeKey] = TypeNone
@@ -96,6 +101,18 @@ func (p Properties) AppendCollectionID(collectionID int64) {
 	p[CollectionIDKey] = fmt.Sprintf("%d", collectionID)
 }
 
+func (p Properties) AppendCollectionName(collectionName string) {
+	p[CollectionNameKey] = collectionName
+}
+
+func (p Properties) AppendDatabaseID(databaseID int64) {
+	p[DatabaseIDKey] = fmt.Sprintf("%d", databaseID)
+}
+
+func (p Properties) AppendDatabaseName(databaseName string) {
+	p[DatabaseNameKey] = databaseName
+}
+
 func (p Properties) AppendReason(reason string) {
 	p[ReasonKey] = reason
 }
@@ -117,7 +134,7 @@ func (p Properties) GetTaskType() (Type, error) {
 		return "", WrapErrTaskPropertyLack(TypeKey, p[TaskIDKey])
 	}
 	switch p[TypeKey] {
-	case PreImport, Import, Compaction, Index, Stats, Analyze, RefreshExternalCollection, CopySegment, ExternalCopySegment:
+	case PreImport, PreImportV3, Import, Reshard, ImportV3, Compaction, Index, Stats, Analyze, RefreshExternalCollection, CopySegment, ExternalCopySegment:
 		return p[TypeKey], nil
 	default:
 		// Task types are assigned by the coordinator. An unrecognized type means
@@ -216,6 +233,26 @@ func (p Properties) GetCollectionID() (int64, error) {
 		return 0, err
 	}
 	return collectionID, nil
+}
+
+// GetCollectionName returns "" when the coordinator sent no name.
+func (p Properties) GetCollectionName() string {
+	return p[CollectionNameKey]
+}
+
+// GetDatabaseID returns 0 when the coordinator sent no database ID or an
+// unparsable one.
+func (p Properties) GetDatabaseID() int64 {
+	databaseID, err := strconv.ParseInt(p[DatabaseIDKey], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return databaseID
+}
+
+// GetDatabaseName returns "" when the coordinator sent no name.
+func (p Properties) GetDatabaseName() string {
+	return p[DatabaseNameKey]
 }
 
 func (p Properties) GetCostTime() int64 {

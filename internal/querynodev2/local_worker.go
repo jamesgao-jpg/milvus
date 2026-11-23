@@ -25,7 +25,6 @@ import (
 	"github.com/milvus-io/milvus/internal/util/streamrpc"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/v3/util/fastpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/resource"
 )
@@ -72,9 +71,8 @@ func (w *LocalWorker) SearchSegments(ctx context.Context, req *querypb.SearchReq
 	// use it directly), then release any pinned C memory.
 	if blob := resp.GetSlicedBlob(); len(blob) > 0 {
 		var resultData schemapb.SearchResultData
-		// fastpb: wire-equivalent fast decoder for the local (in-process) search
-		// hot path (~2x varchar / ~6x vector vs proto.Unmarshal).
-		if unmarshalErr := fastpb.UnmarshalSearchResultData(blob, &resultData); unmarshalErr != nil {
+		// Decode with the configured fast or standard protobuf decoder.
+		if unmarshalErr := resource.UnmarshalSearchResultData(blob, &resultData); unmarshalErr != nil {
 			resource.MsgPins.Release(resp) // still release to avoid leak
 			return nil, merr.WrapErrServiceInternal("unmarshal SearchResultData from SlicedBlob", unmarshalErr.Error())
 		}
@@ -87,6 +85,10 @@ func (w *LocalWorker) SearchSegments(ctx context.Context, req *querypb.SearchReq
 
 func (w *LocalWorker) QueryStreamSegments(ctx context.Context, req *querypb.QueryRequest, srv streamrpc.QueryStreamServer) error {
 	return w.node.queryStreamSegments(ctx, req, srv)
+}
+
+func (w *LocalWorker) MaterializeSegments(ctx context.Context, req *querypb.QueryRequest) (*internalpb.MaterializeResults, error) {
+	return w.node.MaterializeSegments(ctx, req)
 }
 
 func (w *LocalWorker) QuerySegments(ctx context.Context, req *querypb.QueryRequest) (*internalpb.RetrieveResults, error) {

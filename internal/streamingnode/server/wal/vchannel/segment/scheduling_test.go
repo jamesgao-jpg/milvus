@@ -11,6 +11,7 @@ import (
 
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/moduleapi"
 	"github.com/milvus-io/milvus/pkg/v3/proto/streamingpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/viewpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/nodescheduler"
 	"github.com/milvus-io/milvus/pkg/v3/util/retry"
@@ -25,6 +26,8 @@ type fakeSegmentTask struct {
 	executed bool
 	failErr  error
 }
+
+func (t *fakeSegmentTask) timeTick() uint64 { return 0 }
 
 func (t *fakeSegmentTask) Execute(ctx context.Context) error {
 	return t.execute(ctx, func(ctx context.Context) error {
@@ -145,14 +148,14 @@ func TestSegmentTaskUnclassifiedErrorIsRetryable(t *testing.T) {
 
 // failingLifecycle fails both lifecycle calls with an unrecoverable
 // (InputError-class) error, simulating a permanent coordinator rejection.
-type failingLifecycle struct{}
+type failingLifecycle struct{ Lifecycle }
 
 func (failingLifecycle) EnsureGrowingSegment(context.Context, *streamingpb.SegmentAssignmentMeta) error {
 	return retry.Unrecoverable(merr.WrapErrParameterInvalid("v2", "v3"))
 }
 
-func (failingLifecycle) CommitL1Segment(context.Context, *streamingpb.SegmentAssignmentMeta) error {
-	return retry.Unrecoverable(merr.WrapErrParameterInvalid("v2", "v3"))
+func (failingLifecycle) CommitL1Segment(context.Context, *streamingpb.SegmentAssignmentMeta) (*viewpb.DataVersion, error) {
+	return nil, retry.Unrecoverable(merr.WrapErrParameterInvalid("v2", "v3"))
 }
 
 // TestSegmentTaskTerminalErrorNotMarkedDelay covers the CRITICAL contract: an

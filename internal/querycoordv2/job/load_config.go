@@ -24,9 +24,9 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
-	"github.com/milvus-io/milvus/internal/distributed/streaming"
+	"github.com/milvus-io/milvus/internal/metacache"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
+	"github.com/milvus-io/milvus/pkg/v3/extension"
 	"github.com/milvus-io/milvus/pkg/v3/proto/messagespb"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
@@ -34,14 +34,46 @@ import (
 
 type AlterLoadConfigRequest struct {
 	Meta           *meta.Meta
-	CollectionInfo *milvuspb.DescribeCollectionResponse
+	CollectionInfo *metacache.CollectionInfo
 	Expected       ExpectedLoadConfig
 	Current        CurrentLoadConfig
+
+	// ScopedResourceGroups is the list of resource groups the REQUEST named, as
+	// the caller wrote it; empty when it named none. Only a form reads it (see
+	// CheckIfLoadPartitionsExecutable): with one installed, a request naming
+	// groups speaks only for those, and Expected.ExpectedReplicaNumber carries
+	// the other groups' counts through unchanged.
+	ScopedResourceGroups []string
 }
 
-// CheckIfLoadPartitionsExecutable checks if the load partitions is executable.
+// CheckIfLoadPartitionsExecutable checks if the load partitions is executable:
+// loading more partitions of a loaded collection may not change its replica
+// number.
+//
+// On a stock binary that is the total, as it always was. With a form installed
+// and a request that names resource groups, the request speaks only for those
+// groups (the completed placement carries the others through unchanged, see
+// completePlacementForOutOfScopeResourceGroups), so the rule is applied to the
+// named groups alone: a named group that already holds replicas must keep its
+// count, while a named group that holds none is being added, which is the
+// expansion a scoped load exists for and not a replica-number change.
+// Comparing the total there would refuse every such expansion.
 func (req *AlterLoadConfigRequest) CheckIfLoadPartitionsExecutable() error {
 	if req.Current.Collection == nil {
+		return nil
+	}
+	if extension.FormInstalled() && len(req.ScopedResourceGroups) > 0 {
+		current := req.Current.GetReplicaNumber()
+		for _, rgName := range req.ScopedResourceGroups {
+			held := current[rgName]
+			if held == 0 {
+				continue // the request adds this group
+			}
+			if expected := req.Expected.ExpectedReplicaNumber[rgName]; held != expected {
+				return merr.WrapErrParameterInvalid(held, expected,
+					"can't change the replica number for loaded partitions in resource group "+rgName)
+			}
+		}
 		return nil
 	}
 	expectedReplicaNumber := 0
@@ -55,15 +87,18 @@ func (req *AlterLoadConfigRequest) CheckIfLoadPartitionsExecutable() error {
 }
 
 type ExpectedLoadConfig struct {
+	ExpectedAutoLoad                 bool
 	ExpectedPartitionIDs             []int64
 	ExpectedReplicaNumber            map[string]int // map resource group name to replica number in resource group
 	ExpectedFieldIndexID             map[int64]int64
-	ExpectedLoadFields               []int64
+	ExpectedLoadFields               []int64 // Explicit preloads, already resolved by the request adapter.
+	ExpectedRequiredFields           []*messagespb.LoadFieldConfig
 	ExpectedPriority                 commonpb.LoadPriority
 	ExpectedUserSpecifiedReplicaMode bool
 }
 
 type CurrentLoadConfig struct {
+	AutoLoad   bool
 	Collection *meta.Collection
 	Partitions map[int64]*meta.Partition
 	Replicas   map[int64]*meta.Replica
@@ -133,8 +168,10 @@ func (c *CurrentLoadConfig) IntoLoadConfigMessageHeader() *messagespb.AlterLoadC
 		CollectionId:             c.Collection.CollectionID,
 		PartitionIds:             partitionIDs,
 		LoadFields:               loadFields,
+		RequiredFields:           c.Collection.GetRequiredFields(),
 		Replicas:                 replicas,
 		UserSpecifiedReplicaMode: c.GetUserSpecifiedReplicaMode(),
+		AutoLoad:                 c.AutoLoad,
 	}
 }
 
@@ -154,12 +191,14 @@ func GenerateAlterLoadConfigMessage(ctx context.Context, req *AlterLoadConfigReq
 		return partitionIDs[i] < partitionIDs[j]
 	})
 	header := &messagespb.AlterLoadConfigMessageHeader{
-		DbId:                     req.CollectionInfo.DbId,
-		CollectionId:             req.CollectionInfo.CollectionID,
+		DbId:                     req.CollectionInfo.DatabaseID,
+		CollectionId:             req.CollectionInfo.ID,
 		PartitionIds:             partitionIDs,
 		LoadFields:               loadFields,
+		RequiredFields:           req.Expected.ExpectedRequiredFields,
 		Replicas:                 loadReplicaConfigs,
 		UserSpecifiedReplicaMode: req.Expected.ExpectedUserSpecifiedReplicaMode,
+		AutoLoad:                 req.Expected.ExpectedAutoLoad,
 	}
 	// check if the load configuration is changed; nothing to broadcast if not.
 	if previousHeader := req.Current.IntoLoadConfigMessageHeader(); proto.Equal(previousHeader, header) {
@@ -168,7 +207,7 @@ func GenerateAlterLoadConfigMessage(ctx context.Context, req *AlterLoadConfigReq
 	return message.NewAlterLoadConfigMessageBuilderV2().
 		WithHeader(header).
 		WithBody(&messagespb.AlterLoadConfigMessageBody{}).
-		WithBroadcast([]string{streaming.WAL().ControlChannel()}).
+		WithControlChannelBroadcast().
 		MustBuildBroadcast(), nil
 }
 

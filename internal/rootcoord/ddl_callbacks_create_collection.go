@@ -24,10 +24,10 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
-	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	streamingbroadcaster "github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster"
 	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/etcdpb"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
@@ -38,6 +38,14 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
+
+type collectionDataViewCreator interface {
+	CreateCollectionDataView(ctx context.Context, collectionID int64, vchannels []string) error
+}
+
+type collectionDataViewTransformCreator interface {
+	CreateCollectionDataViewWithTransformStarts(ctx context.Context, result message.BroadcastResultCreateCollectionMessageV1) error
+}
 
 func (c *Core) broadcastCreateCollectionV1(ctx context.Context, req *milvuspb.CreateCollectionRequest) error {
 	schema := &schemapb.CollectionSchema{}
@@ -83,9 +91,8 @@ func (c *Core) broadcastCreateCollectionV1(ctx context.Context, req *milvuspb.Cr
 		return err
 	}
 
-	// set up the broadcast virtual channels and control channel, then make a broadcast message.
-	broadcastChannel := make([]string, 0, createCollectionTask.Req.ShardsNum+1)
-	broadcastChannel = append(broadcastChannel, streaming.WAL().ControlChannel())
+	// set up the broadcast virtual channels, then make a broadcast message.
+	broadcastChannel := make([]string, 0, createCollectionTask.Req.ShardsNum)
 	for i := 0; i < int(createCollectionTask.Req.ShardsNum); i++ {
 		broadcastChannel = append(broadcastChannel, createCollectionTask.body.VirtualChannelNames[i])
 	}
@@ -106,6 +113,10 @@ func (c *Core) broadcastCreateCollectionV1(ctx context.Context, req *milvuspb.Cr
 }
 
 func (c *DDLCallback) createCollectionV1AckCallback(ctx context.Context, result message.BroadcastResultCreateCollectionMessageV1) error {
+	return c.applyCollectionCreation(ctx, result, etcdpb.CollectionState_CollectionCreated)
+}
+
+func (c *DDLCallback) applyCollectionCreation(ctx context.Context, result message.BroadcastResultCreateCollectionMessageV1, state etcdpb.CollectionState) error {
 	msg := result.Message
 	header := msg.Header()
 	body := msg.MustBody()
@@ -117,7 +128,19 @@ func (c *DDLCallback) createCollectionV1AckCallback(ctx context.Context, result 
 			}
 		}
 	}
+	creator, ok := c.mixCoord.(collectionDataViewCreator)
+	if transformCreator, supportsTransform := c.mixCoord.(collectionDataViewTransformCreator); supportsTransform {
+		if err := transformCreator.CreateCollectionDataViewWithTransformStarts(ctx, result); err != nil {
+			return merr.Wrap(err, "failed to create collection data view")
+		}
+	} else if !ok {
+		mlog.Warn(ctx, "MixCoord does not support DataView collection creation",
+			mlog.FieldCollectionID(header.CollectionId))
+	} else if err := creator.CreateCollectionDataView(ctx, header.CollectionId, body.VirtualChannelNames); err != nil {
+		return merr.Wrap(err, "failed to create collection data view")
+	}
 	newCollInfo := newCollectionModelWithMessage(header, body, result)
+	newCollInfo.State = state
 	if err := c.meta.AddCollection(ctx, newCollInfo); err != nil {
 		return merr.Wrap(err, "failed to add collection to meta table")
 	}
@@ -216,7 +239,7 @@ func newCollectionModel(header *message.CreateCollectionMessageHeader, body *mes
 		EnableDynamicField:   body.CollectionSchema.EnableDynamicField,
 		EnableNamespace:      body.CollectionSchema.EnableNamespace,
 		UpdateTimestamp:      ts,
-		SchemaVersion:        0,
+		SchemaVersion:        body.CollectionSchema.GetVersion(),
 		ShardInfos:           shardInfos,
 		FileResourceIds:      body.CollectionSchema.GetFileResourceIds(),
 		ExternalSource:       body.CollectionSchema.ExternalSource,

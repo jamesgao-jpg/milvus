@@ -287,12 +287,12 @@ func (s *MetaWriterSuite) TestGrowingSourceSyncShipsStats() {
 	ctx := context.Background()
 
 	cfg := &indexpb.StorageConfig{StorageType: "local", RootPath: s.T().TempDir()}
-	basePath := "files/growing_stats/seg1"
-	bloomPath := path.Join(cfg.RootPath, basePath, "_stats/bloom_filter.100/1")
-	bm25Path := path.Join(cfg.RootPath, basePath, "_stats/bm25.102/1")
+	basePath := path.Join(cfg.RootPath, "growing_stats/seg1")
+	bloomPath := path.Join(basePath, "_stats/bloom_filter.100/1")
+	bm25Path := path.Join(basePath, "_stats/bm25.102/1")
 	s.Require().NoError(packed.WriteFile(cfg, bloomPath, []byte("bloom")))
 	s.Require().NoError(packed.WriteFile(cfg, bm25Path, []byte("bm25")))
-	manifestPath, err := packed.CommitManifestUpdates(basePath, packed.ManifestEarliest, cfg, &packed.ManifestUpdates{
+	manifestPath, err := packed.CommitManifestUpdates(packed.MarshalManifestPath(basePath, packed.ManifestEarliest), cfg, &packed.ManifestUpdates{
 		Stats: []packed.StatEntry{
 			{Key: "bloom_filter.100", Files: []string{bloomPath}, Metadata: map[string]string{"memory_size": "10"}},
 			{Key: "bm25.102", Files: []string{bm25Path}, Metadata: map[string]string{"memory_size": "20"}},

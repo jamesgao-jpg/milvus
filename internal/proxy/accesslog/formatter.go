@@ -31,6 +31,10 @@ const (
 
 var BaseFormatterKey = "base"
 
+// lineBreakEscaper keeps one access log record on one line when field values
+// carry CR or LF from the request.
+var lineBreakEscaper = strings.NewReplacer("\r", "\\r", "\n", "\\n")
+
 // Formaater manager not concurrent safe
 // make sure init with Add and SetMethod before use Get
 type FormatterManger struct {
@@ -121,13 +125,20 @@ func (f *Formatter) build() {
 
 func (f *Formatter) Format(i info.AccessInfo) string {
 	fieldValues := info.Get(i, f.fields...)
+	for idx, v := range fieldValues {
+		if s, ok := v.(string); ok && strings.ContainsAny(s, "\r\n") {
+			fieldValues[idx] = lineBreakEscaper.Replace(s)
+		}
+	}
 	return fmt.Sprintf(f.fmt, fieldValues...)
 }
 
 func parseConfigKey(k string) (string, string, error) {
 	fields := strings.Split(k, ".")
 	if len(fields) != 2 || (fields[1] != fomaterkey && fields[1] != methodKey) {
-		return "", "", merr.WrapErrParameterInvalid("<FormatterName>.(format|methods)", k, "parse accsslog formatter config key failed")
+		// Dynamic names are request payload. This error is also logged by the
+		// refresh callback, so describe the required shape without echoing k.
+		return "", "", merr.WrapErrParameterInvalidMsg("access log formatter key must match <FormatterName>.(format|methods)")
 	}
 	return fields[0], fields[1], nil
 }

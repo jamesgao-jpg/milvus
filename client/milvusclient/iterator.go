@@ -108,9 +108,15 @@ func (it *searchIteratorV2) next(ctx context.Context) (ResultSet, error) {
 		if err != nil {
 			return err
 		}
+		if len(resultSets) == 0 {
+			return merr.WrapErrServiceInternal("search iterator response has no result set")
+		}
 		rs = resultSets[0]
+		if rs.Err != nil {
+			return rs.Err
+		}
 
-		if rs.IDs.Len() == 0 {
+		if rs.IDs == nil || rs.IDs.Len() == 0 {
 			return io.EOF
 		}
 
@@ -126,7 +132,7 @@ func (it *searchIteratorV2) setupCollectionID(ctx context.Context) error {
 		resp, err := milvusService.DescribeCollection(ctx, &milvuspb.DescribeCollectionRequest{
 			CollectionName: opt.collectionName,
 		})
-		if merr.CheckRPCCall(resp, err) != nil {
+		if err := merr.CheckRPCCall(resp, err); err != nil {
 			return err
 		}
 
@@ -257,7 +263,12 @@ func (it *queryIterator) composeIteratorExpr() string {
 		}
 		return fmt.Sprintf("(%s) and %s", expr, pkFilter)
 	case entity.FieldTypeVarChar:
-		pkFilter := fmt.Sprintf(`%s > "%s"`, pkName, it.lastPK)
+		// Quote the primary key as a Go string literal. The server unquotes a
+		// string literal with strconv.Unquote (see planparserv2.convertEscapeSingle),
+		// so strconv.Quote round-trips any value, including one that contains a
+		// double quote, a backslash or a newline. Interpolating the raw value
+		// instead produced an invalid filter such as `ID > "a"b"`.
+		pkFilter := fmt.Sprintf("%s > %s", pkName, strconv.Quote(fmt.Sprintf("%v", it.lastPK)))
 		if len(expr) == 0 {
 			return pkFilter
 		}
@@ -289,19 +300,8 @@ func (it *queryIterator) fetchNextBatch(ctx context.Context) (ResultSet, error) 
 			return err
 		}
 
-		columns, err := it.client.parseSearchResult(it.schema, resp.GetOutputFields(), resp.GetFieldsData(), 0, 0, -1)
-		if err != nil {
-			return err
-		}
-		resultSet = ResultSet{
-			sch:    it.schema,
-			Fields: columns,
-		}
-		if len(columns) > 0 {
-			resultSet.ResultCount = columns[0].Len()
-		}
-
-		return nil
+		resultSet, err = it.client.parseQueryResult(it.schema, resp.GetOutputFields(), resp)
+		return err
 	})
 
 	return resultSet, err

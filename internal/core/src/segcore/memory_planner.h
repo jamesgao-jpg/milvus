@@ -20,7 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <future>
+#include <folly/futures/Future.h>
 #include <memory>
 #include <string>
 #include <vector>
@@ -31,9 +31,13 @@
 #include "common/OpContext.h"
 #include "milvus-storage/common/metadata.h"
 #include "milvus-storage/filesystem/fs.h"
+#include "milvus-storage/format/parquet/file_reader.h"
 #include "milvus-storage/reader.h"
 
 namespace milvus::segcore {
+
+using PreparedParquetFiles =
+    std::vector<std::shared_ptr<milvus_storage::PreparedParquetFile>>;
 
 struct RowGroupBlock {
     int64_t offset;  // Start offset of the row group block
@@ -73,6 +77,8 @@ class ParallelDegreeSplitStrategy : public RowGroupSplitStrategy {
  * @param strategy: strategy to split row groups
  * @param row_group_lists: list of row group lists
  * @param schema: schema of the data, if not provided, storage v2 will read all columns of the files.
+ * @param prepared_files: contexts from metadata discovery, in remote_files order.
+ * If omitted, prepare each file once before splitting it into reader tasks.
  */
 void
 LoadWithStrategy(const std::vector<std::string>& remote_files,
@@ -83,7 +89,8 @@ LoadWithStrategy(const std::vector<std::string>& remote_files,
                  const milvus_storage::ArrowFileSystemPtr& fs,
                  const std::shared_ptr<arrow::Schema> schema = nullptr,
                  milvus::proto::common::LoadPriority priority =
-                     milvus::proto::common::LoadPriority::HIGH);
+                     milvus::proto::common::LoadPriority::HIGH,
+                 const PreparedParquetFiles& prepared_files = {});
 
 // ---- Cell-batch loading ----
 
@@ -113,13 +120,28 @@ struct CellSpec {
         0;  // extra transient bytes during loading; 0 = memory_size
 };
 
+// One contiguous batch, shared by sealed loading and growing recovery.
+struct CellLoadBatch {
+    size_t file_idx;
+    int64_t rg_offset;
+    int64_t rg_count;
+    int64_t batch_loaded_memory_bytes = 0;
+    size_t batch_loading_overhead_bytes = 0;
+    std::vector<CellSpec> cells;
+};
+
+// Sorts cells by file/offset and groups neighbors by estimated transient bytes.
+// A cell larger than the positive split target occupies its own batch.
+[[nodiscard]] std::vector<CellLoadBatch>
+PlanCellLoadBatches(std::vector<CellSpec> cell_specs, int64_t memory_limit);
+
 struct LoadedCell {
     int64_t cid;
     std::unique_ptr<milvus::GroupChunk> chunk;
 };
 
 using LoadedCellBatch = std::vector<LoadedCell>;
-using CellLoadFuture = std::future<LoadedCellBatch>;
+using CellLoadFuture = folly::SemiFuture<LoadedCellBatch>;
 
 // Creates a batch reader for a range of contiguous row groups.
 // Returns all row groups as a vector of tables in one call.
@@ -166,14 +188,11 @@ LoadCellBatchAsync(milvus::OpContext* op_ctx,
 
 /**
  * Creates a BatchReaderFactory that reads from Parquet files via
- * FileRowGroupReader. This factory uses one reader for the requested contiguous
- * row group range and leaves row group internals to the storage/Arrow reader.
- * The returned factory owns a copy of remote_files, so the caller's vector
- * need not outlive the factory.
+ * independent readers from caller-prepared files. The factory retains the file
+ * contexts across batch tasks; it shares plaintext footers but no reader state.
  */
 BatchReaderFactory
-MakeFileReaderFactory(std::vector<std::string> remote_files,
-                      milvus_storage::ArrowFileSystemPtr fs);
+MakeFileReaderFactory(PreparedParquetFiles prepared_files);
 
 /**
  * Creates a BatchReaderFactory that reads from a ChunkReader via batch

@@ -2,12 +2,20 @@ package shards
 
 import (
 	"context"
+	"encoding/json"
 	"math/rand"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/bytedance/mockey"
 	"github.com/cockroachdb/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 
 	"github.com/milvus-io/milvus/internal/mocks/streamingnode/server/mock_wal"
 	"github.com/milvus-io/milvus/internal/mocks/streamingnode/server/wal/interceptors/shard/mock_utils"
@@ -17,14 +25,108 @@ import (
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/shard/stats"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/shard/utils"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/metricsutil"
+	"github.com/milvus-io/milvus/pkg/v3/metrics"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/messagespb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/streamingpb"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/types"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/walimpls/impls/rmq"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v3/util/syncutil"
 )
+
+func TestPartitionManagerLogging(t *testing.T) {
+	sink := mlog.CaptureGlobalLogs(t, &mlog.Config{Level: "debug", Format: "json"})
+	parent := mlog.With(mlog.FieldPChannel("pchannel"), mlog.FieldComponent("shard-manager"))
+	ctx := context.Background()
+	future := syncutil.NewFuture[wal.WAL]()
+	future.Set(mock_wal.NewMockWAL(t))
+	segment := &segmentAllocManager{inner: &streamingpb.SegmentAssignmentMeta{SegmentId: 1001}}
+	done := make(chan struct{}, 4)
+	alloc := mockey.Mock((*segmentAllocWorker).do).To(func(w *segmentAllocWorker) {
+		w.Logger().Info(w.ctx, "alloc worker")
+		done <- struct{}{}
+	}).Build()
+	defer alloc.UnPatch()
+	flush := mockey.Mock((*segmentFlushWorker).do).To(func(w *segmentFlushWorker) {
+		w.Logger().Info(w.ctx, "flush worker")
+		done <- struct{}{}
+	}).Build()
+	defer flush.UnPatch()
+
+	managers := []*partitionManager{
+		newPartitionSegmentManager(ctx, parent, future, types.PChannelInfo{}, "v1", 1, 2, nil, nil, 0, nil),
+		newPartitionSegmentManager(ctx, parent, future, types.PChannelInfo{}, "v2", 3, 4, nil, nil, 0, nil),
+	}
+	for _, manager := range managers {
+		require.Same(t, parent, manager.Logger())
+		manager.asyncAllocSegment(0, false)
+		manager.asyncFlushSegment(ctx, segment)
+	}
+	for range 4 {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("worker did not finish logging")
+		}
+	}
+
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	for _, manager := range managers {
+		manager.asyncAllocSegment(0, false)
+		manager.wal = syncutil.NewFuture[wal.WAL]()
+		manager.asyncFlushSegment(canceledCtx, segment)
+	}
+	require.Eventually(t, func() bool {
+		return strings.Count(sink.String(), "stop flushing segment before wal is ready") == 2
+	}, time.Second, time.Millisecond)
+	parent.Info(ctx, "parent logger")
+
+	expectedLevels := map[string]string{
+		"alloc worker": "INFO",
+		"flush worker": "INFO",
+		"segment alloc worker is already on allocating": "DEBUG",
+		"stop flushing segment before wal is ready":     "INFO",
+	}
+	counts := make(map[string]int)
+	for _, line := range strings.Split(strings.TrimSpace(sink.String()), "\n") {
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &entry))
+		msg := entry["message"].(string)
+		if _, ok := expectedLevels[msg]; !ok && msg != "parent logger" {
+			continue
+		}
+		require.Equal(t, "pchannel", entry["pchannel"])
+		require.Equal(t, "shard-manager", entry["component"])
+		if entry["message"] == "parent logger" {
+			require.NotContains(t, entry, "vchannel")
+			require.NotContains(t, entry, "collectionID")
+			require.NotContains(t, entry, "partitionID")
+			continue
+		}
+		require.Equal(t, expectedLevels[msg], entry["level"])
+		counts[msg]++
+		switch entry["vchannel"] {
+		case "v1":
+			require.Equal(t, float64(1), entry["collectionID"])
+			require.Equal(t, float64(2), entry["partitionID"])
+		case "v2":
+			require.Equal(t, float64(3), entry["collectionID"])
+			require.Equal(t, float64(4), entry["partitionID"])
+		default:
+			t.Fatalf("missing or unexpected partition fields: %v", entry)
+		}
+		if msg == "stop flushing segment before wal is ready" {
+			require.Equal(t, float64(1001), entry["segmentID"])
+			require.Contains(t, entry["error"], "context canceled")
+		}
+	}
+	for msg := range expectedLevels {
+		require.Equal(t, 2, counts[msg], msg)
+	}
+}
 
 func TestPartitionManager(t *testing.T) {
 	paramtable.Init()
@@ -205,4 +307,57 @@ func (m *mockedTxnManager) RecoverDone() <-chan struct{} {
 	ch := make(chan struct{})
 	close(ch)
 	return ch
+}
+
+// A pending async Flush has already registered the segment's metrics. A later
+// collection-wide fence or drop must remove it without recording it again.
+func TestPartitionFlushMetricsRecordedOnce(t *testing.T) {
+	paramtable.Init()
+	for _, drop := range []bool{false, true} {
+		name := "fence"
+		if drop {
+			name = "drop"
+		}
+		t.Run(name, func(t *testing.T) {
+			resource.InitForTest(t)
+			manager := newShardManagerWithGrowingSegment(t, 1, 2, 1001)
+			defer manager.Close()
+			pm := manager.partitionManagers[PartitionUniqueKey{CollectionID: 1, PartitionID: 2}]
+			segment := pm.GetSegmentManager(1001)
+			pendingFlush := mockey.Mock((*partitionManager).asyncFlushSegment).Return().Build()
+			defer pendingFlush.UnPatch()
+
+			labels := []string{paramtable.GetStringNodeID(), manager.Channel().Name}
+			growing := metrics.WALSegmentAllocTotal.WithLabelValues(labels...)
+			flushed := metrics.WALSegmentFlushedTotal.WithLabelValues(append(labels, string(policy.PolicyNameCapacity))...)
+			require.Equal(t, float64(1), testutil.ToFloat64(growing))
+			signal := utils.SealSegmentSignal{
+				SegmentBelongs: utils.SegmentBelongs{SegmentID: 1001},
+				SealPolicy:     policy.PolicyCapacity(),
+			}
+			require.NoError(t, pm.AsyncFlushSegment(signal))
+			require.NoError(t, pm.AsyncFlushSegment(signal))
+			require.Equal(t, 1, pendingFlush.Times())
+
+			var ids []int64
+			if drop {
+				ids = pm.FlushAndDropPartition(policy.PolicyPartitionRemoved())
+			} else {
+				ids = pm.FlushAndFenceSegmentUntil(200)
+			}
+			require.Equal(t, []int64{1001}, ids)
+			require.Empty(t, pm.segments)
+			require.Equal(t, policy.PolicyNameCapacity, segment.SealPolicy().Policy)
+			require.Equal(t, float64(0), testutil.ToFloat64(growing))
+			require.Equal(t, float64(1), testutil.ToFloat64(flushed))
+			for _, observer := range []prometheus.Observer{
+				metrics.WALSegmentRowsTotal.WithLabelValues(labels...),
+				metrics.WALSegmentBytes.WithLabelValues(labels...),
+			} {
+				metric := &dto.Metric{}
+				require.NoError(t, observer.(prometheus.Metric).Write(metric))
+				require.Equal(t, uint64(1), metric.GetHistogram().GetSampleCount())
+			}
+		})
+	}
 }

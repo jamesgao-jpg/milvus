@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bytedance/mockey"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -16,22 +17,30 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/msgpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/mocks/streamingnode/server/wal/interceptors/shard/mock_shards"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/resource"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/interceptors/shard/shards"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/moduleapi"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/recovery"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/utility"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/vchannel"
 	"github.com/milvus-io/milvus/internal/util/function"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/status"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/messagespb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/streamingpb"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
+	"github.com/milvus-io/milvus/pkg/v3/streaming/util/types"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/walimpls/impls/rmq"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/syncutil"
 )
 
 func allocWALSchemaForTest(t *testing.T, collectionID int64, vchannel string, schemaVersion int32) {
 	t.Helper()
-	key := walFunctionRunnerKey(vchannel)
+	key := WALFunctionRunnerKey(vchannel)
 	assert.NoError(t, function.GetManager().Alloc(collectionID, key, &schemapb.CollectionSchema{Version: schemaVersion}))
 	t.Cleanup(func() {
 		function.GetManager().Release(collectionID, key)
@@ -160,10 +169,10 @@ func TestShardInterceptorUpdateFunctionRunnersRetainsSchemaWhenFunctionsDropped(
 			},
 		},
 	}
-	assert.NoError(t, function.GetManager().Alloc(collectionID, walFunctionRunnerKey(vchannel), schema))
-	defer function.GetManager().Release(collectionID, walFunctionRunnerKey(vchannel))
+	assert.NoError(t, function.GetManager().Alloc(collectionID, WALFunctionRunnerKey(vchannel), schema))
+	defer function.GetManager().Release(collectionID, WALFunctionRunnerKey(vchannel))
 
-	ok, err := function.GetManager().RunWithAnalyzer(context.Background(), collectionID, walFunctionRunnerKey(vchannel), 101, func(function.Analyzer) error {
+	ok, err := function.GetManager().RunWithAnalyzer(context.Background(), collectionID, WALFunctionRunnerKey(vchannel), 101, func(function.Analyzer) error {
 		return nil
 	})
 	assert.NoError(t, err)
@@ -178,7 +187,7 @@ func TestShardInterceptorUpdateFunctionRunnersRetainsSchemaWhenFunctionsDropped(
 	noFunctionSchema.Functions = nil
 	impl.updateFunctionRunners(collectionID, vchannel, noFunctionSchema)
 
-	ok, err = function.GetManager().RunWithAnalyzer(context.Background(), collectionID, walFunctionRunnerKey(vchannel), 101, func(function.Analyzer) error {
+	ok, err = function.GetManager().RunWithAnalyzer(context.Background(), collectionID, WALFunctionRunnerKey(vchannel), 101, func(function.Analyzer) error {
 		return nil
 	})
 	assert.NoError(t, err)
@@ -195,10 +204,129 @@ func TestShardInterceptorUpdateFunctionRunnersRetainsSchemaWhenFunctionsDropped(
 	})
 }
 
+type schemaTrackingFunctionRunnerManager struct {
+	function.FunctionRunnerManager
+	allocated *schemapb.CollectionSchema
+	updated   *schemapb.CollectionSchema
+}
+
+func (m *schemaTrackingFunctionRunnerManager) Alloc(collectionID int64, key string, schema *schemapb.CollectionSchema) error {
+	m.allocated = schema
+	return m.FunctionRunnerManager.Alloc(collectionID, key, schema)
+}
+
+func (m *schemaTrackingFunctionRunnerManager) Update(collectionID int64, key string, schema *schemapb.CollectionSchema) error {
+	m.updated = schema
+	return m.FunctionRunnerManager.Update(collectionID, key, schema)
+}
+
+func TestShardInterceptorSharesWriteSchemaWithFunctionRunners(t *testing.T) {
+	paramtable.Init()
+	resource.InitForTest(t)
+	manager := &schemaTrackingFunctionRunnerManager{FunctionRunnerManager: function.NewFunctionRunnerManager()}
+	defer manager.Close()
+	getManager := mockey.Mock(function.GetManager).Return(manager).Build()
+	defer getManager.UnPatch()
+	schema := &schemapb.CollectionSchema{
+		Version: 1,
+		Fields:  []*schemapb.FieldSchema{{FieldID: 100, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true}},
+	}
+	view := vchannel.NewVChannelViewFromMeta(&streamingpb.VChannelMeta{
+		Vchannel: "p0_1v0", State: streamingpb.VChannelState_VCHANNEL_STATE_NORMAL, CheckpointTimeTick: 1,
+		CollectionInfo: &streamingpb.CollectionInfoOfVChannel{
+			CollectionId: 1,
+			Schemas: []*streamingpb.CollectionSchemaOfVChannel{{
+				Schema: schema, State: streamingpb.VChannelSchemaState_VCHANNEL_SCHEMA_STATE_NORMAL, CheckpointTimeTick: 1,
+			}},
+		},
+	})
+	state, ok := view.WritePathRecoveryState()
+	require.True(t, ok)
+	shardManager := shards.RecoverShardManager(&shards.ShardManagerRecoverParam{
+		ChannelInfo: types.PChannelInfo{Name: "test_schema_sharing", Term: 1},
+		WAL:         syncutil.NewFuture[wal.WAL](),
+		InitialRecoverSnapshot: &recovery.RecoverySnapshot{
+			Checkpoint: &recovery.WALCheckpoint{TimeTick: 1},
+			WritePathRecovery: &moduleapi.WritePathRecoveryModuleSnapshot{
+				VChannels: map[string]moduleapi.VChannelWritePathRecoveryState{
+					"p0_1v0": state,
+				},
+			},
+		},
+	})
+	defer shardManager.Close()
+	interceptor := NewInterceptorBuilder().Build(&interceptors.InterceptorBuildParam{ShardManager: shardManager})
+	defer interceptor.Close()
+	_, recoverySchema := view.GetSchema(0)
+	require.Same(t, recoverySchema, manager.allocated, "WAL registration must share recovery's schema")
+	require.Same(t, shardManager.GetCollectionSchemaSnapshot(1), manager.allocated)
+
+	for _, test := range []struct {
+		name         string
+		collectionID int64
+		vchannel     string
+		restore      bool
+	}{
+		{name: "create", collectionID: 2, vchannel: "p0_2v0"},
+		{name: "restore", collectionID: 3, vchannel: "p0_3v0", restore: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager.allocated = nil
+			header := &message.CreateCollectionMessageHeader{CollectionId: test.collectionID}
+			body := &message.CreateCollectionRequest{CollectionSchema: schema}
+			var msg message.MutableMessage
+			if test.restore {
+				msg = message.NewRestoreSnapshotMessageBuilderV2().WithVChannel(test.vchannel).
+					WithHeader(&message.RestoreSnapshotMessageHeader{CollectionId: test.collectionID}).
+					WithBody(&message.RestoreSnapshotMessageBody{CollectionHeader: header, Collection: body}).MustBuildMutable()
+			} else {
+				msg = message.NewCreateCollectionMessageBuilderV1().WithVChannel(test.vchannel).
+					WithHeader(header).WithBody(body).MustBuildMutable()
+			}
+			msg = msg.WithTimeTick(2).WithLastConfirmedUseMessageID()
+			_, err := interceptor.DoAppend(t.Context(), msg, func(context.Context, message.MutableMessage) (message.MessageID, error) {
+				require.Nil(t, manager.allocated, "registration must follow a successful append")
+				return rmq.NewRmqID(10), nil
+			})
+			require.NoError(t, err)
+			require.NotNil(t, manager.allocated)
+			require.Same(t, shardManager.GetCollectionSchemaSnapshot(test.collectionID), manager.allocated)
+		})
+	}
+
+	for _, succeed := range []bool{true, false} {
+		updated := proto.Clone(schema).(*schemapb.CollectionSchema)
+		updated.Version = 2
+		if !succeed {
+			updated.Version = 3
+		}
+		manager.updated = nil
+		msg := message.NewAlterCollectionMessageBuilderV2().WithVChannel("p0_1v0").
+			WithHeader(&message.AlterCollectionMessageHeader{CollectionId: 1, UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{message.FieldMaskCollectionSchema}}}).
+			WithBody(&message.AlterCollectionMessageBody{Updates: &message.AlterCollectionMessageUpdates{Schema: updated}}).
+			MustBuildMutable().WithTimeTick(uint64(updated.GetVersion()))
+		_, err := interceptor.DoAppend(t.Context(), msg, func(context.Context, message.MutableMessage) (message.MessageID, error) {
+			require.Nil(t, manager.updated, "registration must follow a successful append")
+			if !succeed {
+				return nil, context.DeadlineExceeded
+			}
+			return rmq.NewRmqID(11), nil
+		})
+		if succeed {
+			require.NoError(t, err)
+			require.Same(t, shardManager.GetCollectionSchemaSnapshot(1), manager.updated)
+		} else {
+			require.ErrorIs(t, err, context.DeadlineExceeded)
+			require.Nil(t, manager.updated)
+		}
+	}
+	require.True(t, proto.Equal(schema, recoverySchema), "writer updates must leave the shared recovery snapshot unchanged")
+}
+
 func TestShardInterceptorCreateCollectionAllocatesFunctionRunnersFromLegacySchema(t *testing.T) {
 	collectionID := int64(99003)
 	vchannel := "by-dev-rootcoord-dml_0_99003v0"
-	key := walFunctionRunnerKey(vchannel)
+	key := WALFunctionRunnerKey(vchannel)
 	schema := &schemapb.CollectionSchema{
 		Version: 1,
 		Fields: []*schemapb.FieldSchema{
@@ -226,6 +354,7 @@ func TestShardInterceptorCreateCollectionAllocatesFunctionRunnersFromLegacySchem
 	shardManager := mock_shards.NewMockShardManager(t)
 	shardManager.EXPECT().CheckIfCollectionCanBeCreated(collectionID).Return(nil).Once()
 	shardManager.EXPECT().CreateCollection(mock.Anything).Return().Once()
+	shardManager.EXPECT().GetCollectionSchemaSnapshot(collectionID).Return(schema).Once()
 	shardManager.EXPECT().Logger().Return(mlog.With()).Maybe()
 	impl := &shardInterceptor{shardManager: shardManager}
 	msg := message.NewCreateCollectionMessageBuilderV1().
@@ -292,7 +421,7 @@ func TestShardInterceptorRejectsInvalidLegacySchemaBeforeAppend(t *testing.T) {
 func TestShardInterceptorAlterCollectionSkipsPartialSchemaForFunctionManager(t *testing.T) {
 	collectionID := int64(99002)
 	vchannel := "by-dev-rootcoord-dml_0_99002v0"
-	key := walFunctionRunnerKey(vchannel)
+	key := WALFunctionRunnerKey(vchannel)
 	schema := &schemapb.CollectionSchema{
 		Fields: []*schemapb.FieldSchema{
 			{FieldID: 100, Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
@@ -545,6 +674,7 @@ func TestShardInterceptor(t *testing.T) {
 		MustBuildMutable()
 	shardManager.EXPECT().CheckIfCollectionCanBeCreated(mock.Anything).Return(nil)
 	shardManager.EXPECT().CreateCollection(mock.Anything).Return()
+	shardManager.EXPECT().GetCollectionSchemaSnapshot(int64(1)).Return(&schemapb.CollectionSchema{Version: 0})
 	msgID, err := i.DoAppend(ctx, msg, appender)
 	assert.NoError(t, err)
 	assert.NotNil(t, msgID)
@@ -604,7 +734,7 @@ func TestShardInterceptor(t *testing.T) {
 			PartitionId:  1,
 		}).
 		WithBody(&msgpb.DropPartitionRequest{}).
-		MustBuildMutable()
+		MustBuildMutable().WithTimeTick(1)
 	shardManager.EXPECT().CheckIfPartitionExists(mock.Anything).Return(nil)
 	shardManager.EXPECT().DropPartition(mock.Anything).Return()
 	msgID, err = i.DoAppend(ctx, msg, appender)
@@ -802,4 +932,72 @@ func TestShardInterceptor(t *testing.T) {
 	msgID, err = i.DoAppend(ctx, msg, appender)
 	assert.Error(t, err)
 	assert.Nil(t, msgID)
+}
+
+func TestCreateSnapshotSealsSegmentsBeforeAppend(t *testing.T) {
+	manager := &mock_shards.MockShardManager{}
+	sealed := false
+	patch := mockey.Mock(mockey.GetMethod(manager, "FlushAndFenceSegmentAllocUntil")).To(func(collectionID int64, tt uint64) ([]int64, error) {
+		assert.Equal(t, int64(100), collectionID)
+		assert.Equal(t, uint64(200), tt)
+		sealed = true
+		return []int64{1, 2}, nil
+	}).Build()
+	defer patch.UnPatch()
+	impl := &shardInterceptor{shardManager: manager}
+	impl.initOpTable()
+	msg := message.NewCreateSnapshotMessageBuilderV2().WithVChannel("p1_100v0").
+		WithHeader(&message.CreateSnapshotMessageHeader{CollectionId: 100}).
+		WithBody(&message.CreateSnapshotMessageBody{}).MustBuildMutable().WithTimeTick(200)
+	assert.True(t, msg.MessageType().IsExclusiveRequired())
+	_, err := impl.DoAppend(context.Background(), msg, func(_ context.Context, _ message.MutableMessage) (message.MessageID, error) {
+		assert.True(t, sealed)
+		return rmq.NewRmqID(1), nil
+	})
+	assert.NoError(t, err)
+}
+
+func TestDropPartitionUpdatesManagerAfterAppend(t *testing.T) {
+	for _, failAt := range []string{"none", "append"} {
+		t.Run(failAt, func(t *testing.T) {
+			manager := &mock_shards.MockShardManager{}
+			check := mockey.Mock(mockey.GetMethod(manager, "CheckIfPartitionExists")).Return(nil).Build()
+			defer check.UnPatch()
+			var events []string
+			drop := mockey.Mock(mockey.GetMethod(manager, "DropPartition")).To(func(msg message.ImmutableDropPartitionMessageV1) {
+				require.Equal(t, int64(10), msg.Header().GetPartitionId())
+				events = append(events, "drop")
+			}).Build()
+			defer drop.UnPatch()
+			impl := &shardInterceptor{shardManager: manager}
+			impl.initOpTable()
+			newMessage := func() message.MutableMessage {
+				return message.NewDropPartitionMessageBuilderV1().WithVChannel("p1_100v0").
+					WithHeader(&messagespb.DropPartitionMessageHeader{CollectionId: 100, PartitionId: 10}).
+					WithBody(&msgpb.DropPartitionRequest{}).MustBuildMutable().WithTimeTick(200)
+			}
+			require.True(t, newMessage().MessageType().IsExclusiveRequired())
+			appendMessage := func(_ context.Context, _ message.MutableMessage) (message.MessageID, error) {
+				events = append(events, "append")
+				if failAt == "append" {
+					return nil, context.DeadlineExceeded
+				}
+				return rmq.NewRmqID(1), nil
+			}
+			_, err := impl.DoAppend(context.Background(), newMessage(), appendMessage)
+			if failAt == "none" {
+				require.NoError(t, err)
+				require.Equal(t, []string{"append", "drop"}, events)
+				return
+			}
+			require.Error(t, err)
+			require.NotContains(t, events, "drop", "a failed append must not remove the partition")
+			// Retry updates the manager only after a successful append.
+			failAt = "none"
+			events = nil
+			_, err = impl.DoAppend(context.Background(), newMessage(), appendMessage)
+			require.NoError(t, err)
+			require.Equal(t, []string{"append", "drop"}, events)
+		})
+	}
 }

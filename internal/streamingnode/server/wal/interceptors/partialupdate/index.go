@@ -8,6 +8,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/utility/primarykey"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/status"
 	"github.com/milvus-io/milvus/pkg/v3/util/tsoutil"
 )
@@ -20,73 +21,19 @@ const (
 	estimatedVersionEntryFixedBytes int64 = 128
 )
 
-type primaryKeyKind uint8
-
-const (
-	primaryKeyKindNone primaryKeyKind = iota
-	primaryKeyKindInt64
-	primaryKeyKindString
-	primaryKeyKindMixed
-)
-
-type primaryKeys struct {
-	kind         primaryKeyKind
-	int64Values  []int64
-	stringValues []string
-}
-
-func (p primaryKeys) Len() int {
-	return len(p.int64Values) + len(p.stringValues)
-}
-
-func (p primaryKeys) clone() primaryKeys {
-	return primaryKeys{
-		kind:         p.kind,
-		int64Values:  append([]int64(nil), p.int64Values...),
-		stringValues: append([]string(nil), p.stringValues...),
-	}
-}
-
-// toAny keeps the existing test and helper API while the append path uses the
-// typed representation above.
-func (p primaryKeys) toAny() []any {
-	values := make([]any, 0, p.Len())
-	for _, value := range p.int64Values {
-		values = append(values, value)
-	}
-	for _, value := range p.stringValues {
-		values = append(values, value)
-	}
-	return values
-}
-
-func (p *primaryKeys) append(other primaryKeys) {
-	if other.Len() == 0 {
-		return
-	}
-	if p.kind == primaryKeyKindNone {
-		p.kind = other.kind
-	}
-	if p.kind != other.kind && p.kind != primaryKeyKindMixed {
-		p.kind = primaryKeyKindMixed
-	}
-	p.int64Values = append(p.int64Values, other.int64Values...)
-	p.stringValues = append(p.stringValues, other.stringValues...)
-}
-
-func primaryKeysFromAny(values []any) (primaryKeys, error) {
-	result := primaryKeys{}
+func primaryKeysFromAny(values []any) (primarykey.Keys, error) {
+	result := primarykey.Keys{}
 	for _, value := range values {
-		var current primaryKeys
+		var current primarykey.Keys
 		switch value := value.(type) {
 		case int64:
-			current = primaryKeys{kind: primaryKeyKindInt64, int64Values: []int64{value}}
+			current = primarykey.Keys{Kind: primarykey.KindInt64, Int64Values: []int64{value}}
 		case string:
-			current = primaryKeys{kind: primaryKeyKindString, stringValues: []string{value}}
+			current = primarykey.Keys{Kind: primarykey.KindString, StringValues: []string{value}}
 		default:
-			return primaryKeys{}, status.NewUnrecoverableError("partial update pk must be int64 or string")
+			return primarykey.Keys{}, status.NewUnrecoverableError("partial update pk must be int64 or string")
 		}
-		result.append(current)
+		result.Append(current)
 	}
 	return result, nil
 }
@@ -157,14 +104,15 @@ func (b *versionByteBudget) recordMissedWrite(missed bool) {
 
 // vchannelPKVersionIndex tracks recent PK writes on one vchannel.
 type vchannelPKVersionIndex struct {
-	mu                sync.Mutex
-	ttl               time.Duration
-	budget            *versionByteBudget
-	retainedSinceTS   uint64
-	lastMissedWriteTS uint64
-	int64Versions     map[int64]*versionEntry
-	stringVersions    map[string]*versionEntry
-	expirations       versionMinHeap
+	mu     sync.Mutex
+	ttl    time.Duration
+	budget *versionByteBudget
+	// forgottenWriteTS is the largest commit timestamp whose exact PK record
+	// was evicted or omitted. Reads at this timestamp already include that write.
+	forgottenWriteTS uint64
+	int64Versions    map[int64]*versionEntry
+	stringVersions   map[string]*versionEntry
+	expirations      versionMinHeap
 }
 
 type versionEntry struct {
@@ -274,22 +222,21 @@ func (idx *vchannelPKVersionIndex) clear() {
 	idx.int64Versions = make(map[int64]*versionEntry)
 	idx.stringVersions = make(map[string]*versionEntry)
 	idx.expirations = nil
-	idx.retainedSinceTS = 0
-	idx.lastMissedWriteTS = 0
+	idx.forgottenWriteTS = 0
 	idx.budget.release(releasedBytes)
 }
 
-func (idx *pkVersionIndex) UpdateAllTyped(vchannel string, pks primaryKeys, commitTS uint64) {
+func (idx *pkVersionIndex) UpdateAllTyped(vchannel string, pks primarykey.Keys, commitTS uint64) {
 	idx.channel(vchannel).updateAll(pks, commitTS)
 }
 
-func (idx *vchannelPKVersionIndex) updateAll(pks primaryKeys, commitTS uint64) {
+func (idx *vchannelPKVersionIndex) updateAll(pks primarykey.Keys, commitTS uint64) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
 	idx.advanceRetentionLocked(commitTS)
 	missedWrite := false
-	for _, pk := range pks.int64Values {
+	for _, pk := range pks.Int64Values {
 		entry, ok := idx.int64Versions[pk]
 		if ok && entry.commitTS >= commitTS {
 			continue
@@ -299,15 +246,13 @@ func (idx *vchannelPKVersionIndex) updateAll(pks primaryKeys, commitTS uint64) {
 			heap.Fix(&idx.expirations, entry.index)
 			continue
 		}
-		if commitTS < idx.retainedSinceTS {
+		if commitTS < idx.forgottenWriteTS {
 			continue
 		}
 		if !idx.budget.tryReserve(estimatedVersionEntryFixedBytes) {
-			// Once a committed write is omitted, exact conflict detection is
-			// incomplete until that write leaves every valid read window.
-			if commitTS > idx.lastMissedWriteTS {
-				idx.lastMissedWriteTS = commitTS
-			}
+			// The write is absent from the exact index. Only snapshots that
+			// include it can still be validated against the retained records.
+			idx.forgottenWriteTS = max(idx.forgottenWriteTS, commitTS)
 			missedWrite = true
 			continue
 		}
@@ -319,7 +264,7 @@ func (idx *vchannelPKVersionIndex) updateAll(pks primaryKeys, commitTS uint64) {
 		idx.int64Versions[pk] = entry
 		heap.Push(&idx.expirations, entry)
 	}
-	for _, pk := range pks.stringValues {
+	for _, pk := range pks.StringValues {
 		entry, ok := idx.stringVersions[pk]
 		if ok && entry.commitTS >= commitTS {
 			continue
@@ -329,14 +274,12 @@ func (idx *vchannelPKVersionIndex) updateAll(pks primaryKeys, commitTS uint64) {
 			heap.Fix(&idx.expirations, entry.index)
 			continue
 		}
-		if commitTS < idx.retainedSinceTS {
+		if commitTS < idx.forgottenWriteTS {
 			continue
 		}
 		estimatedBytes := estimatedVersionEntryFixedBytes + int64(len(pk))
 		if !idx.budget.tryReserve(estimatedBytes) {
-			if commitTS > idx.lastMissedWriteTS {
-				idx.lastMissedWriteTS = commitTS
-			}
+			idx.forgottenWriteTS = max(idx.forgottenWriteTS, commitTS)
 			missedWrite = true
 			continue
 		}
@@ -352,8 +295,8 @@ func (idx *vchannelPKVersionIndex) updateAll(pks primaryKeys, commitTS uint64) {
 	idx.budget.recordMissedWrite(missedWrite)
 }
 
-// Advance moves retention forward without publishing a PK write. TimeTick
-// messages use it to reclaim memory and restore complete read windows while idle.
+// Advance reclaims expired records without publishing a PK write. TimeTick
+// messages do not advance the validation floor unless a record is actually evicted.
 func (idx *pkVersionIndex) Advance(currentTS uint64) {
 	idx.channels.Range(func(_, value any) bool {
 		value.(*vchannelPKVersionIndex).advance(currentTS)
@@ -367,7 +310,7 @@ func (idx *vchannelPKVersionIndex) advance(currentTS uint64) {
 	idx.advanceRetentionLocked(currentTS)
 }
 
-func (idx *pkVersionIndex) VerifyTyped(vchannel string, pks primaryKeys, readTS, commitTS uint64) error {
+func (idx *pkVersionIndex) VerifyTyped(vchannel string, pks primarykey.Keys, readTS, commitTS uint64) error {
 	return idx.channel(vchannel).verify(vchannel, pks, readTS, commitTS)
 }
 
@@ -380,7 +323,7 @@ func (idx *pkVersionIndex) Verify(vchannel string, pks []any, readTS, commitTS u
 	return idx.VerifyTyped(vchannel, keys, readTS, commitTS)
 }
 
-func (idx *vchannelPKVersionIndex) verify(vchannel string, pks primaryKeys, readTS, commitTS uint64) error {
+func (idx *vchannelPKVersionIndex) verify(vchannel string, pks primarykey.Keys, readTS, commitTS uint64) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
@@ -389,12 +332,12 @@ func (idx *vchannelPKVersionIndex) verify(vchannel string, pks primaryKeys, read
 		return err
 	}
 
-	for _, pk := range pks.int64Values {
+	for _, pk := range pks.Int64Values {
 		if entry := idx.int64Versions[pk]; entry != nil && entry.commitTS > readTS {
 			return status.NewPartialUpdateRetryable("partial update pk conflict, vchannel: %s, read ts: %d, last commit ts: %d", vchannel, readTS, entry.commitTS)
 		}
 	}
-	for _, pk := range pks.stringValues {
+	for _, pk := range pks.StringValues {
 		if entry := idx.stringVersions[pk]; entry != nil && entry.commitTS > readTS {
 			return status.NewPartialUpdateRetryable("partial update pk conflict, vchannel: %s, read ts: %d, last commit ts: %d", vchannel, readTS, entry.commitTS)
 		}
@@ -403,36 +346,22 @@ func (idx *vchannelPKVersionIndex) verify(vchannel string, pks primaryKeys, read
 }
 
 func (idx *vchannelPKVersionIndex) verifyReadWindowLocked(readTS, commitTS uint64) error {
-	if readTS < idx.retainedSinceTS {
-		return status.NewPartialUpdateRetryable("partial update read ts %d is older than retained since ts %d", readTS, idx.retainedSinceTS)
+	if readTS < idx.forgottenWriteTS {
+		return status.NewPartialUpdateRetryable("partial update read ts %d is older than forgotten write ts %d", readTS, idx.forgottenWriteTS)
 	}
 	if commitTS < readTS {
 		return status.NewUnrecoverableError("partial update commit ts %d is older than read ts %d", commitTS, readTS)
 	}
-	if time.Duration(tsoutil.CalculateDuration(commitTS, readTS))*time.Millisecond > idx.ttl {
-		return status.NewPartialUpdateRetryable("partial update read window exceeds max age, read ts: %d, commit ts: %d, max age: %s", readTS, commitTS, idx.ttl)
-	}
-	if idx.lastMissedWriteTS != 0 {
-		return status.NewPartialUpdateRetryable("partial update version index is incomplete after missing write ts %d", idx.lastMissedWriteTS)
-	}
 	return nil
 }
 
-// advanceRetentionLocked evicts only versions older than the maximum valid
-// read window. Moving retainedSinceTS with the same cutoff preserves fail-closed
-// verification for reads whose conflict history has been discarded.
+// advanceRetentionLocked uses time only for memory reclamation. The validation
+// floor advances to actual discarded writes, not to the expiration cutoff, so
+// an unchanged snapshot remains valid while its vchannel is idle.
 func (idx *vchannelPKVersionIndex) advanceRetentionLocked(commitTS uint64) {
 	evictUntilTS := retentionCutoffTS(commitTS, idx.ttl)
-	if evictUntilTS == 0 {
-		return
-	}
-	if evictUntilTS <= idx.retainedSinceTS {
-		return
-	}
-	idx.retainedSinceTS = evictUntilTS
-	idx.sweepLocked(evictUntilTS)
-	if idx.lastMissedWriteTS != 0 && idx.lastMissedWriteTS <= evictUntilTS {
-		idx.lastMissedWriteTS = 0
+	if evictUntilTS != 0 {
+		idx.sweepLocked(evictUntilTS)
 	}
 }
 
@@ -448,6 +377,7 @@ func retentionCutoffTS(ts uint64, ttl time.Duration) uint64 {
 func (idx *vchannelPKVersionIndex) sweepLocked(evictUntilTS uint64) {
 	for idx.expirations.Len() > 0 && idx.expirations[0].commitTS <= evictUntilTS {
 		entry := heap.Pop(&idx.expirations).(*versionEntry)
+		idx.forgottenWriteTS = max(idx.forgottenWriteTS, entry.commitTS)
 		if entry.stringKey {
 			delete(idx.stringVersions, entry.stringPK)
 		} else {

@@ -72,11 +72,95 @@ func TestCatalog_ListCollections_SkipsTombstone(t *testing.T) {
 func TestCatalog_GetCollectionByID_TombstoneIsNotFound(t *testing.T) {
 	ctx := context.Background()
 	kv := mocks.NewTxnKV(t)
-	// Both default-db attempt and legacy-path attempt return the tombstone.
-	kv.EXPECT().Load(mock.Anything, mock.Anything).Return(tombstone(), nil)
+	defaultKey := BuildCollectionKey(util.DefaultDBID, 99999)
+	// A tombstone is a logical deletion, not evidence that the modern key is
+	// absent. The legacy key must not be read.
+	kv.EXPECT().Load(mock.Anything, defaultKey).Return(tombstone(), nil).Once()
 
 	kc := NewCatalog(kv)
 	got, err := kc.GetCollectionByID(ctx, util.DefaultDBID, 1, 99999)
+	assert.Error(t, err)
+	assert.True(t, merr.ErrCollectionNotFound.Is(err))
+	assert.Nil(t, got)
+}
+
+func TestCatalog_GetCollectionByID_DefaultLoadErrorDoesNotFallback(t *testing.T) {
+	ctx := context.Background()
+	defaultKey := BuildCollectionKey(util.DefaultDBID, 42)
+	kv := mocks.NewTxnKV(t)
+	kv.EXPECT().Load(mock.Anything, defaultKey).
+		Return("", merr.WrapErrIoFailed(defaultKey, context.DeadlineExceeded)).Once()
+
+	kc := NewCatalog(kv)
+	got, err := kc.GetCollectionByID(ctx, util.DefaultDBID, 1, 42)
+	assert.Error(t, err)
+	assert.True(t, merr.ErrIoFailed.Is(err))
+	assert.False(t, merr.ErrCollectionNotFound.Is(err))
+	assert.Nil(t, got)
+}
+
+func TestCatalog_GetCollectionByID_DefaultLoadContextErrorIsPreserved(t *testing.T) {
+	ctx := context.Background()
+	defaultKey := BuildCollectionKey(util.DefaultDBID, 42)
+	for _, loadErr := range []error{context.DeadlineExceeded, context.Canceled} {
+		kv := mocks.NewTxnKV(t)
+		// The KV layer returns the context error unwrapped. It must reach the
+		// caller unchanged and must not trigger the legacy fallback.
+		kv.EXPECT().Load(mock.Anything, defaultKey).Return("", loadErr).Once()
+
+		kc := NewCatalog(kv)
+		got, err := kc.GetCollectionByID(ctx, util.DefaultDBID, 1, 42)
+		assert.ErrorIs(t, err, loadErr)
+		assert.True(t, merr.IsCanceledOrTimeout(err))
+		assert.False(t, merr.ErrCollectionNotFound.Is(err))
+		assert.Nil(t, got)
+	}
+}
+
+func TestCatalog_GetCollectionByID_DefaultKeyNotFoundFallsBackToLegacy(t *testing.T) {
+	ctx := context.Background()
+	defaultKey := BuildCollectionKey(util.DefaultDBID, 42)
+	legacyKey := BuildCollectionKey(util.NonDBID, 42)
+	legacy := &pb.CollectionInfo{
+		ID:    42,
+		DbId:  util.DefaultDBID,
+		State: pb.CollectionState_CollectionCreated,
+		Schema: &schemapb.CollectionSchema{
+			Name:   "legacy-collection",
+			Fields: []*schemapb.FieldSchema{{FieldID: 1, Name: "field"}},
+		},
+		PartitionIDs:               []int64{43},
+		PartitionNames:             []string{"_default"},
+		PartitionCreatedTimestamps: []uint64{1},
+	}
+	legacyValue, err := proto.Marshal(legacy)
+	require.NoError(t, err)
+
+	kv := mocks.NewTxnKV(t)
+	kv.EXPECT().Load(mock.Anything, defaultKey).
+		Return("", merr.WrapErrIoKeyNotFound(defaultKey)).Once()
+	kv.EXPECT().Load(mock.Anything, legacyKey).
+		Return(string(legacyValue), nil).Once()
+
+	kc := NewCatalog(kv)
+	got, err := kc.GetCollectionByID(ctx, util.DefaultDBID, 1, 42)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "legacy-collection", got.Name)
+}
+
+func TestCatalog_GetCollectionByID_DefaultAndLegacyKeysNotFound(t *testing.T) {
+	ctx := context.Background()
+	defaultKey := BuildCollectionKey(util.DefaultDBID, 42)
+	legacyKey := BuildCollectionKey(util.NonDBID, 42)
+	kv := mocks.NewTxnKV(t)
+	kv.EXPECT().Load(mock.Anything, defaultKey).
+		Return("", merr.WrapErrIoKeyNotFound(defaultKey)).Once()
+	kv.EXPECT().Load(mock.Anything, legacyKey).
+		Return("", merr.WrapErrIoKeyNotFound(legacyKey)).Once()
+
+	kc := NewCatalog(kv)
+	got, err := kc.GetCollectionByID(ctx, util.DefaultDBID, 1, 42)
 	assert.Error(t, err)
 	assert.True(t, merr.ErrCollectionNotFound.Is(err))
 	assert.Nil(t, got)
@@ -130,22 +214,6 @@ func TestCatalog_listPartitionsAfter210_SkipsTombstone(t *testing.T) {
 	assert.Equal(t, int64(1), got[0].PartitionID)
 }
 
-func TestCatalog_batchListPartitionsAfter210_SkipsTombstone(t *testing.T) {
-	ctx := context.Background()
-	part := &pb.PartitionInfo{PartitionID: 1, CollectionId: 5}
-	b, err := proto.Marshal(part)
-	require.NoError(t, err)
-
-	kv := mocks.NewTxnKV(t)
-	kv.EXPECT().LoadWithPrefix(mock.Anything, mock.Anything).
-		Return([]string{"k-tomb", "k-ok"}, []string{tombstone(), string(b)}, nil)
-
-	kc := NewCatalog(kv).(*Catalog)
-	got, err := kc.batchListPartitionsAfter210(ctx, 0)
-	assert.NoError(t, err)
-	require.Len(t, got[5], 1)
-}
-
 func TestCatalog_listFieldsAfter210_SkipsTombstone(t *testing.T) {
 	ctx := context.Background()
 	field := &schemapb.FieldSchema{FieldID: 100, Name: "f"}
@@ -161,27 +229,6 @@ func TestCatalog_listFieldsAfter210_SkipsTombstone(t *testing.T) {
 	assert.NoError(t, err)
 	require.Len(t, got, 1)
 	assert.Equal(t, int64(100), got[0].FieldID)
-}
-
-func TestCatalog_batchListFieldsAfter210_SkipsTombstone(t *testing.T) {
-	ctx := context.Background()
-	field := &schemapb.FieldSchema{FieldID: 100, Name: "f"}
-	b, err := proto.Marshal(field)
-	require.NoError(t, err)
-
-	kv := mocks.NewTxnKV(t)
-	kv.EXPECT().LoadWithPrefix(mock.Anything, mock.Anything).
-		Return(
-			[]string{"root-coord/fields/7/0", "root-coord/fields/7/100"},
-			[]string{tombstone(), string(b)},
-			nil,
-		)
-
-	kc := NewCatalog(kv).(*Catalog)
-	got, err := kc.batchListFieldsAfter210(ctx, 0)
-	assert.NoError(t, err)
-	require.Len(t, got[7], 1)
-	assert.Equal(t, int64(100), got[7][0].FieldID)
 }
 
 func TestCatalog_listStructArrayFieldsAfter210_SkipsTombstone(t *testing.T) {
@@ -216,25 +263,4 @@ func TestCatalog_listFunctions_SkipsTombstone(t *testing.T) {
 	assert.NoError(t, err)
 	require.Len(t, got, 1)
 	assert.Equal(t, int64(300), got[0].ID)
-}
-
-func TestCatalog_batchListFunctions_SkipsTombstone(t *testing.T) {
-	ctx := context.Background()
-	fn := &schemapb.FunctionSchema{Id: 300, Name: "fn"}
-	b, err := proto.Marshal(fn)
-	require.NoError(t, err)
-
-	kv := mocks.NewTxnKV(t)
-	kv.EXPECT().LoadWithPrefix(mock.Anything, mock.Anything).
-		Return(
-			[]string{"root-coord/functions/9/0", "root-coord/functions/9/300"},
-			[]string{tombstone(), string(b)},
-			nil,
-		)
-
-	kc := NewCatalog(kv).(*Catalog)
-	got, err := kc.batchListFunctions(ctx, 0)
-	assert.NoError(t, err)
-	require.Len(t, got[9], 1)
-	assert.Equal(t, int64(300), got[9][0].ID)
 }

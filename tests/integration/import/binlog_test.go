@@ -20,17 +20,18 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"strconv"
-	"strings"
+	"testing"
 	"time"
 
 	"github.com/samber/lo"
+	"github.com/stretchr/testify/suite"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/internal/util/importutilv2"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
@@ -46,25 +47,305 @@ import (
 
 type DMLGroup struct {
 	insertRowNums []int
-	deleteRowNums []int
 }
 
 type SourceCollectionInfo struct {
-	collectionID   int64
-	partitionID    int64
-	l0SegmentIDs   []int64
-	SegmentIDs     []int64
-	insertedIDs    *schemapb.IDs
-	storageVersion int
-	// Timestamp ranges extracted from source segments' binlogs,
-	// there's only one L1 segment and one L0 segment after import so we can record the min and max timestamps directly.
-	l1MinTs uint64 // min timestamp from L1 segments' insert binlogs
-	l1MaxTs uint64 // max timestamp from L1 segments' insert binlogs
-	l0MinTs uint64 // min timestamp from L0 segments' delta binlogs
-	l0MaxTs uint64 // max timestamp from L0 segments' delta binlogs
+	collectionID int64
+	partitionID  int64
+	SegmentIDs   []int64
+	insertedIDs  *schemapb.IDs
+	snapshotURI  string
+	// Exact timestamp range retained in the source SegmentStats.
+	l1MinTs uint64
+	l1MaxTs uint64
 }
 
-func (s *BulkInsertSuite) PrepareSourceCollection(dim int, dmlGroup *DMLGroup) *SourceCollectionInfo {
+// SnapshotSchemaImportSuite exercises schema conversion through the public
+// insert/snapshot APIs, the import scheduler, and queries of imported rows.
+type SnapshotSchemaImportSuite struct {
+	importSuite
+}
+
+func (s *SnapshotSchemaImportSuite) SetupSuite() {
+	s.WithMilvusConfig(paramtable.Get().CommonCfg.UseLoonFFI.Key, "true")
+	s.WithMilvusConfig(paramtable.Get().DataCoordCfg.EnableImportV3.Key, "false")
+	s.importSuite.SetupSuite()
+}
+
+func TestSnapshotSchemaImportSuite(t *testing.T) {
+	suite.Run(t, new(SnapshotSchemaImportSuite))
+}
+
+func (s *SnapshotSchemaImportSuite) TestSnapshotSchemaConversion() {
+	for _, format := range []string{"vortex", "parquet"} {
+		s.Run(format, func() {
+			restore := s.Cluster.MustModifyMilvusConfig(map[string]string{
+				paramtable.Get().DataNodeCfg.StorageFormat.Key: format,
+			})
+			defer restore()
+			for _, tc := range []struct {
+				name                  string
+				dim                   int
+				targetType            schemapb.DataType
+				sourceElement         schemapb.DataType
+				targetElement         schemapb.DataType
+				sourceElementNullable bool
+				targetElementNullable bool
+				text                  string
+				sourceLength          int
+				targetLength          int
+				sourceNullable        bool
+				targetNullable        bool
+				withDefault           bool
+				admissionErr          string
+			}{
+				{name: "smaller_dimension", dim: 64, admissionErr: "vector dimension mismatch"},
+				{name: "larger_dimension", dim: 256, admissionErr: "vector dimension mismatch"},
+				{
+					name: "float_to_bfloat16_equal_width", dim: 256, targetType: schemapb.DataType_BFloat16Vector,
+					admissionErr: "vector data type mismatch",
+				},
+				{
+					name: "array_float_to_binary", sourceElement: schemapb.DataType_FloatVector,
+					targetElement: schemapb.DataType_BinaryVector, admissionErr: "vector element type mismatch",
+				},
+				{
+					name: "array_float16_to_bfloat16", sourceElement: schemapb.DataType_Float16Vector,
+					targetElement: schemapb.DataType_BFloat16Vector, admissionErr: "vector element type mismatch",
+				},
+				{
+					name: "array_nullable_to_required", sourceElement: schemapb.DataType_FloatVector,
+					targetElement: schemapb.DataType_FloatVector, sourceElementNullable: true,
+					admissionErr: "vector element nullable mismatch",
+				},
+				{
+					name: "array_required_to_nullable", sourceElement: schemapb.DataType_FloatVector,
+					targetElement: schemapb.DataType_FloatVector, targetElementNullable: true,
+					// Nullable elements in the target are already rejected by the Proxy import gate.
+					admissionErr: "element-nullable or nested Array field group.vectors is not supported",
+				},
+				{name: "ascii_boundary", text: "abcdef", sourceLength: 6, sourceNullable: true, targetNullable: true},
+				{name: "utf8_boundary", text: "中文", sourceLength: 6, sourceNullable: true, targetNullable: true},
+				{name: "ascii_oversized", text: "abcdefg", targetLength: 6, sourceNullable: true, targetNullable: true, admissionErr: "max_length"},
+				{name: "utf8_oversized", text: "中文a", targetLength: 6, sourceNullable: true, targetNullable: true, admissionErr: "max_length"},
+				{name: "narrower_target_short_value", text: "abc", targetLength: 6, sourceNullable: true, targetNullable: true, admissionErr: "max_length"},
+				{name: "wider_target", text: "abc", sourceLength: 6, targetLength: 64, sourceNullable: true, targetNullable: true},
+				{name: "nullable_to_required_with_default", sourceNullable: true, withDefault: true, admissionErr: "nullable mismatch"},
+				{name: "nullable_default", sourceNullable: true, targetNullable: true, withDefault: true},
+				{name: "nullable_no_default", sourceNullable: true, targetNullable: true},
+				{name: "nullable_to_required", sourceNullable: true, admissionErr: "nullable mismatch"},
+				{name: "required_to_nullable", targetNullable: true, admissionErr: "nullable mismatch"},
+				{name: "required_to_nullable_with_default", targetNullable: true, withDefault: true, admissionErr: "nullable mismatch"},
+				{name: "both_required"},
+				{name: "both_required_with_default", withDefault: true},
+			} {
+				s.Run(tc.name, func() {
+					ctx, cancel := context.WithTimeout(s.Cluster.GetContext(), 3*time.Minute)
+					defer cancel()
+					create := func(schema *schemapb.CollectionSchema) {
+						encoded, err := proto.Marshal(schema)
+						s.Require().NoError(err)
+						status, err := s.Cluster.MilvusClient.CreateCollection(ctx, &milvuspb.CreateCollectionRequest{
+							CollectionName: schema.GetName(), Schema: encoded, ShardsNum: 1,
+						})
+						s.Require().NoError(merr.CheckRPCCall(status, err))
+						s.T().Cleanup(func() {
+							cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
+							defer cleanupCancel()
+							status, err := s.Cluster.MilvusClient.DropCollection(cleanupCtx,
+								&milvuspb.DropCollectionRequest{CollectionName: schema.GetName()})
+							s.NoError(merr.CheckRPCCall(status, err))
+						})
+					}
+					const sourceDim = 128
+					source := &schemapb.CollectionSchema{Name: "snapshot_schema_src_" + funcutil.RandomString(8), Fields: []*schemapb.FieldSchema{
+						{Name: "pk", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+						{Name: "vector", DataType: schemapb.DataType_FloatVector, TypeParams: []*commonpb.KeyValuePair{{Key: common.DimKey, Value: "128"}}},
+						{Name: "text", DataType: schemapb.DataType_VarChar, TypeParams: []*commonpb.KeyValuePair{{Key: common.MaxLengthKey, Value: "64"}}},
+						{Name: "value", DataType: schemapb.DataType_Int64, Nullable: tc.sourceNullable},
+					}}
+					if tc.sourceElement != schemapb.DataType_None {
+						source.StructArrayFields = []*schemapb.StructArrayFieldSchema{{Name: "group", Fields: []*schemapb.FieldSchema{
+							{
+								Name: "vectors", DataType: schemapb.DataType_ArrayOfVector, ElementType: tc.sourceElement,
+								ElementNullable: tc.sourceElementNullable,
+								TypeParams:      []*commonpb.KeyValuePair{{Key: common.DimKey, Value: "32"}, {Key: common.MaxCapacityKey, Value: "1000"}},
+							},
+						}}}
+					}
+					if tc.sourceLength != 0 {
+						source.Fields[2].TypeParams[0].Value = fmt.Sprint(tc.sourceLength)
+					}
+					create(source)
+					values := integration.NewInt64FieldData("value", 3)
+					values.GetScalars().GetLongData().Data = []int64{7, 0, 5}
+					if tc.sourceNullable {
+						values.GetScalars().GetLongData().Data = []int64{0, 5}
+						typeutil.SetFieldDataValidData(values, []bool{false, true, true})
+					}
+					text := integration.NewVarCharFieldData("text", 3, false)
+					typeutil.SetFieldDataValidData(text, nil)
+					text.GetScalars().GetStringData().Data = []string{"", "a", tc.text}
+					fieldsData := []*schemapb.FieldData{
+						integration.NewInt64FieldData("pk", 3),
+						integration.NewFloatVectorFieldData("vector", 3, sourceDim), text, values,
+					}
+					if tc.sourceElement != schemapb.DataType_None {
+						group := integration.NewStructArrayFieldData(source.StructArrayFields[0], "group", 3, 32)
+						if tc.sourceElementNullable {
+							for _, row := range group.GetStructArrays().GetFields()[0].GetVectors().GetVectorArray().GetData() {
+								row.GetFloatVector().Data = make([]float32, 32)
+								row.ValidData = []bool{true, false}
+							}
+						}
+						fieldsData = append(fieldsData, group)
+					}
+					insert, err := s.Cluster.MilvusClient.Insert(ctx, &milvuspb.InsertRequest{
+						CollectionName: source.GetName(), NumRows: 3, HashKeys: integration.GenerateHashKeys(3),
+						FieldsData: fieldsData,
+					})
+					s.Require().NoError(merr.CheckRPCCall(insert, err))
+					s.Require().EqualValues(3, insert.GetInsertCnt())
+					flush, err := s.Cluster.MilvusClient.Flush(ctx, &milvuspb.FlushRequest{CollectionNames: []string{source.GetName()}})
+					s.Require().NoError(merr.CheckRPCCall(flush, err))
+					s.Require().Eventually(func() bool {
+						segments, err := s.Cluster.ShowSegments(source.GetName())
+						if err != nil {
+							return false
+						}
+						var rows int64
+						for _, segment := range segments {
+							if segment.GetState() == commonpb.SegmentState_Flushed && segment.GetLevel() == datapb.SegmentLevel_L1 {
+								if segment.GetStorageVersion() != storage.StorageV3 || segment.GetManifestPath() == "" {
+									return false
+								}
+								rows += segment.GetNumOfRows()
+							}
+						}
+						return rows == 3
+					}, time.Minute, 100*time.Millisecond)
+					description, err := s.Cluster.MilvusClient.DescribeCollection(ctx,
+						&milvuspb.DescribeCollectionRequest{CollectionName: source.GetName()})
+					s.Require().NoError(merr.CheckRPCCall(description, err))
+					valueField, found := lo.Find(description.GetSchema().GetFields(), func(field *schemapb.FieldSchema) bool {
+						return field.GetName() == "value"
+					})
+					s.Require().True(found)
+					valueID := fmt.Sprint(valueField.GetFieldID())
+					segments, err := s.Cluster.ShowSegments(source.GetName())
+					s.Require().NoError(err)
+					foundValue := false
+					for _, segment := range segments {
+						if segment.GetState() != commonpb.SegmentState_Flushed || segment.GetLevel() != datapb.SegmentLevel_L1 {
+							continue
+						}
+						groups, err := packed.ReadManifestColumnGroups(segment.GetManifestPath(), packed.CreateStorageConfig())
+						s.Require().NoError(err)
+						for _, group := range groups {
+							if lo.Contains(group.Columns, valueID) {
+								foundValue = true
+								// Prove the nullable column actually exercises this format.
+								s.Require().Equal(format, group.Format)
+							}
+						}
+					}
+					s.Require().True(foundValue)
+					snapshotName := "schema_" + funcutil.RandomString(8)
+					status, err := s.Cluster.MilvusClient.CreateSnapshot(ctx, &milvuspb.CreateSnapshotRequest{Name: snapshotName, CollectionName: source.GetName()})
+					s.Require().NoError(merr.CheckRPCCall(status, err))
+					s.T().Cleanup(func() {
+						cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
+						defer cleanupCancel()
+						status, err := s.Cluster.MilvusClient.DropSnapshot(cleanupCtx,
+							&milvuspb.DropSnapshotRequest{Name: snapshotName, CollectionName: source.GetName()})
+						s.NoError(merr.CheckRPCCall(status, err))
+					})
+					snapshot, err := s.Cluster.MilvusClient.DescribeSnapshot(ctx, &milvuspb.DescribeSnapshotRequest{Name: snapshotName, CollectionName: source.GetName()})
+					s.Require().NoError(merr.CheckRPCCall(snapshot, err))
+					s.Require().NotEmpty(snapshot.GetS3Location())
+					target := proto.Clone(source).(*schemapb.CollectionSchema)
+					target.Name = "snapshot_schema_dst_" + funcutil.RandomString(8)
+					if tc.dim != 0 {
+						target.Fields[1].TypeParams[0].Value = fmt.Sprint(tc.dim)
+					}
+					if tc.targetType != schemapb.DataType_None {
+						target.Fields[1].DataType = tc.targetType
+					}
+					if tc.targetElement != schemapb.DataType_None {
+						target.StructArrayFields[0].Fields[0].ElementType = tc.targetElement
+						target.StructArrayFields[0].Fields[0].ElementNullable = tc.targetElementNullable
+					}
+					if tc.targetLength != 0 {
+						target.Fields[2].TypeParams[0].Value = fmt.Sprint(tc.targetLength)
+					}
+					target.Fields[3].Nullable = tc.targetNullable
+					if tc.withDefault {
+						target.Fields[3].DefaultValue = &schemapb.ValueField{Data: &schemapb.ValueField_LongData{LongData: 42}}
+					}
+					create(target)
+					response, err := s.Cluster.ProxyClient.ImportV2(ctx, &internalpb.ImportRequest{
+						CollectionName: target.GetName(), Files: []*internalpb.ImportFile{{Paths: []string{snapshot.GetS3Location()}}},
+						Options: []*commonpb.KeyValuePair{{Key: "backup", Value: "true"}, {Key: importutilv2.SourceType, Value: importutilv2.SourceTypeSnapshot}},
+					})
+					if tc.admissionErr != "" {
+						s.Require().ErrorContains(merr.CheckRPCCall(response, err), tc.admissionErr)
+						s.Require().Empty(response.GetJobID(), "schema rejection must precede job creation")
+						// A rejected schema must leave the service available.
+						response, err := s.Cluster.MilvusClient.DescribeCollection(ctx,
+							&milvuspb.DescribeCollectionRequest{CollectionName: target.GetName()})
+						s.Require().NoError(merr.CheckRPCCall(response, err))
+						return
+					}
+					s.Require().NoError(merr.CheckRPCCall(response, err))
+					s.Require().NotEmpty(response.GetJobID())
+					// Bound polling here rather than using WaitForImportDone, whose
+					// loop does not stop when the context expires.
+					var progress *internalpb.GetImportProgressResponse
+					s.Require().Eventually(func() bool {
+						var err error
+						progress, err = s.Cluster.ProxyClient.GetImportProgress(ctx, &internalpb.GetImportProgressRequest{JobID: response.GetJobID()})
+						return err == nil && merr.Ok(progress.GetStatus()) &&
+							(progress.GetState() == internalpb.ImportJobState_Completed || progress.GetState() == internalpb.ImportJobState_Failed)
+					}, time.Minute, 100*time.Millisecond)
+					s.Require().Equal(internalpb.ImportJobState_Completed, progress.GetState(), progress.GetReason())
+					status, err = s.Cluster.MilvusClient.CreateIndex(ctx, &milvuspb.CreateIndexRequest{
+						CollectionName: target.GetName(), FieldName: "vector", IndexName: "vector_idx",
+						ExtraParams: integration.ConstructIndexParam(sourceDim, integration.IndexFaissIDMap, metric.L2),
+					})
+					s.Require().NoError(merr.CheckRPCCall(status, err))
+					s.WaitForIndexBuilt(ctx, target.GetName(), "vector")
+					status, err = s.Cluster.MilvusClient.LoadCollection(ctx, &milvuspb.LoadCollectionRequest{CollectionName: target.GetName()})
+					s.Require().NoError(merr.CheckRPCCall(status, err))
+					s.WaitForLoad(ctx, target.GetName())
+					for pk := int64(0); pk < 3; pk++ {
+						result, err := s.Cluster.MilvusClient.Query(ctx, &milvuspb.QueryRequest{
+							CollectionName: target.GetName(), Expr: fmt.Sprintf("pk == %d", pk),
+							OutputFields: []string{"pk", "text", "value"}, ConsistencyLevel: commonpb.ConsistencyLevel_Strong,
+						})
+						s.Require().NoError(merr.CheckRPCCall(result, err))
+						fields := lo.KeyBy(result.GetFieldsData(), func(field *schemapb.FieldData) string { return field.GetFieldName() })
+						s.Require().Equal([]int64{pk}, fields["pk"].GetScalars().GetLongData().GetData())
+						s.Equal([]string{"", "a", tc.text}[pk], fields["text"].GetScalars().GetStringData().GetData()[0])
+						if pk == 0 && tc.sourceNullable && !tc.withDefault {
+							s.Require().Equal([]bool{false}, typeutil.GetFieldDataValidData(fields["value"]))
+						} else {
+							want := []int64{7, 0, 5}[pk]
+							if pk == 0 && tc.sourceNullable {
+								want = 42
+							}
+							if valid := typeutil.GetFieldDataValidData(fields["value"]); len(valid) != 0 {
+								s.Equal([]bool{true}, valid)
+							}
+							s.Equal([]int64{want}, fields["value"].GetScalars().GetLongData().GetData())
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func (s *importTestBase) PrepareSourceCollection(dim int, dmlGroup *DMLGroup) *SourceCollectionInfo {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*10)
 	defer cancel()
 	c := s.Cluster
@@ -122,10 +403,8 @@ func (s *BulkInsertSuite) PrepareSourceCollection(dim int, dmlGroup *DMLGroup) *
 	s.NoError(merr.CheckRPCCall(loadStatus, err))
 	s.WaitForLoad(ctx, collectionName)
 
-	const delBatch = 2
 	var (
 		totalInsertRowNum = 0
-		totalDeleteRowNum = 0
 		totalInsertedIDs  = &schemapb.IDs{
 			IdField: &schemapb.IDs_IntId{
 				IntId: &schemapb.LongArray{
@@ -137,9 +416,7 @@ func (s *BulkInsertSuite) PrepareSourceCollection(dim int, dmlGroup *DMLGroup) *
 
 	for i := range dmlGroup.insertRowNums {
 		insRow := dmlGroup.insertRowNums[i]
-		delRow := dmlGroup.deleteRowNums[i]
 		totalInsertRowNum += insRow
-		totalDeleteRowNum += delRow
 
 		fVecColumn := integration.NewFloatVectorFieldData(integration.FloatVecField, insRow, dim)
 		structColumn := integration.NewStructArrayFieldData(schema.StructArrayFields[0], integration.StructArrayField, insRow, dim)
@@ -155,35 +432,34 @@ func (s *BulkInsertSuite) PrepareSourceCollection(dim int, dmlGroup *DMLGroup) *
 		totalInsertedIDs.IdField.(*schemapb.IDs_IntId).IntId.Data = append(
 			totalInsertedIDs.IdField.(*schemapb.IDs_IntId).IntId.Data, insertedIDs.IdField.(*schemapb.IDs_IntId).IntId.Data...)
 
-		// delete
-		beginIndex := 0
-		for j := 0; j < delBatch; j++ {
-			if delRow == 0 {
-				continue
-			}
-			delCnt := delRow / delBatch
-			idBegin := insertedIDs.GetIntId().GetData()[beginIndex]
-			idEnd := insertedIDs.GetIntId().GetData()[beginIndex+delCnt-1]
-			deleteResult, err := c.MilvusClient.Delete(ctx, &milvuspb.DeleteRequest{
-				CollectionName: collectionName,
-				Expr:           fmt.Sprintf("%d <= %s <= %d", idBegin, integration.Int64Field, idEnd),
-			})
-			s.NoError(merr.CheckRPCCall(deleteResult, err))
-			beginIndex += delCnt
-		}
-
 		// flush
 		flushResp, err := c.MilvusClient.Flush(ctx, &milvuspb.FlushRequest{
 			CollectionNames: []string{collectionName},
 		})
 		s.NoError(merr.CheckRPCCall(flushResp, err))
-		segmentIDs, has := flushResp.GetCollSegIDs()[collectionName]
-		ids := segmentIDs.GetData()
-		s.Require().NotEmpty(segmentIDs)
-		s.Require().True(has)
-		flushTs, has := flushResp.GetCollFlushTs()[collectionName]
-		s.True(has)
-		s.WaitForFlush(ctx, ids, flushTs, "", collectionName)
+		// The per-collection flush segment map is filled asynchronously by the
+		// flusher and can still be empty when the RPC returns. Discover the
+		// sealed L1 segments from meta instead of trusting the response body.
+		ids := flushResp.GetFlushCollSegIDs()[collectionName].GetData()
+		if len(ids) == 0 {
+			s.Require().Eventually(func() bool {
+				segments, err := c.ShowSegments(collectionName)
+				if err != nil {
+					return false
+				}
+				ids = ids[:0]
+				for _, segment := range segments {
+					if segment.GetState() == commonpb.SegmentState_Flushed && segment.GetLevel() == datapb.SegmentLevel_L1 {
+						ids = append(ids, segment.GetID())
+					}
+				}
+				return len(ids) > 0
+			}, 60*time.Second, 200*time.Millisecond)
+		}
+		s.Require().NotEmpty(ids)
+		if flushTs, ok := flushResp.GetCollFlushTs()[collectionName]; ok && flushTs != 0 {
+			s.WaitForFlush(ctx, ids, flushTs, "", collectionName)
+		}
 		segments, err := c.ShowSegments(collectionName)
 		s.NoError(err)
 		s.NotEmpty(segments)
@@ -196,47 +472,30 @@ func (s *BulkInsertSuite) PrepareSourceCollection(dim int, dmlGroup *DMLGroup) *
 	segments, err := c.ShowSegments(collectionName)
 	s.NoError(err)
 	s.NotEmpty(segments)
-	l0Segments := lo.Filter(segments, func(segment *datapb.SegmentInfo, _ int) bool {
-		return segment.GetState() == commonpb.SegmentState_Flushed && segment.GetLevel() == datapb.SegmentLevel_L0
-	})
 	segments = lo.Filter(segments, func(segment *datapb.SegmentInfo, _ int) bool {
 		return segment.GetState() == commonpb.SegmentState_Flushed && segment.GetLevel() == datapb.SegmentLevel_L1
 	})
-	// check l0 segments
-	if totalDeleteRowNum > 0 {
-		s.True(len(l0Segments) > 0)
+	s.Require().NotEmpty(segments)
+	for _, segment := range segments {
+		s.Require().EqualValues(storage.StorageV3, segment.GetStorageVersion())
+		s.Require().NotEmpty(segment.GetManifestPath())
 	}
 
-	// Extract timestamp ranges from source segments' binlogs
+	// V3 persists exact row timestamp bounds in SegmentStats; legacy
+	// FieldBinlog arrays need not be present in the catalog.
 	var l1MinTs uint64 = math.MaxUint64
 	var l1MaxTs uint64 = 0
 	for _, segment := range segments {
-		for _, fieldBinlog := range segment.GetBinlogs() {
-			for _, binlog := range fieldBinlog.GetBinlogs() {
-				if binlog.GetTimestampFrom() < l1MinTs {
-					l1MinTs = binlog.GetTimestampFrom()
-				}
-				if binlog.GetTimestampTo() > l1MaxTs {
-					l1MaxTs = binlog.GetTimestampTo()
-				}
-			}
-		}
+		stats := segment.GetStats()
+		s.Require().NotNil(stats)
+		s.Require().Positive(stats.GetTimestampFrom())
+		s.Require().GreaterOrEqual(stats.GetTimestampTo(), stats.GetTimestampFrom())
+		l1MinTs = min(l1MinTs, stats.GetTimestampFrom())
+		l1MaxTs = max(l1MaxTs, stats.GetTimestampTo())
 	}
 
-	var l0MinTs uint64 = math.MaxUint64
-	var l0MaxTs uint64 = 0
-	for _, segment := range l0Segments {
-		for _, fieldBinlog := range segment.GetDeltalogs() {
-			for _, binlog := range fieldBinlog.GetBinlogs() {
-				if binlog.GetTimestampFrom() < l0MinTs {
-					l0MinTs = binlog.GetTimestampFrom()
-				}
-				if binlog.GetTimestampTo() > l0MaxTs {
-					l0MaxTs = binlog.GetTimestampTo()
-				}
-			}
-		}
-	}
+	s.Require().NotEqual(uint64(math.MaxUint64), l1MinTs)
+	s.Require().Positive(l1MaxTs)
 
 	// search
 	expr := fmt.Sprintf("%s > 0", integration.Int64Field)
@@ -253,8 +512,8 @@ func (s *BulkInsertSuite) PrepareSourceCollection(dim int, dmlGroup *DMLGroup) *
 	err = merr.CheckRPCCall(searchResult, err)
 	s.NoError(err)
 	expectResult := nq * topk
-	if expectResult > totalInsertRowNum-totalDeleteRowNum {
-		expectResult = totalInsertRowNum - totalDeleteRowNum
+	if expectResult > totalInsertRowNum {
+		expectResult = totalInsertRowNum
 	}
 	s.Equal(expectResult, len(searchResult.GetResults().GetScores()))
 
@@ -268,7 +527,7 @@ func (s *BulkInsertSuite) PrepareSourceCollection(dim int, dmlGroup *DMLGroup) *
 	err = merr.CheckRPCCall(queryResult, err)
 	s.NoError(err)
 	count := int(queryResult.GetFieldsData()[0].GetScalars().GetLongData().GetData()[0])
-	s.Equal(totalInsertRowNum-totalDeleteRowNum, count)
+	s.Equal(totalInsertRowNum, count)
 
 	// query 2
 	expr = fmt.Sprintf("%s < %d", integration.Int64Field, totalInsertedIDs.GetIntId().GetData()[10])
@@ -281,56 +540,64 @@ func (s *BulkInsertSuite) PrepareSourceCollection(dim int, dmlGroup *DMLGroup) *
 	s.NoError(err)
 	count = len(queryResult.GetFieldsData()[0].GetScalars().GetLongData().GetData())
 	expectCount := 10
-	if dmlGroup.deleteRowNums[0] >= 10 {
-		expectCount = 0
-	}
 	s.Equal(expectCount, count)
 
 	// get collectionID and partitionID
 	collectionID := showCollectionsResp.GetCollectionIds()[0]
 	partitionID := showPartitionsResp.GetPartitionIDs()[0]
 
+	// StorageV3 backup import consumes snapshot metadata containing exact
+	// Manifest versions; legacy insert_log prefixes are not a V3 input format.
+	snapshotName := "binlog_source_" + funcutil.RandomString(8)
+	status, err := c.MilvusClient.CreateSnapshot(ctx, &milvuspb.CreateSnapshotRequest{
+		Name: snapshotName, CollectionName: collectionName,
+	})
+	s.Require().NoError(merr.CheckRPCCall(status, err))
+	s.T().Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		status, err := c.MilvusClient.DropSnapshot(cleanupCtx, &milvuspb.DropSnapshotRequest{
+			Name: snapshotName, CollectionName: collectionName,
+		})
+		s.NoError(merr.CheckRPCCall(status, err))
+	})
+	snapshot, err := c.MilvusClient.DescribeSnapshot(ctx, &milvuspb.DescribeSnapshotRequest{
+		Name: snapshotName, CollectionName: collectionName,
+	})
+	s.Require().NoError(merr.CheckRPCCall(snapshot, err))
+	s.Require().NotEmpty(snapshot.GetS3Location())
+
 	return &SourceCollectionInfo{
 		collectionID: collectionID,
 		partitionID:  partitionID,
-		l0SegmentIDs: lo.Map(l0Segments, func(segment *datapb.SegmentInfo, _ int) int64 {
-			return segment.GetID()
-		}),
 		SegmentIDs: lo.Map(segments, func(segment *datapb.SegmentInfo, _ int) int64 {
 			return segment.GetID()
 		}),
-		insertedIDs:    totalInsertedIDs,
-		storageVersion: int(storage.StorageV2),
-		l1MinTs:        l1MinTs,
-		l1MaxTs:        l1MaxTs,
-		l0MinTs:        l0MinTs,
-		l0MaxTs:        l0MaxTs,
+		insertedIDs: totalInsertedIDs,
+		snapshotURI: snapshot.GetS3Location(),
+		l1MinTs:     l1MinTs,
+		l1MaxTs:     l1MaxTs,
 	}
 }
 
-func (s *BulkInsertSuite) runBinlogTest(dmlGroup *DMLGroup) {
+func (s *importTestBase) runBinlogTest(dmlGroup *DMLGroup) {
 	const dim = 128
 
 	sourceCollectionInfo := s.PrepareSourceCollection(dim, dmlGroup)
 	collectionID := sourceCollectionInfo.collectionID
 	partitionID := sourceCollectionInfo.partitionID
-	l0SegmentIDs := sourceCollectionInfo.l0SegmentIDs
 	segmentIDs := sourceCollectionInfo.SegmentIDs
 	insertedIDs := sourceCollectionInfo.insertedIDs
 
 	mlog.Info(context.TODO(), "prepare source collection done",
 		mlog.FieldCollectionID(collectionID),
 		mlog.FieldPartitionID(partitionID),
-		mlog.Int64s("segments", segmentIDs),
-		mlog.Int64s("l0 segments", l0SegmentIDs))
+		mlog.Int64s("segments", segmentIDs))
 
 	c := s.Cluster
 	ctx := c.GetContext()
 
 	totalInsertRowNum := lo.SumBy(dmlGroup.insertRowNums, func(num int) int {
-		return num
-	})
-	totalDeleteRowNum := lo.SumBy(dmlGroup.deleteRowNums, func(num int) int {
 		return num
 	})
 
@@ -364,12 +631,8 @@ func (s *BulkInsertSuite) runBinlogTest(dmlGroup *DMLGroup) {
 
 	s.WaitForIndexBuilt(ctx, collectionName, integration.FloatVecField)
 
-	// binlog import
-	files := make([]*internalpb.ImportFile, 0)
-	for _, segmentID := range segmentIDs {
-		files = append(files, &internalpb.ImportFile{Paths: []string{fmt.Sprintf("%s/insert_log/%d/%d/%d",
-			s.Cluster.RootPath(), collectionID, partitionID, segmentID)}})
-	}
+	// Import the V3 snapshot while retaining source primary keys and timestamps.
+	files := []*internalpb.ImportFile{{Paths: []string{sourceCollectionInfo.snapshotURI}}}
 
 	importResp, err := c.ProxyClient.ImportV2(ctx, &internalpb.ImportRequest{
 		CollectionName: collectionName,
@@ -377,7 +640,7 @@ func (s *BulkInsertSuite) runBinlogTest(dmlGroup *DMLGroup) {
 		Files:          files,
 		Options: []*commonpb.KeyValuePair{
 			{Key: "backup", Value: "true"},
-			{Key: importutilv2.StorageVersion, Value: strconv.Itoa(sourceCollectionInfo.storageVersion)},
+			{Key: importutilv2.SourceType, Value: importutilv2.SourceTypeSnapshot},
 		},
 	})
 	s.NoError(merr.CheckRPCCall(importResp, err))
@@ -400,12 +663,9 @@ func (s *BulkInsertSuite) runBinlogTest(dmlGroup *DMLGroup) {
 	})
 	s.True(ok)
 	s.Equal(commonpb.SegmentState_Flushed, segment.GetState())
-	s.True(len(segment.GetBinlogs()) > 0)
-	s.NoError(CheckLogID(segment.GetBinlogs()))
-	s.True(len(segment.GetDeltalogs()) == 0)
-	s.NoError(CheckLogID(segment.GetDeltalogs()))
-	s.True(len(segment.GetStatslogs()) > 0)
-	s.NoError(CheckLogID(segment.GetStatslogs()))
+	s.EqualValues(storage.StorageV3, segment.GetStorageVersion())
+	s.NotEmpty(segment.GetManifestPath())
+	s.Empty(segment.GetDeltalogs())
 
 	// Verify L1 segment positions match actual timestamps from source collection
 	s.Equal(sourceCollectionInfo.l1MinTs, segment.GetStartPosition().GetTimestamp(),
@@ -413,52 +673,6 @@ func (s *BulkInsertSuite) runBinlogTest(dmlGroup *DMLGroup) {
 	s.Equal(sourceCollectionInfo.l1MaxTs, segment.GetDmlPosition().GetTimestamp(),
 		"L1 segment DmlPosition should match actual max timestamp from source binlogs")
 	mlog.Info(context.TODO(), "L1 segment position verification passed")
-
-	// l0 import
-	if totalDeleteRowNum > 0 {
-		files = make([]*internalpb.ImportFile, 0)
-		for _, segmentID := range l0SegmentIDs {
-			files = append(files, &internalpb.ImportFile{Paths: []string{fmt.Sprintf("%s/delta_log/%d/%d/%d",
-				s.Cluster.RootPath(), collectionID, common.AllPartitionsID, segmentID)}})
-		}
-		importResp, err = c.ProxyClient.ImportV2(ctx, &internalpb.ImportRequest{
-			CollectionName: collectionName,
-			Files:          files,
-			Options: []*commonpb.KeyValuePair{
-				{Key: "l0_import", Value: "true"},
-				{Key: importutilv2.StorageVersion, Value: strconv.Itoa(sourceCollectionInfo.storageVersion)},
-			},
-		})
-		s.NoError(merr.CheckRPCCall(importResp, err))
-		mlog.Info(context.TODO(), "Import result", mlog.Any("importResp", importResp))
-
-		jobID = importResp.GetJobID()
-		err = WaitForImportDone(ctx, c, jobID)
-		s.NoError(err)
-
-		segments, err = c.ShowSegments(collectionName)
-		s.NoError(err)
-		s.NotEmpty(segments)
-		mlog.Info(context.TODO(), "Show segments", mlog.Any("segments", segments))
-		l0Segments := lo.Filter(segments, func(segment *datapb.SegmentInfo, _ int) bool {
-			return segment.GetLevel() == datapb.SegmentLevel_L0
-		})
-		s.Equal(1, len(l0Segments))
-		segment = l0Segments[0]
-		s.Equal(commonpb.SegmentState_Flushed, segment.GetState())
-		s.Equal(common.AllPartitionsID, segment.GetPartitionID())
-		s.True(len(segment.GetBinlogs()) == 0)
-		s.True(len(segment.GetDeltalogs()) > 0)
-		s.NoError(CheckLogID(segment.GetDeltalogs()))
-		s.True(len(segment.GetStatslogs()) == 0)
-
-		// Verify L0 segment positions match actual timestamps from source collection
-		s.Equal(sourceCollectionInfo.l0MinTs, segment.GetStartPosition().GetTimestamp(),
-			"L0 segment StartPosition should match actual min timestamp from source deltalogs")
-		s.Equal(sourceCollectionInfo.l0MaxTs, segment.GetDmlPosition().GetTimestamp(),
-			"L0 segment DmlPosition should match actual max timestamp from source deltalogs")
-		mlog.Info(context.TODO(), "L0 segment position verification passed")
-	}
 
 	// load
 	loadStatus, err := c.MilvusClient.LoadCollection(ctx, &milvuspb.LoadCollectionRequest{
@@ -483,8 +697,8 @@ func (s *BulkInsertSuite) runBinlogTest(dmlGroup *DMLGroup) {
 	err = merr.CheckRPCCall(searchResult, err)
 	s.NoError(err)
 	expectResult := nq * topk
-	if expectResult > totalInsertRowNum-totalDeleteRowNum {
-		expectResult = totalInsertRowNum - totalDeleteRowNum
+	if expectResult > totalInsertRowNum {
+		expectResult = totalInsertRowNum
 	}
 	s.Equal(expectResult, len(searchResult.GetResults().GetScores()))
 	// check ids from collectionA, because during binlog import, even if the primary key's autoID is set to true,
@@ -508,7 +722,7 @@ func (s *BulkInsertSuite) runBinlogTest(dmlGroup *DMLGroup) {
 	err = merr.CheckRPCCall(queryResult, err)
 	s.NoError(err)
 	count := int(queryResult.GetFieldsData()[0].GetScalars().GetLongData().GetData()[0])
-	s.Equal(totalInsertRowNum-totalDeleteRowNum, count)
+	s.Equal(totalInsertRowNum, count)
 
 	// query 2
 	expr = fmt.Sprintf("%s < %d", integration.Int64Field, insertedIDs.GetIntId().GetData()[10])
@@ -522,9 +736,6 @@ func (s *BulkInsertSuite) runBinlogTest(dmlGroup *DMLGroup) {
 	s.NoError(err)
 	count = len(queryResult.GetFieldsData()[0].GetScalars().GetLongData().GetData())
 	expectCount := 10
-	if dmlGroup.deleteRowNums[0] >= 10 {
-		expectCount = 0
-	}
 	s.Equal(expectCount, count)
 }
 
@@ -550,7 +761,17 @@ func (s *BulkInsertSuite) TestInvalidInput() {
 	})
 	s.NoError(merr.CheckRPCCall(describeCollectionResp, err))
 
-	// binlog import
+	s.False(paramtable.Get().DataCoordCfg.EnableL0Import.GetAsBool())
+	l0Resp, err := c.ProxyClient.ImportV2(ctx, &internalpb.ImportRequest{
+		CollectionName: collectionName,
+		Files:          []*internalpb.ImportFile{{Paths: []string{"delta_log/source"}}},
+		Options:        []*commonpb.KeyValuePair{{Key: "l0_import", Value: "true"}},
+	})
+	s.NoError(err)
+	s.ErrorContains(merr.CheckRPCCall(l0Resp, err), "l0 import is disabled")
+
+	// Backup paths are an insert-log prefix and an optional delta-log prefix.
+	// A third path is invalid input and must not trigger service retries.
 	files := []*internalpb.ImportFile{
 		{
 			Paths: []string{"invalid-path", "invalid-path", "invalid-path"},
@@ -564,40 +785,16 @@ func (s *BulkInsertSuite) TestInvalidInput() {
 			{Key: "backup", Value: "true"},
 		},
 	})
+	s.Require().NoError(err)
 	err = merr.CheckRPCCall(importResp, err)
-	s.True(strings.Contains(err.Error(), "too many input paths for binlog import"))
-	s.Error(err)
+	s.ErrorContains(err, "too many input paths for binlog import")
+	s.ErrorIs(err, merr.ErrImportFailed)
+	s.Equal(merr.InputError, merr.GetErrorType(err))
+	s.False(importResp.GetStatus().GetRetriable())
 	mlog.Info(context.TODO(), "Import result", mlog.Any("importResp", importResp))
 }
 
-func (s *BulkInsertSuite) TestBinlogImport() {
-	dmlGroup := &DMLGroup{
-		insertRowNums: []int{500, 500, 500},
-		deleteRowNums: []int{300, 300, 300},
-	}
-	s.runBinlogTest(dmlGroup)
-}
-
+// Independent L0 import is disabled; retain ordinary binlog restore coverage.
 func (s *BulkInsertSuite) TestBinlogImport_NoDelete() {
-	dmlGroup := &DMLGroup{
-		insertRowNums: []int{500, 500, 500},
-		deleteRowNums: []int{0, 0, 0},
-	}
-	s.runBinlogTest(dmlGroup)
-}
-
-func (s *BulkInsertSuite) TestBinlogImport_Partial_0_Rows_Segment() {
-	dmlGroup := &DMLGroup{
-		insertRowNums: []int{500, 500, 500},
-		deleteRowNums: []int{500, 300, 0},
-	}
-	s.runBinlogTest(dmlGroup)
-}
-
-func (s *BulkInsertSuite) TestBinlogImport_All_0_Rows_Segment() {
-	dmlGroup := &DMLGroup{
-		insertRowNums: []int{500, 500, 500},
-		deleteRowNums: []int{500, 500, 500},
-	}
-	s.runBinlogTest(dmlGroup)
+	s.runBinlogTest(&DMLGroup{insertRowNums: []int{500, 500, 500}})
 }

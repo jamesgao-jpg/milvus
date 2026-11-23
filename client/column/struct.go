@@ -24,6 +24,13 @@ import (
 	"github.com/milvus-io/milvus/client/v3/entity"
 )
 
+// StructArrayColumn is implemented by struct array columns.
+type StructArrayColumn interface {
+	Column
+	// Fields returns the sub-field columns.
+	Fields() []Column
+}
+
 // columnStructArray represents a struct-array field. Each sub-column must itself be an
 // "array-of-X" column (e.g. ColumnInt32Array, ColumnFloatVectorArray) so that one entry
 // in the column corresponds to one row's variable-length list of struct elements.
@@ -46,6 +53,118 @@ func NewColumnStructArray(name string, fields []Column) Column {
 		name:     name,
 		nullable: nullable,
 	}
+}
+
+// NewColumnStructArrayFromSchema creates an empty StructArray column whose
+// child columns match schema. Values can then be appended as map[string]any.
+func NewColumnStructArrayFromSchema(name string, schema *entity.StructSchema) (Column, error) {
+	if schema == nil {
+		return nil, errors.New("struct schema is required")
+	}
+	fields := make([]Column, 0, len(schema.Fields))
+	for _, field := range schema.Fields {
+		if field == nil {
+			return nil, errors.New("struct schema contains a nil child")
+		}
+		child, err := newStructArrayChildColumn(field)
+		if err != nil {
+			return nil, err
+		}
+		fields = append(fields, child)
+	}
+	return NewColumnStructArray(name, fields), nil
+}
+
+// newStructArrayChildColumn creates the empty column of a sub-field. The sub-field describes one
+// struct element; its Nullable makes the column element nullable, and ElementNullable makes the
+// leaves of an Array<T> sub-field nullable.
+func newStructArrayChildColumn(field *entity.Field) (Column, error) {
+	if field == nil {
+		return nil, errors.New("struct child field is required")
+	}
+	col, err := newStructArrayChildBase(field)
+	if err != nil {
+		return nil, err
+	}
+	if field.Nullable {
+		elementCol, ok := col.(ElementNullableColumn)
+		if !ok {
+			return nil, errors.Newf("struct sub-field %q of type %v does not support element nullable", field.Name, field.DataType)
+		}
+		elementCol.SetElementNullable(true)
+	}
+	if field.ElementNullable {
+		nestedCol, ok := col.(NestedArrayColumn)
+		if !ok {
+			return nil, errors.Newf("struct sub-field %q of type %v does not support element nullable leaves", field.Name, field.DataType)
+		}
+		nestedCol.SetLeafNullable(true)
+	}
+	return col, nil
+}
+
+func newStructArrayChildBase(field *entity.Field) (Column, error) {
+	switch field.DataType {
+	case entity.FieldTypeArray:
+		col, err := newNestedArrayColumn(field.Name, field.ElementType)
+		if err != nil {
+			return nil, errors.Wrapf(err, "sub-field %q", field.Name)
+		}
+		return col, nil
+	case entity.FieldTypeBool:
+		return NewColumnBoolArray(field.Name, nil), nil
+	case entity.FieldTypeInt8:
+		return NewColumnInt8Array(field.Name, nil), nil
+	case entity.FieldTypeInt16:
+		return NewColumnInt16Array(field.Name, nil), nil
+	case entity.FieldTypeInt32:
+		return NewColumnInt32Array(field.Name, nil), nil
+	case entity.FieldTypeInt64:
+		return NewColumnInt64Array(field.Name, nil), nil
+	case entity.FieldTypeFloat:
+		return NewColumnFloatArray(field.Name, nil), nil
+	case entity.FieldTypeDouble:
+		return NewColumnDoubleArray(field.Name, nil), nil
+	case entity.FieldTypeVarChar, entity.FieldTypeString:
+		return NewColumnVarCharArray(field.Name, nil), nil
+	case entity.FieldTypeFloatVector:
+		dim, err := field.GetDim()
+		if err != nil {
+			return nil, errors.Wrapf(err, "sub-field %q", field.Name)
+		}
+		return NewColumnFloatVectorArray(field.Name, int(dim), nil), nil
+	case entity.FieldTypeFloat16Vector:
+		dim, err := field.GetDim()
+		if err != nil {
+			return nil, errors.Wrapf(err, "sub-field %q", field.Name)
+		}
+		return NewColumnFloat16VectorArray(field.Name, int(dim), nil), nil
+	case entity.FieldTypeBFloat16Vector:
+		dim, err := field.GetDim()
+		if err != nil {
+			return nil, errors.Wrapf(err, "sub-field %q", field.Name)
+		}
+		return NewColumnBFloat16VectorArray(field.Name, int(dim), nil), nil
+	case entity.FieldTypeBinaryVector:
+		dim, err := field.GetDim()
+		if err != nil {
+			return nil, errors.Wrapf(err, "sub-field %q", field.Name)
+		}
+		return NewColumnBinaryVectorArray(field.Name, int(dim), nil), nil
+	case entity.FieldTypeInt8Vector:
+		dim, err := field.GetDim()
+		if err != nil {
+			return nil, errors.Wrapf(err, "sub-field %q", field.Name)
+		}
+		return NewColumnInt8VectorArray(field.Name, int(dim), nil), nil
+	default:
+		return nil, errors.Newf("unsupported struct sub-field type %v for field %q", field.DataType, field.Name)
+	}
+}
+
+// Fields returns the sub-field columns.
+func (c *columnStructArray) Fields() []Column {
+	return c.fields
 }
 
 func (c *columnStructArray) Name() string {
@@ -104,7 +223,9 @@ func (c *columnStructArray) FieldData() *schemapb.FieldData {
 
 // AppendValue appends one row of struct elements. The row must be a map[string]any whose keys
 // match the sub-field names; each value must match what the corresponding sub-column's AppendValue
-// accepts (typically `[]T` for scalar arrays or `[][]float32`/`[][]byte` for vector arrays).
+// accepts (typically `[]T` for scalar arrays or `[][]float32`/`[][]byte` for vector arrays, and
+// `[]*T` or nil vectors for null elements of element-nullable sub-fields). An element-nullable
+// sub-field may be omitted or nil: it gets one null element per struct element of the row.
 //
 // If any sub-field append fails, previously appended sub-fields are rolled back to their pre-call
 // lengths so sub-columns stay in lock-step.
@@ -120,28 +241,87 @@ func (c *columnStructArray) AppendValue(value any) error {
 		return c.AppendNull()
 	}
 	// pre-check all keys exist before mutating any sub-column.
-	for _, sub := range c.fields {
+	omitted := make([]bool, len(c.fields))
+	for i, sub := range c.fields {
 		value, present := row[sub.Name()]
+		if present && value != nil {
+			continue
+		}
+		if isElementNullableColumn(sub) {
+			omitted[i] = true
+			continue
+		}
 		if !present {
 			return errors.Newf("struct array AppendValue: missing sub-field %q", sub.Name())
 		}
-		if value == nil {
-			return errors.Newf("struct array AppendValue: sub-field %q is nil; use a nil struct row to append null", sub.Name())
-		}
+		return errors.Newf("struct array AppendValue: sub-field %q is nil; use a nil struct row to append null", sub.Name())
 	}
 	preLens := make([]int, len(c.fields))
 	for i, sub := range c.fields {
 		preLens[i] = sub.Len()
 	}
-	for i, sub := range c.fields {
-		if err := sub.AppendValue(row[sub.Name()]); err != nil {
-			for j := 0; j < i; j++ {
-				c.fields[j] = c.fields[j].Slice(0, preLens[j])
+	rollback := func() {
+		for j, field := range c.fields {
+			if field.Len() > preLens[j] {
+				c.fields[j] = field.Slice(0, preLens[j])
 			}
+		}
+	}
+
+	elementCount, countFrom := -1, ""
+	for i, sub := range c.fields {
+		if omitted[i] {
+			continue
+		}
+		if err := sub.AppendValue(row[sub.Name()]); err != nil {
+			rollback()
+			return errors.Wrapf(err, "struct array AppendValue: sub-field %q", sub.Name())
+		}
+		n, err := subFieldElementLen(sub, sub.Len()-1)
+		if err != nil {
+			rollback()
+			return errors.Wrapf(err, "struct array AppendValue: sub-field %q", sub.Name())
+		}
+		if elementCount < 0 {
+			elementCount, countFrom = n, sub.Name()
+		} else if n != elementCount {
+			rollback()
+			return errors.Newf("struct array AppendValue: sub-field %q has %d elements but sub-field %q has %d",
+				sub.Name(), n, countFrom, elementCount)
+		}
+	}
+	for i, sub := range c.fields {
+		if !omitted[i] {
+			continue
+		}
+		if elementCount < 0 {
+			rollback()
+			return errors.Newf("struct array AppendValue: cannot infer the element count of omitted sub-field %q; provide at least one sub-field", sub.Name())
+		}
+		if err := sub.(elementNuller).appendNullElements(elementCount); err != nil {
+			rollback()
 			return errors.Wrapf(err, "struct array AppendValue: sub-field %q", sub.Name())
 		}
 	}
 	return nil
+}
+
+func isElementNullableColumn(col Column) bool {
+	elementCol, ok := col.(ElementNullableColumn)
+	if !ok || !elementCol.ElementNullable() {
+		return false
+	}
+	_, ok = col.(elementNuller)
+	return ok
+}
+
+// subFieldElementLen returns the logical element count of a sub-field row.
+func subFieldElementLen(col Column, row int) (int, error) {
+	lener, ok := col.(elementLener)
+	if !ok {
+		return 0, errors.Newf("column %q of type %v is not a struct sub-field column", col.Name(), col.Type())
+	}
+	return lener.ElementLen(row)
 }
 
 func (c *columnStructArray) Get(idx int) (any, error) {
@@ -242,6 +422,9 @@ func (c *columnStructArray) ValidateNullable() error {
 				field.Name(), field.Len(), rowCount)
 		}
 	}
+	if err := c.validateElementCounts(rowCount); err != nil {
+		return err
+	}
 	if !c.nullable {
 		return nil
 	}
@@ -264,6 +447,33 @@ func (c *columnStructArray) ValidateNullable() error {
 	return nil
 }
 
+// validateElementCounts checks that every sub-field holds the same number of struct elements in
+// each row.
+func (c *columnStructArray) validateElementCounts(rowCount int) error {
+	for row := 0; row < rowCount; row++ {
+		expected, expectedFrom := -1, ""
+		for _, field := range c.fields {
+			lener, ok := field.(elementLener)
+			if !ok {
+				continue
+			}
+			n, err := lener.ElementLen(row)
+			if err != nil {
+				return errors.Wrapf(err, "struct array sub-field %q row %d", field.Name(), row)
+			}
+			if expected < 0 {
+				expected, expectedFrom = n, field.Name()
+				continue
+			}
+			if n != expected {
+				return errors.Newf("struct array %q sub-field %q has %d elements at row %d, but sub-field %q has %d",
+					c.name, field.Name(), n, row, expectedFrom, expected)
+			}
+		}
+	}
+	return nil
+}
+
 func (c *columnStructArray) CompactNullableValues() {
 	for _, field := range c.fields {
 		field.CompactNullableValues()
@@ -275,4 +485,74 @@ func (c *columnStructArray) ValidCount() int {
 		return 0
 	}
 	return c.fields[0].ValidCount()
+}
+
+// ApplyStructSchema aligns the sub-columns of a struct array column with its struct schema: it
+// marks the element-nullable and leaf-nullable sub-columns, and gives an Array<T> sub-column
+// parsed from rows that do not tell their leaf type the type declared in the schema. Sub-columns
+// absent from the schema are left as they are.
+func ApplyStructSchema(col Column, schema *entity.StructSchema) error {
+	structCol, ok := col.(*columnStructArray)
+	if !ok {
+		return errors.Newf("column %q is not a struct array column", col.Name())
+	}
+	if schema == nil {
+		return nil
+	}
+	fields := make(map[string]*entity.Field, len(schema.Fields))
+	for _, field := range schema.Fields {
+		if field != nil {
+			fields[field.Name] = field
+		}
+	}
+	for i, sub := range structCol.fields {
+		field := fields[sub.Name()]
+		if field == nil {
+			continue
+		}
+		if untyped, ok := sub.(*columnUntypedArrayArray); ok && field.DataType == entity.FieldTypeArray {
+			typed, err := retypeUntypedArrayArray(untyped, field)
+			if err != nil {
+				return err
+			}
+			structCol.fields[i] = typed
+			sub = typed
+		}
+		if elementCol, ok := sub.(ElementNullableColumn); ok && field.Nullable && !elementCol.ElementNullable() {
+			elementCol.SetElementNullable(true)
+		}
+		if nestedCol, ok := sub.(NestedArrayColumn); ok && field.ElementNullable && !nestedCol.LeafNullable() {
+			nestedCol.SetLeafNullable(true)
+		}
+	}
+	return nil
+}
+
+// retypeUntypedArrayArray rebuilds an untyped Array<T> sub-column with the leaf type of its
+// schema. None of its rows holds an inner array.
+func retypeUntypedArrayArray(untyped *columnUntypedArrayArray, field *entity.Field) (Column, error) {
+	typed, err := newStructArrayChildColumn(field)
+	if err != nil {
+		return nil, err
+	}
+	if untyped.Nullable() {
+		typed.SetNullable(true)
+	}
+	for row := 0; row < untyped.Len(); row++ {
+		isNull, err := untyped.IsNull(row)
+		if err != nil {
+			return nil, err
+		}
+		if isNull {
+			err = typed.AppendNull()
+		} else if n, _ := untyped.ElementLen(row); n > 0 {
+			err = typed.(elementNuller).appendNullElements(n)
+		} else {
+			err = typed.(interface{ appendEmptyRow() error }).appendEmptyRow()
+		}
+		if err != nil {
+			return nil, errors.Wrapf(err, "struct sub-field %q row %d", field.Name, row)
+		}
+	}
+	return typed, nil
 }

@@ -1,0 +1,139 @@
+package queryresource
+
+import (
+	"context"
+	"sync"
+
+	"github.com/cockroachdb/errors"
+
+	"github.com/milvus-io/milvus/internal/views/qviews"
+	"github.com/milvus-io/milvus/pkg/v3/util/nodescheduler"
+)
+
+type resourceBuildTask struct {
+	build        func(context.Context) (*QueryRuntime, error)
+	doneCallback func()
+	done         chan struct{}
+
+	mu       sync.Mutex
+	finished bool
+	runtime  *QueryRuntime
+	err      error
+}
+
+func newResourceBuildTask(build func(context.Context) (*QueryRuntime, error)) *resourceBuildTask {
+	return &resourceBuildTask{
+		build: build,
+		done:  make(chan struct{}),
+	}
+}
+
+func (t *resourceBuildTask) Execute(ctx context.Context) error {
+	runtime, err := t.build(ctx)
+	if errors.Is(err, nodescheduler.ErrDelay) {
+		return err
+	}
+	t.finish(runtime, err)
+	if t.doneCallback != nil {
+		t.doneCallback()
+	}
+	return err
+}
+
+func (t *resourceBuildTask) Result() (*QueryRuntime, error) {
+	<-t.done
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.runtime, t.err
+}
+
+func (t *resourceBuildTask) finish(runtime *QueryRuntime, err error) {
+	t.mu.Lock()
+	if t.finished {
+		t.mu.Unlock()
+		runtime.Close()
+		return
+	}
+	t.runtime = runtime
+	t.err = err
+	t.finished = true
+	close(t.done)
+	t.mu.Unlock()
+}
+
+type scheduledBuild struct {
+	task   *resourceBuildTask
+	handle nodescheduler.TaskHandle
+}
+
+func scheduleResourceBuild(scheduler nodescheduler.Scheduler, task *resourceBuildTask, callback func(*scheduledBuild), opts ...nodescheduler.Option) *scheduledBuild {
+	scheduled := &scheduledBuild{task: task}
+	task.doneCallback = func() {
+		if callback != nil {
+			callback(scheduled)
+		}
+	}
+	scheduled.handle = scheduler.Submit(task, opts...)
+	return scheduled
+}
+
+func (t *scheduledBuild) Cancel() {
+	t.handle.Cancel()
+}
+
+func (t *scheduledBuild) Result() (*QueryRuntime, error) {
+	_ = t.handle.Wait(context.Background())
+	t.task.finish(nil, context.Canceled)
+	return t.task.Result()
+}
+
+var _ nodescheduler.Task = (*resourceBuildTask)(nil)
+
+type resourceReadyTask struct {
+	ref     queryViewRef
+	runtime *QueryRuntime
+	manager *Manager
+	key     qviews.QueryViewKey
+	onReady func()
+}
+
+func (t resourceReadyTask) Execute(ctx context.Context) error {
+	return t.manager.prepareViewRef(ctx, t.key, t.ref, t.runtime, t.onReady)
+}
+
+var _ nodescheduler.Task = resourceReadyTask{}
+
+// Retaining the callback retains the old DataView's files until subtraction finishes.
+type resourceReleaseTask struct {
+	resources    *viewResources
+	closeRuntime bool
+	runtime      *QueryRuntime
+	version      qviews.DataVersion
+	onDropped    func()
+}
+
+func (t resourceReleaseTask) Execute(ctx context.Context) error {
+	if err := t.resources.release(); err != nil {
+		return err
+	}
+	var err error
+	if t.closeRuntime {
+		err = t.runtime.tryClose()
+	} else {
+		err = t.runtime.BeforeRelease(ctx, t.version)
+	}
+	if err != nil {
+		return errors.Mark(err, nodescheduler.ErrDelay)
+	}
+	if t.onDropped != nil {
+		t.onDropped()
+	}
+	return nil
+}
+
+// SetPriority changes only the pending attempt, including a delayed retry.
+func (t *scheduledBuild) SetPriority(priority int32) {
+	if handle, ok := t.handle.(nodescheduler.PriorityTaskHandle); ok {
+		handle.SetPriority(priority)
+	}
+}

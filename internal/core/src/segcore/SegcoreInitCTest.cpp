@@ -11,6 +11,7 @@
 
 #include <stdlib.h>
 #include <exception>
+#include <limits>
 #include <string>
 
 #include "common/EasyAssert.h"
@@ -29,6 +30,24 @@ TEST(Init, Naive) {
     free(simd_type);
 }
 
+TEST(Init, KnowhereMRLRefineRatio) {
+    const auto previous = milvus::config::KnowhereGetMRLRefineRatio();
+    auto status = SegcoreSetMRLRefineRatio(2.9f);
+    EXPECT_EQ(status.error_code, 0);
+    EXPECT_FLOAT_EQ(milvus::config::KnowhereGetMRLRefineRatio(), 2.9f);
+    for (float value : {0.0f,
+                        0.5f,
+                        -1.0f,
+                        std::numeric_limits<float>::infinity(),
+                        std::numeric_limits<float>::quiet_NaN()}) {
+        status = SegcoreSetMRLRefineRatio(value);
+        EXPECT_NE(status.error_code, 0);
+        EXPECT_FLOAT_EQ(milvus::config::KnowhereGetMRLRefineRatio(), 2.9f);
+        free(const_cast<char*>(status.error_msg));
+    }
+    milvus::config::KnowhereSetMRLRefineRatio(previous);
+}
+
 TEST(Init, KnowhereThreadPoolInit) {
 #ifdef BUILD_DISK_ANN
     try {
@@ -42,7 +61,7 @@ TEST(Init, KnowhereThreadPoolInit) {
 }
 
 TEST(Init, KnowhereGPUMemoryPoolInit) {
-#ifdef MILVUS_GPU_VERSION
+#ifdef MILVUS_WITH_CUVS
     ASSERT_NO_THROW(milvus::config::KnowhereInitGPUMemoryPool(0, 0));
 #endif
 }

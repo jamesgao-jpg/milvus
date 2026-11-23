@@ -22,6 +22,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/protoadapt"
 
+	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/fastpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 )
@@ -37,11 +38,22 @@ import (
 // It is registered globally via init() so any gRPC server or client that
 // imports this package (or any package that imports pkg/util/resource)
 // automatically uses it.
-type releaseCodec struct{}
+type releaseCodec struct {
+	// An optional pool lets tests compare the same codec with gRPC's default.
+	// Registered production codecs use the shared private pool.
+	bufferPool mem.BufferPool
+}
+
+func (c releaseCodec) pool() mem.BufferPool {
+	if c.bufferPool != nil {
+		return c.bufferPool
+	}
+	return releaseCodecBufferPool
+}
 
 func (releaseCodec) Name() string { return "proto" }
 
-func (releaseCodec) Marshal(v any) (mem.BufferSlice, error) {
+func (c releaseCodec) Marshal(v any) (mem.BufferSlice, error) {
 	msg := messageV2Of(v)
 	if msg == nil {
 		return nil, merr.WrapErrServiceInternalMsg("releaseCodec: %T does not implement proto.Message", v)
@@ -51,6 +63,15 @@ func (releaseCodec) Marshal(v any) (mem.BufferSlice, error) {
 	// lookup for the vast majority of gRPC messages that carry no C-backed memory.
 	if _, ok := v.(MsgPinnable); ok {
 		defer MsgPins.Release(v)
+	}
+
+	// MaterializeResults carries large opaque body entries: send them as
+	// views instead of copying them into a marshal buffer
+	// (marshalMaterializeResults). The views outlive this call, so the type
+	// must never become MsgPinnable (its pins would be released before gRPC
+	// writes the views).
+	if m, ok := v.(*internalpb.MaterializeResults); ok {
+		return marshalMaterializeResults(m)
 	}
 
 	size := proto.Size(msg)
@@ -64,7 +85,7 @@ func (releaseCodec) Marshal(v any) (mem.BufferSlice, error) {
 		}
 		out = mem.BufferSlice{mem.SliceBuffer(buf)}
 	} else {
-		pool := mem.DefaultBufferPool()
+		pool := c.pool()
 		pbuf := pool.Get(size)
 		if buf, err := marshalOptions.MarshalAppend((*pbuf)[:0], msg); err != nil {
 			pool.Put(pbuf)
@@ -78,19 +99,27 @@ func (releaseCodec) Marshal(v any) (mem.BufferSlice, error) {
 	return out, nil
 }
 
-func (releaseCodec) Unmarshal(data mem.BufferSlice, v any) error {
+func (c releaseCodec) Unmarshal(data mem.BufferSlice, v any) error {
 	msg := messageV2Of(v)
 	if msg == nil {
 		return merr.WrapErrServiceInternalMsg("releaseCodec: %T does not implement proto.Message", v)
 	}
 
-	buf := data.MaterializeToBuffer(mem.DefaultBufferPool())
+	// MaterializeResults: no copy of the body; it stays in the received
+	// buffers, referenced (see unmarshalMaterializeResults).
+	if m, ok := v.(*internalpb.MaterializeResults); ok {
+		return unmarshalMaterializeResults(data, m)
+	}
+
+	buf := data.MaterializeToBuffer(c.pool())
 	defer buf.Free()
 	// Fast path for the top-level hot RPC messages supported by TryUnmarshal:
 	// RetrieveResults, InsertRequest, and UpsertRequest. Unsupported message
 	// types fall through to the official codec.
-	if handled, err := fastpb.TryUnmarshal(v, buf.ReadOnlyData()); handled {
-		return err
+	if fastPBEnabled() {
+		if handled, err := fastpb.TryUnmarshal(v, buf.ReadOnlyData()); handled {
+			return err
+		}
 	}
 	return proto.Unmarshal(buf.ReadOnlyData(), msg)
 }

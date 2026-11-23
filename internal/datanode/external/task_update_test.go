@@ -20,6 +20,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -41,6 +43,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexcgopb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/externalspec"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
@@ -471,6 +474,79 @@ func (s *RefreshExternalCollectionTaskSuite) TestBalanceFragmentsToSegments_Mult
 	}
 }
 
+func (s *RefreshExternalCollectionTaskSuite) TestBalanceFragmentsToSegments_PaimonDataSplitLimitsAndBuckets() {
+	paramtable.Init()
+	maxSplitsKey := paramtable.Get().DataNodeCfg.ExternalCollectionPaimonMaxDataSplitsPerSegment.Key
+	paramtable.Get().Save(maxSplitsKey, "2")
+	defer paramtable.Get().Reset(maxSplitsKey)
+
+	req := &datapb.RefreshExternalCollectionTaskRequest{
+		CollectionID:           s.collectionID,
+		TaskID:                 s.taskID,
+		PreAllocatedSegmentIds: &datapb.IDRange{Begin: 100, End: 300},
+		TargetRowsPerSegment:   100,
+		StorageConfig:          &indexpb.StorageConfig{StorageType: "local"},
+		ExternalSource:         "s3://bucket/table",
+		ExternalSpec:           `{"format":"paimon-table"}`,
+		Schema: &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{
+			{FieldID: 100, Name: "pk", ExternalField: "pk"},
+		}},
+	}
+	task := NewRefreshExternalCollectionTask(context.Background(), req)
+	task.preallocatedIDRange = req.GetPreAllocatedSegmentIds()
+	task.nextAllocID = task.preallocatedIDRange.Begin
+	task.parsedSpec = &externalspec.ExternalSpec{Format: externalspec.FormatPaimonTable}
+
+	var mu sync.Mutex
+	var packedBins [][]packed.Fragment
+	m1 := mockey.Mock(packed.CreateSegmentManifestWithBasePathAndExtfs).
+		To(func(ctx context.Context, basePath, format string, columns []string, fragments []packed.Fragment, storageConfig *indexpb.StorageConfig, extfs packed.ExternalSpecContext) (string, error) {
+			mu.Lock()
+			packedBins = append(packedBins, append([]packed.Fragment(nil), fragments...))
+			mu.Unlock()
+			return fmt.Sprintf("%s/manifest.json", basePath), nil
+		}).Build()
+	defer m1.UnPatch()
+	m2 := mockey.Mock(packed.SampleExternalFieldSizes).Return(map[string]int64{"pk": 8}, nil).Build()
+	defer m2.UnPatch()
+
+	fragments := make([]packed.Fragment, 0, 6)
+	for bucket := 0; bucket < 2; bucket++ {
+		for split := 0; split < 3; split++ {
+			fragments = append(fragments, packed.Fragment{
+				FragmentID: int64(bucket*3 + split),
+				FilePath:   fmt.Sprintf("split-%d-%d", bucket, split),
+				RowCount:   10,
+				Properties: map[string]string{
+					// Production fragments carry only the descriptor; routing
+					// is derived from it.
+					"metadata": fmt.Sprintf(
+						`{"version":1,"read_path":"data-split","bucket":%d,"snapshot_id":9,"record_count":10}`,
+						bucket),
+				},
+			})
+		}
+	}
+
+	result, err := task.balanceFragmentsToSegments(context.Background(), fragments)
+	s.NoError(err)
+	s.Len(result, 4)
+	s.Len(packedBins, 4)
+	for _, bin := range packedBins {
+		s.LessOrEqual(len(bin), 2)
+		if !s.NotEmpty(bin) {
+			continue
+		}
+		_, bucket, err := packed.PaimonRoutingMeta(bin[0].Properties)
+		s.NoError(err)
+		for _, fragment := range bin {
+			_, fragmentBucket, err := packed.PaimonRoutingMeta(fragment.Properties)
+			s.NoError(err)
+			s.Equal(bucket, fragmentBucket)
+		}
+	}
+}
+
 func (s *RefreshExternalCollectionTaskSuite) TestPreExecuteContextCanceled() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -596,6 +672,9 @@ func (s *RefreshExternalCollectionTaskSuite) TestOrganizeSegments_SameFragmentsM
 	task.parsedSpec = &externalspec.ExternalSpec{Format: "parquet"}
 	task.columns = []string{"id", "vec", "text", "score"}
 
+	manifestColumns := mockey.Mock(packed.ManifestMissingColumns).Return([]string{"score"}, nil).Build()
+	defer manifestColumns.UnPatch()
+
 	mockAppend := mockey.Mock(packed.AppendSegmentManifestColumns).
 		To(func(ctx context.Context, oldManifestPath string, format string, columns []string, fragments []packed.Fragment, storageConfig *indexpb.StorageConfig) (string, error) {
 			s.Equal(`{"base_path":"seg10","ver":1}`, oldManifestPath)
@@ -695,6 +774,9 @@ func (s *RefreshExternalCollectionTaskSuite) TestOrganizeSegments_PatchedSegment
 	task.parsedSpec = &externalspec.ExternalSpec{Format: "parquet"}
 	task.columns = []string{"id", "text", "score"}
 
+	manifestColumns := mockey.Mock(packed.ManifestMissingColumns).Return([]string{"score"}, nil).Build()
+	defer manifestColumns.UnPatch()
+
 	mockAppend := mockey.Mock(packed.AppendSegmentManifestColumns).
 		To(func(ctx context.Context, oldManifestPath string, format string, columns []string, fragments []packed.Fragment, storageConfig *indexpb.StorageConfig) (string, error) {
 			s.Equal(`{"base_path":"seg10","ver":1}`, oldManifestPath)
@@ -763,6 +845,201 @@ func (s *RefreshExternalCollectionTaskSuite) TestOrganizeSegments_SameFragmentsA
 	s.Len(result, 1)
 	s.ElementsMatch([]int64{10}, task.GetKeptSegmentIDs())
 	s.Empty(task.GetUpdatedSegments())
+}
+
+func (s *RefreshExternalCollectionTaskSuite) TestRebuildSegmentFakeBinlogs() {
+	paramtable.Init()
+	pt := paramtable.Get()
+	pt.Save(pt.QueryNodeCfg.ExternalCollectionSampleRows.Key, "100")
+	defer pt.Reset(pt.QueryNodeCfg.ExternalCollectionSampleRows.Key)
+	readErr := merr.WrapErrServiceUnavailableMsg("sample unavailable")
+	outputErr := merr.WrapErrFunctionFailedMsg("output size unavailable")
+	for _, tc := range []struct {
+		name         string
+		rows         int64
+		sampleErr    error
+		outputErr    error
+		emptySample  bool
+		cancelBefore bool
+		cancelSample bool
+		wantErr      string
+	}{
+		{name: "sample capped by segment rows", rows: 10},
+		{name: "sample capped by configuration", rows: 200},
+		{name: "sample error", rows: 10, sampleErr: readErr},
+		{name: "empty sample", rows: 10, emptySample: true, wantErr: "non-positive average size"},
+		{name: "output sizing error", rows: 10, outputErr: outputErr},
+		{name: "zero memory size", wantErr: "non-positive memory size"},
+		{name: "canceled before sampling", rows: 10, cancelBefore: true},
+		{name: "canceled during sampling", rows: 10, cancelSample: true},
+	} {
+		s.Run(tc.name, func() {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			schema := &schemapb.CollectionSchema{Version: 9, Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, Name: "pk", ExternalField: "pk", DataType: schemapb.DataType_Int64},
+				{
+					FieldID: 101, Name: "vector", IsFunctionOutput: true, DataType: schemapb.DataType_FloatVector,
+					TypeParams: []*commonpb.KeyValuePair{{Key: common.DimKey, Value: "4"}},
+				},
+			}}
+			task := s.newTask(ctx, &datapb.RefreshExternalCollectionTaskRequest{Schema: schema})
+			task.parsedSpec = &externalspec.ExternalSpec{Format: "parquet"}
+			seg := &datapb.SegmentInfo{
+				ID: 10, CollectionID: 1000, PartitionID: 2000, NumOfRows: tc.rows,
+				ManifestPath: "old", SchemaVersion: 3,
+				TextStatsLogs: map[int64]*datapb.TextIndexStats{100: {Version: 2}},
+				JsonKeyStats:  map[int64]*datapb.JsonKeyStats{100: {Version: 3}},
+			}
+			var gotManifest string
+			var gotRows int
+			sample := mockey.Mock(packed.SampleExternalFieldSizes).
+				To(func(manifest string, rows int, _ int64, _, _ string, _ *schemapb.CollectionSchema, _ *indexpb.StorageConfig) (map[string]int64, error) {
+					gotManifest, gotRows = manifest, rows
+					if tc.cancelSample {
+						cancel()
+					}
+					if tc.emptySample {
+						return nil, nil
+					}
+					return map[string]int64{"pk": 8}, tc.sampleErr
+				}).Build()
+			defer sample.UnPatch()
+			if tc.outputErr != nil {
+				estimate := mockey.Mock(estimateFunctionOutputBytesPerRow).Return(int64(0), tc.outputErr).Build()
+				defer estimate.UnPatch()
+			}
+			appendColumns := mockey.Mock(packed.AppendSegmentManifestColumns).Return("", nil).Build()
+			defer appendColumns.UnPatch()
+			if tc.cancelBefore {
+				cancel()
+			}
+
+			updated, err := task.rebuildSegmentFakeBinlogs(ctx, seg, "final")
+			s.Zero(appendColumns.Times(), "metadata recovery must never change physical columns")
+			s.Equal("old", seg.GetManifestPath())
+			s.Equal(int32(3), seg.GetSchemaVersion())
+			s.Empty(seg.GetBinlogs())
+			if tc.cancelBefore || tc.cancelSample {
+				s.ErrorIs(err, context.Canceled)
+			} else if tc.sampleErr != nil {
+				s.ErrorIs(err, tc.sampleErr)
+			} else if tc.outputErr != nil {
+				s.ErrorIs(err, tc.outputErr)
+			} else if tc.wantErr != "" {
+				s.ErrorContains(err, tc.wantErr)
+			} else {
+				s.Require().NoError(err)
+				s.Require().NotNil(updated)
+				s.Equal(seg.GetID(), updated.GetID())
+				s.Equal(seg.GetNumOfRows(), updated.GetNumOfRows())
+				s.Equal("final", updated.GetManifestPath())
+				s.Equal(int32(9), updated.GetSchemaVersion())
+				s.Equal(storage.StorageV3, updated.GetStorageVersion())
+				s.Equal(seg.GetTextStatsLogs(), updated.GetTextStatsLogs())
+				s.Equal(seg.GetJsonKeyStats(), updated.GetJsonKeyStats())
+				s.Require().Len(updated.GetBinlogs(), 1)
+				binlog := updated.GetBinlogs()[0]
+				s.Equal([]int64{100, 101}, binlog.GetChildFields())
+				s.Require().Len(binlog.GetBinlogs(), 1)
+				s.Equal(tc.rows, binlog.GetBinlogs()[0].GetEntriesNum())
+				s.Equal(int64(24)*tc.rows, binlog.GetBinlogs()[0].GetMemorySize(), "include 16 Function-output bytes per row")
+			}
+			if err != nil {
+				s.Nil(updated)
+			}
+			if tc.cancelBefore {
+				s.Zero(sample.Times())
+			} else {
+				s.Equal(1, sample.Times())
+				s.Equal("final", gotManifest)
+				s.Equal(int(min(tc.rows, 100)), gotRows)
+			}
+		})
+	}
+}
+
+func (s *RefreshExternalCollectionTaskSuite) TestMissingExternalColumnsManifestFallback() {
+	readErr := merr.WrapErrServiceUnavailableMsg("manifest temporarily unavailable")
+	for _, tc := range []struct {
+		name        string
+		spec        string
+		schemaSpec  string
+		noSchema    bool
+		binlogs     []*datapb.FieldBinlog
+		noManifest  bool
+		missing     []string
+		readErr     error
+		want        []string
+		wantColumns string
+	}{
+		{name: "nil schema", noSchema: true},
+		{name: "ChildFields fast path", binlogs: []*datapb.FieldBinlog{{ChildFields: []int64{100, 101}}}},
+		{name: "field binlog fast path", binlogs: []*datapb.FieldBinlog{{FieldID: 100}, {FieldID: 101}}},
+		{name: "no manifest retains missing names", noManifest: true, want: []string{"doc", "price"}},
+		{name: "parquet after restart", spec: `{"format":"parquet"}`, wantColumns: "doc,price"},
+		{name: "milvus-table after restart", spec: `{"format":"milvus-table"}`, wantColumns: "100,101"},
+		{name: "milvus-table schema spec", schemaSpec: `{"format":"milvus-table"}`, wantColumns: "100,101"},
+		{
+			name: "only unadvertised columns are read", spec: `{"format":"milvus-table"}`,
+			binlogs: []*datapb.FieldBinlog{{ChildFields: []int64{100}}}, wantColumns: "101",
+		},
+		{name: "only truly missing parquet column returned", missing: []string{"price"}, want: []string{"price"}, wantColumns: "doc,price"},
+		{
+			name: "physical IDs map back to external names", spec: `{"format":"milvus-table"}`,
+			missing: []string{"101"}, want: []string{"price"}, wantColumns: "100,101",
+		},
+		{name: "read error is preserved", readErr: readErr, wantColumns: "doc,price"},
+		{name: "cancellation is preserved", readErr: context.Canceled, wantColumns: "doc,price"},
+	} {
+		s.Run(tc.name, func() {
+			schema := &schemapb.CollectionSchema{
+				ExternalSpec: tc.schemaSpec,
+				Fields: []*schemapb.FieldSchema{
+					{FieldID: 100, Name: "text", ExternalField: "doc"},
+					{FieldID: 101, Name: "amount", ExternalField: "price"},
+					{FieldID: 102, Name: "output", IsFunctionOutput: true},
+				},
+			}
+			if tc.noSchema {
+				schema = nil
+			}
+			cfg := &indexpb.StorageConfig{StorageType: "local"}
+			task := s.newTask(context.Background(), &datapb.RefreshExternalCollectionTaskRequest{
+				Schema: schema, ExternalSpec: tc.spec, StorageConfig: cfg,
+			})
+			seg := &datapb.SegmentInfo{ID: 10, ManifestPath: "pinned-manifest", Binlogs: tc.binlogs}
+			if tc.noManifest {
+				seg.ManifestPath = ""
+			}
+			var gotPath, gotColumns string
+			var gotConfig *indexpb.StorageConfig
+			read := mockey.Mock(packed.ManifestMissingColumns).
+				To(func(path string, config *indexpb.StorageConfig, columns []string) ([]string, error) {
+					// Capture scalars, not reflection-based assertions on stack-backed slices.
+					gotPath, gotColumns, gotConfig = path, strings.Join(columns, ","), config
+					return tc.missing, tc.readErr
+				}).Build()
+			defer read.UnPatch()
+
+			missing, err := task.missingExternalColumns(seg)
+			if tc.readErr != nil {
+				s.ErrorIs(err, tc.readErr)
+				s.ErrorContains(err, "check external columns for segment 10")
+			} else {
+				s.NoError(err)
+			}
+			s.Equal(tc.want, missing)
+			s.Equal(tc.wantColumns, gotColumns)
+			if tc.wantColumns == "" {
+				s.Zero(read.Times())
+			} else {
+				s.Equal(1, read.Times(), "one manifest read for all unadvertised columns")
+				s.Equal(seg.GetManifestPath(), gotPath)
+				s.Same(cfg, gotConfig)
+			}
+		})
+	}
 }
 
 func (s *RefreshExternalCollectionTaskSuite) TestOrganizeSegments_FragmentRemoved() {
@@ -1201,14 +1478,44 @@ func (s *RefreshExternalCollectionTaskSuite) TestSegmentHasFunctionOutputColumns
 	s.NoError(err)
 	s.False(hasColumns)
 
-	mock := mockey.Mock(packed.ManifestHasColumns).To(
-		func(string, *indexpb.StorageConfig, []string) (bool, error) {
-			s.FailNow("ManifestHasColumns should not be called when ChildFields already prove the output field exists")
-			return false, nil
-		}).Build()
-	defer mock.UnPatch()
+	// Verify routing through call counts without inspecting slice arguments in
+	// a reflection-based mock callback, which crashed under CI's race checks.
+	mock := mockey.Mock(packed.ManifestHasColumns).Return(false, nil).Build()
 	hasColumns, err = task.segmentHasFunctionOutputColumns(&datapb.SegmentInfo{
 		ManifestPath: "manifest",
+		Binlogs: []*datapb.FieldBinlog{
+			{ChildFields: []int64{100, 101}},
+		},
+	}, []string{"101"})
+	s.NoError(err)
+	s.True(hasColumns)
+	s.Zero(mock.Times(), "advertised Function outputs must not require a manifest read")
+	hasColumns, err = task.segmentHasFunctionOutputColumns(&datapb.SegmentInfo{
+		ManifestPath: "manifest",
+	}, []string{"101"})
+	s.NoError(err)
+	s.False(hasColumns)
+	s.Equal(1, mock.Times())
+	mock.UnPatch()
+
+	mock = mockey.Mock(packed.ManifestHasColumns).Return(true, nil).Build()
+	hasColumns, err = task.segmentHasFunctionOutputColumns(&datapb.SegmentInfo{
+		ManifestPath: "manifest",
+	}, []string{"101"})
+	s.NoError(err)
+	s.True(hasColumns)
+	mock.UnPatch()
+
+	mock = mockey.Mock(packed.ManifestHasColumns).Return(false, fmt.Errorf("manifest read failed")).Build()
+	_, err = task.segmentHasFunctionOutputColumns(&datapb.SegmentInfo{
+		ID:           10,
+		ManifestPath: "manifest",
+	}, []string{"101"})
+	s.Error(err)
+	s.ErrorContains(err, "check function output columns for segment 10")
+	mock.UnPatch()
+
+	hasColumns, err = task.segmentHasFunctionOutputColumns(&datapb.SegmentInfo{
 		Binlogs: []*datapb.FieldBinlog{
 			{ChildFields: []int64{100, 101}},
 		},
@@ -1325,7 +1632,7 @@ func (s *RefreshExternalCollectionTaskSuite) TestOrganizeSegments_NewFragmentsAd
 
 func (s *RefreshExternalCollectionTaskSuite) TestSplitFileToFragments_SmallFile() {
 	// File smaller than limit - should return single fragment
-	fragments := packed.SplitFileToFragments("/data/small.parquet", 500000, packed.DefaultFragmentRowLimit, packed.NewFragmentIDGenerator(0))
+	fragments := packed.SplitFileToFragments("/data/small.parquet", 500000, packed.DefaultFragmentRowLimit, nil, packed.NewFragmentIDGenerator(0))
 
 	s.Len(fragments, 1)
 	s.Equal(int64(0), fragments[0].FragmentID)
@@ -1337,7 +1644,7 @@ func (s *RefreshExternalCollectionTaskSuite) TestSplitFileToFragments_SmallFile(
 
 func (s *RefreshExternalCollectionTaskSuite) TestSplitFileToFragments_ExactLimit() {
 	// File exactly at limit - should return single fragment
-	fragments := packed.SplitFileToFragments("/data/exact.parquet", packed.DefaultFragmentRowLimit, packed.DefaultFragmentRowLimit, packed.NewFragmentIDGenerator(0))
+	fragments := packed.SplitFileToFragments("/data/exact.parquet", packed.DefaultFragmentRowLimit, packed.DefaultFragmentRowLimit, nil, packed.NewFragmentIDGenerator(0))
 
 	s.Len(fragments, 1)
 	s.Equal(int64(0), fragments[0].FragmentID)
@@ -1349,7 +1656,7 @@ func (s *RefreshExternalCollectionTaskSuite) TestSplitFileToFragments_ExactLimit
 func (s *RefreshExternalCollectionTaskSuite) TestSplitFileToFragments_LargeFile() {
 	// File with 2.5 million rows - should split into 3 fragments
 	totalRows := int64(2500000)
-	fragments := packed.SplitFileToFragments("/data/large.parquet", totalRows, packed.DefaultFragmentRowLimit, packed.NewFragmentIDGenerator(0))
+	fragments := packed.SplitFileToFragments("/data/large.parquet", totalRows, packed.DefaultFragmentRowLimit, nil, packed.NewFragmentIDGenerator(0))
 
 	s.Len(fragments, 3)
 
@@ -1377,7 +1684,7 @@ func (s *RefreshExternalCollectionTaskSuite) TestSplitFileToFragments_LargeFile(
 
 func (s *RefreshExternalCollectionTaskSuite) TestSplitFileToFragments_BaseFragmentID() {
 	// Test with non-zero base fragment ID
-	fragments := packed.SplitFileToFragments("/data/test.parquet", 2500000, packed.DefaultFragmentRowLimit, packed.NewFragmentIDGenerator(100))
+	fragments := packed.SplitFileToFragments("/data/test.parquet", 2500000, packed.DefaultFragmentRowLimit, nil, packed.NewFragmentIDGenerator(100))
 
 	s.Len(fragments, 3)
 	s.Equal(int64(100), fragments[0].FragmentID)
@@ -1387,7 +1694,7 @@ func (s *RefreshExternalCollectionTaskSuite) TestSplitFileToFragments_BaseFragme
 
 func (s *RefreshExternalCollectionTaskSuite) TestSplitFileToFragments_ZeroRows() {
 	// Empty file - should return single fragment with zero rows
-	fragments := packed.SplitFileToFragments("/data/empty.parquet", 0, packed.DefaultFragmentRowLimit, packed.NewFragmentIDGenerator(0))
+	fragments := packed.SplitFileToFragments("/data/empty.parquet", 0, packed.DefaultFragmentRowLimit, nil, packed.NewFragmentIDGenerator(0))
 
 	s.Len(fragments, 1)
 	s.Equal(int64(0), fragments[0].RowCount)
@@ -1396,7 +1703,7 @@ func (s *RefreshExternalCollectionTaskSuite) TestSplitFileToFragments_ZeroRows()
 func (s *RefreshExternalCollectionTaskSuite) TestSplitFileToFragments_TenMillionRows() {
 	// 10 million rows - should split into 10 fragments
 	totalRows := int64(10000000)
-	fragments := packed.SplitFileToFragments("/data/huge.parquet", totalRows, packed.DefaultFragmentRowLimit, packed.NewFragmentIDGenerator(0))
+	fragments := packed.SplitFileToFragments("/data/huge.parquet", totalRows, packed.DefaultFragmentRowLimit, nil, packed.NewFragmentIDGenerator(0))
 
 	s.Len(fragments, 10)
 
@@ -1721,9 +2028,8 @@ func (s *RefreshExternalCollectionTaskSuite) TestFinalizeBM25Stats() {
 		}).Build()
 	defer mockWrite.UnPatch()
 	mockCommit := mockey.Mock(packed.CommitManifestUpdates).
-		To(func(basePath string, version int64, storageConfig *indexpb.StorageConfig, updates *packed.ManifestUpdates) (string, error) {
-			s.Equal("files/insert_log/1000/2000/3000", basePath)
-			s.Equal(int64(42), version)
+		To(func(baseManifest string, storageConfig *indexpb.StorageConfig, updates *packed.ManifestUpdates) (string, error) {
+			s.Equal(manifestPath, baseManifest)
 			gotEntries = updates.Stats
 			return "updated-manifest", nil
 		}).Build()
@@ -2069,8 +2375,8 @@ func (s *RefreshExternalCollectionTaskSuite) TestExecuteFunctionsForSegmentSucce
 	mockAppend := mockey.Mock(appendBM25Stats).Return(nil).Build()
 	defer mockAppend.UnPatch()
 	mockCommit := mockey.Mock(packed.CommitManifestUpdates).
-		To(func(basePath string, version int64, storageConfig *indexpb.StorageConfig, updates *packed.ManifestUpdates) (string, error) {
-			s.Equal(int64(42), version)
+		To(func(baseManifest string, storageConfig *indexpb.StorageConfig, updates *packed.ManifestUpdates) (string, error) {
+			s.Equal(packed.MarshalManifestPath(basePath, 42), baseManifest)
 			s.Same(output, updates.NewFiles)
 			return "final-manifest", nil
 		}).Build()
@@ -2742,6 +3048,23 @@ func (s *RefreshExternalCollectionTaskSuite) TestFragmentKey() {
 	f4 := packed.Fragment{FilePath: "/data/file1.parquet", StartRow: 0, EndRow: 1000}
 	s.Equal(fragmentKey(f1), fragmentKey(f4))
 
+	// Paimon snapshot-specific properties are part of the data view identity.
+	// Their map insertion order is not.
+	withSnapshot1 := packed.Fragment{
+		FilePath: "/data/file1.parquet", StartRow: 0, EndRow: 1000,
+		Properties: map[string]string{"metadata": `{"version":1,"read_path":"data-split","snapshot_id":1}`, "file_size": "10"},
+	}
+	withSnapshot1Reordered := packed.Fragment{
+		FilePath: "/data/file1.parquet", StartRow: 0, EndRow: 1000,
+		Properties: map[string]string{"file_size": "10", "metadata": `{"version":1,"read_path":"data-split","snapshot_id":1}`},
+	}
+	withSnapshot2 := packed.Fragment{
+		FilePath: "/data/file1.parquet", StartRow: 0, EndRow: 1000,
+		Properties: map[string]string{"metadata": `{"version":1,"read_path":"data-split","snapshot_id":2}`, "file_size": "10"},
+	}
+	s.Equal(fragmentKey(withSnapshot1), fragmentKey(withSnapshot1Reordered))
+	s.NotEqual(fragmentKey(withSnapshot1), fragmentKey(withSnapshot2))
+
 	// L0 deltalogs are not part of the L1 data identity. They are handled by a
 	// manifest-only refresh so the target segment ID can be reused.
 	f5 := packed.Fragment{
@@ -2772,6 +3095,16 @@ func (s *RefreshExternalCollectionTaskSuite) TestFragmentKey() {
 	}
 	s.Equal(fragmentKey(f1), fragmentKey(f5))
 	s.Equal(fragmentKey(f5), fragmentKey(f6))
+
+	// A milvus-table fragment's file is a source segment manifest path: two
+	// spellings of the same revision are one fragment, another revision is not.
+	source := packed.Fragment{FilePath: packed.MarshalManifestPath("files/insert_log/1/2/3", 5), EndRow: 1000}
+	respelled := source
+	respelled.FilePath = `{"base_path":"files/insert_log/1/2/3","size":1024,"ver":5}`
+	advanced := source
+	advanced.FilePath = packed.MarshalManifestPath("files/insert_log/1/2/3", 6)
+	s.Equal(fragmentKey(source), fragmentKey(respelled))
+	s.NotEqual(fragmentKey(source), fragmentKey(advanced))
 }
 
 func (s *RefreshExternalCollectionTaskSuite) TestGetColumnNamesFromSchema() {

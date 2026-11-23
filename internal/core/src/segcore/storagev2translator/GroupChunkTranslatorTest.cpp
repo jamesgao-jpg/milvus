@@ -38,6 +38,7 @@
 #include "common/protobuf_utils.h"
 #include "filemanager/InputStream.h"
 #include "gtest/gtest.h"
+#include "index/skipindex_stats/SkipIndexStats.h"
 #include "milvus-storage/common/config.h"
 #include "milvus-storage/common/metadata.h"
 #include "milvus-storage/filesystem/fs.h"
@@ -54,8 +55,13 @@
 #include "segcore/storagev2translator/GroupChunkTranslator.h"
 #include "storage/EntryStreamUtils.h"
 #include "storage/LoadOverheadController.h"
-#include "storage/ThreadPools.h"
+#include "segcore/storagev2translator/StorageV2Config.h"
+#include <folly/ScopeGuard.h>
 #include "test_utils/Constants.h"
+#include "test_utils/CountedFileSystem.h"
+#include "storage/KeyRetriever.h"
+#include "storage/StatusToErrorCode.h"
+#include <folly/CancellationToken.h>
 #include "test_utils/DataGen.h"
 
 using namespace milvus;
@@ -114,9 +120,194 @@ class GroupChunkTranslatorTest : public ::testing::TestWithParam<bool> {
 
     std::vector<std::string> paths_;
     int64_t segment_id_ = 0;
+
+    // Two files, each with several row groups. Non-adjacent cids force
+    // separate batches while a request confined to file 1 leaves file 0 cold.
+    std::unique_ptr<GroupChunkTranslator>
+    MakeFooterReuseTranslator(
+        const std::shared_ptr<test::CountedFileSystem>& fs,
+        std::vector<std::string>& files) {
+        files = {path_ + "/footer_scope_0.parquet",
+                 path_ + "/footer_scope_1.parquet"};
+        auto write_paths = std::vector<std::string>{files[0]};
+        auto groups = std::vector<std::vector<int>>{
+            {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}};
+        auto config = milvus_storage::StorageConfig();
+        auto result = milvus_storage::PackedRecordBatchWriter::Make(
+            fs_,
+            write_paths,
+            arrow_schema_,
+            config,
+            groups,
+            1024 * 1024,
+            parquet::default_writer_properties());
+        AssertInfo(result.ok(), "failed to create footer test writer");
+        auto writer = std::move(result).ValueOrDie();
+        int64_t rows = 0;
+        for (int i = 0; i < 12; ++i) {
+            auto data = DataGen(schema_, 1000);
+            auto batch = ConvertToArrowRecordBatch(data, 128, arrow_schema_);
+            rows += batch->num_rows();
+            AssertInfo(writer->Write(batch).ok(),
+                       "failed to write footer test file");
+        }
+        AssertInfo(writer->Close().ok(), "failed to close footer test file");
+        AssertInfo(fs_->CopyFile(files[0], files[1]).ok(),
+                   "failed to copy footer test file");
+        auto metadata = LoadGroupChunkMetadata(files, {}, "test_footer_scope");
+        AssertInfo(metadata.row_group_meta_list[0].size() >= 3,
+                   "footer test requires at least three row groups");
+        return std::make_unique<GroupChunkTranslator>(
+            segment_id_,
+            GroupChunkType::DEFAULT,
+            schema_->get_fields(),
+            FieldDataInfo(0, rows * 2, TestLocalPath),
+            fs,
+            files,
+            std::move(metadata.row_group_meta_list),
+            GetParam(),
+            true,
+            schema_->get_field_ids().size(),
+            proto::common::LoadPriority::LOW,
+            "disable",
+            MmapChunkWritebackMode::Disabled,
+            /* force_one_row_group_per_cell */ true);
+    }
 };
 
+TEST_P(GroupChunkTranslatorTest, FooterReuseScopedToRequestedFilesAndCall) {
+    auto fs = std::make_shared<test::CountedFileSystem>(fs_);
+    std::vector<std::string> files;
+    auto translator = MakeFooterReuseTranslator(fs, files);
+    auto untouched = fs->CountsFor(files[0]);
+    auto requested = fs->CountsFor(files[1]);
+    // Metadata discovery uses fs_, so the translator must start with no
+    // footer references or counted handles from construction.
+    EXPECT_EQ(requested->opens, 0);
+    const int before_probe = requested->footer_reads;
+    const auto bytes_before_probe = requested->footer_bytes.load();
+    auto probe = milvus_storage::PreparedParquetFile::Open(
+        fs, files[1], storage::GetReaderProperties());
+    ASSERT_TRUE(probe.ok()) << probe.status();
+    const int reads_per_prepare = requested->footer_reads - before_probe;
+    const auto bytes_per_prepare = requested->footer_bytes - bytes_before_probe;
+    ASSERT_GT(reads_per_prepare, 0);
+    auto reader = probe.ValueOrDie()->MakeReader();
+    ASSERT_TRUE(reader.ok()) << reader.status();
+    std::weak_ptr<parquet::FileMetaData> footer =
+        reader.ValueOrDie()->file_metadata()->GetParquetMetadata();
+    reader.ValueOrDie().reset();
+    probe.ValueOrDie().reset();
+    EXPECT_TRUE(footer.expired());
+    EXPECT_EQ(requested->handles, 0);
+    const int baseline = requested->footer_reads;
+    const auto baseline_bytes = requested->footer_bytes.load();
+    const int baseline_opens = requested->opens;
+    // Keep original file_idx=1, and split the same file into two batches.
+    const std::vector<cachinglayer::cid_t> cids{
+        translator->get_global_row_group_idx(1, 0),
+        translator->get_global_row_group_idx(1, 2)};
+    for (int call = 1; call <= 2; ++call) {
+        auto cells = translator->get_cells(nullptr, cids);
+        EXPECT_EQ(cells.size(), cids.size());
+        EXPECT_EQ(requested->footer_reads, baseline + call * reads_per_prepare);
+        // A preparation also probes the 4-byte encryption marker. Two legacy
+        // per-batch footer reads can accidentally match that read count, so
+        // also check bytes and the probe + two independent reader opens.
+        EXPECT_EQ(requested->footer_bytes,
+                  baseline_bytes + call * bytes_per_prepare);
+        EXPECT_EQ(requested->opens, baseline_opens + call * 3);
+        EXPECT_EQ(requested->handles, 0);
+        EXPECT_EQ(untouched->opens, 0);
+        EXPECT_EQ(untouched->footer_reads, 0);
+    }
+    EXPECT_TRUE(translator->get_cells(nullptr, {}).empty());
+    EXPECT_EQ(requested->footer_reads, baseline + 2 * reads_per_prepare);
+}
+
+TEST_P(GroupChunkTranslatorTest,
+       FooterPreparationFailurePreservesCodeAndReleasesFiles) {
+    auto fs = std::make_shared<test::CountedFileSystem>(fs_);
+    std::vector<std::string> files;
+    auto translator = MakeFooterReuseTranslator(fs, files);
+    auto failure = milvus_storage::MakeExtendError(
+        milvus_storage::ExtendStatusCode::StorageTransientThrottling,
+        "injected throttle",
+        "");
+    fs->before_open = [&](const std::string& path) {
+        return path == files[1] ? failure : arrow::Status::OK();
+    };
+    const std::vector<cachinglayer::cid_t> cids{
+        translator->get_global_row_group_idx(0, 0),
+        translator->get_global_row_group_idx(1, 0)};
+    try {
+        translator->get_cells(nullptr, cids);
+        FAIL() << "expected preparation failure";
+    } catch (const SegcoreError& error) {
+        EXPECT_EQ(error.get_error_code(), ErrorCode::StorageTransientError);
+    }
+    EXPECT_GT(fs->CountsFor(files[0])->footer_reads, 0);
+    EXPECT_EQ(fs->CountsFor(files[0])->handles, 0);
+    fs->before_open = {};
+    auto before = fs->CountsFor(files[0])->footer_reads.load();
+    EXPECT_EQ(translator->get_cells(nullptr, cids).size(), cids.size());
+    EXPECT_GT(fs->CountsFor(files[0])->footer_reads, before);
+    EXPECT_EQ(fs->CountsFor(files[1])->handles, 0);
+}
+
+TEST_P(GroupChunkTranslatorTest,
+       CancellationDuringPreparationStopsBeforeNextFile) {
+    auto fs = std::make_shared<test::CountedFileSystem>(fs_);
+    std::vector<std::string> files;
+    auto translator = MakeFooterReuseTranslator(fs, files);
+    folly::CancellationSource source;
+    OpContext ctx(source.getToken());
+    fs->before_open = [&](const std::string&) {
+        source.requestCancellation();
+        return arrow::Status::OK();
+    };
+    const std::vector<cachinglayer::cid_t> cids{
+        translator->get_global_row_group_idx(0, 0),
+        translator->get_global_row_group_idx(1, 0)};
+    try {
+        translator->get_cells(&ctx, cids);
+        FAIL() << "expected cancellation";
+    } catch (const SegcoreError& error) {
+        EXPECT_EQ(error.get_error_code(), ErrorCode::FollyCancel);
+    }
+    EXPECT_EQ(fs->CountsFor(files[0])->handles, 0);
+    EXPECT_EQ(fs->CountsFor(files[1])->opens, 0);
+}
+
+TEST_P(GroupChunkTranslatorTest,
+       FailedBatchClosesReadersAndRepreparesOnReload) {
+    auto fs = std::make_shared<test::CountedFileSystem>(fs_);
+    std::vector<std::string> files;
+    auto translator = MakeFooterReuseTranslator(fs, files);
+    auto counts = fs->CountsFor(files[0]);
+    counts->fail_data_reads = true;
+    const std::vector<cachinglayer::cid_t> cids{
+        translator->get_global_row_group_idx(0, 0),
+        translator->get_global_row_group_idx(0, 2)};
+    try {
+        translator->get_cells(nullptr, cids);
+        FAIL() << "expected batch read failure";
+    } catch (const SegcoreError& error) {
+        EXPECT_EQ(error.get_error_code(), ErrorCode::StorageError);
+    }
+    EXPECT_EQ(counts->handles, 0);
+    auto before = counts->footer_reads.load();
+    counts->fail_data_reads = false;
+    EXPECT_EQ(translator->get_cells(nullptr, cids).size(), cids.size());
+    EXPECT_GT(counts->footer_reads, before);
+    EXPECT_EQ(counts->handles, 0);
+}
+
 TEST_P(GroupChunkTranslatorTest, TestWithMmap) {
+    const auto previous_enabled = StorageV2AsyncLoadEnabled();
+    auto restore_mode = folly::makeGuard(
+        [&] { SetStorageV2AsyncLoadEnabled(previous_enabled); });
+    SetStorageV2AsyncLoadEnabled(false);
     auto temp_dir =
         std::filesystem::path(TestLocalPath) / "gctt_test_with_mmap";
     std::filesystem::create_directory(temp_dir);
@@ -124,26 +315,33 @@ TEST_P(GroupChunkTranslatorTest, TestWithMmap) {
     auto use_mmap = GetParam();
     std::unordered_map<FieldId, FieldMeta> field_metas = schema_->get_fields();
     auto column_group_info = FieldDataInfo(0, 3000, temp_dir.string());
-    auto metadata = LoadGroupChunkMetadata(paths_, {}, "test_group_chunk");
+    const auto make_translator = [&] {
+        auto metadata = LoadGroupChunkMetadata(paths_, {}, "test_group_chunk");
 
-    auto translator = std::make_unique<GroupChunkTranslator>(
-        segment_id_,
-        GroupChunkType::DEFAULT,
-        field_metas,
-        column_group_info,
-        paths_,
-        std::move(metadata.row_group_meta_list),
-        use_mmap,
-        true,
-        schema_->get_field_ids().size(),
-        milvus::proto::common::LoadPriority::LOW,
-        /* warmup_policy */ "",
-        MmapChunkWritebackMode::Disabled);
+        return std::make_unique<GroupChunkTranslator>(
+            segment_id_,
+            GroupChunkType::DEFAULT,
+            field_metas,
+            column_group_info,
+            fs_,
+            paths_,
+            std::move(metadata.row_group_meta_list),
+            use_mmap,
+            true,
+            schema_->get_field_ids().size(),
+            milvus::proto::common::LoadPriority::LOW,
+            /* warmup_policy */ "",
+            MmapChunkWritebackMode::Disabled);
+    };
+    auto translator = make_translator();
+    SetStorageV2AsyncLoadEnabled(true);
+    EXPECT_FALSE(
+        make_translator()->meta()->loading_overhead_config.has_value());
+    SetStorageV2AsyncLoadEnabled(false);
 
-    auto executor_workers = milvus::ThreadPools::GetLoadExecutorWorkers();
     auto memory_group =
         milvus::storage::LoadMemoryOverheadController::GetInstance()
-            .GetOrCreate(executor_workers);
+            .GetOrCreate();
     ASSERT_TRUE(translator->meta()->loading_overhead_config.has_value());
     ASSERT_TRUE(
         translator->meta()->loading_overhead_config->memory.has_value());
@@ -160,7 +358,7 @@ TEST_P(GroupChunkTranslatorTest, TestWithMmap) {
             translator->meta()->loading_overhead_config->file.has_value());
         EXPECT_EQ(translator->meta()->loading_overhead_config->file->group,
                   milvus::storage::LoadFileOverheadController::GetInstance()
-                      .GetOrCreate(executor_workers));
+                      .GetOrCreate());
         ASSERT_TRUE(
             translator->meta()
                 ->loading_overhead_config->file->max_runtime_unit.has_value());
@@ -181,16 +379,8 @@ TEST_P(GroupChunkTranslatorTest, TestWithMmap) {
     auto fr = reader_result.ValueOrDie();
     auto row_group_metadata_vector =
         fr->file_metadata()->GetRowGroupMetadataVector();
-    std::vector<int64_t> row_group_sizes;
-    row_group_sizes.reserve(row_group_metadata_vector.size());
-    for (int i = 0; i < row_group_metadata_vector.size(); ++i) {
-        row_group_sizes.push_back(static_cast<int64_t>(
-            row_group_metadata_vector.Get(i).memory_size()));
-    }
-    auto rgs_per_cell =
-        ComputeRowGroupsPerCell(row_group_sizes, GetCellTargetSizeBytes());
-    auto expected_num_cells =
-        (row_group_metadata_vector.size() + rgs_per_cell - 1) / rgs_per_cell;
+    // Default force keeps one cell per row group even without skip metrics.
+    auto expected_num_cells = row_group_metadata_vector.size();
     auto status = fr->Close();
     AssertInfo(status.ok(), "failed to close file reader");
     EXPECT_EQ(translator->num_cells(), expected_num_cells);
@@ -215,13 +405,44 @@ TEST_P(GroupChunkTranslatorTest, TestWithMmap) {
             expected_size += static_cast<int64_t>(
                 row_group_metadata_vector.Get(row_group_idx).memory_size());
         }
-        auto usage = translator->estimated_byte_size_of_cell(i).first;
+        auto usage =
+            translator
+                ->estimated_loading_usage({static_cast<cachinglayer::cid_t>(i)})
+                .resident;
         if (use_mmap) {
             EXPECT_EQ(usage.file_bytes, expected_size);
         } else {
             EXPECT_EQ(usage.memory_bytes, expected_size);
         }
     }
+
+    std::vector<cachinglayer::cid_t> estimate_cids{0};
+    if (translator->num_cells() > 1) {
+        estimate_cids.push_back(translator->num_cells() - 1);
+    }
+    int64_t expected_batch_bytes = 0;
+    for (const auto cid : estimate_cids) {
+        expected_batch_bytes += static_cast<GroupCTMeta*>(translator->meta())
+                                    ->chunk_memory_size_[cid];
+    }
+    const auto batch = translator->estimated_loading_usage(estimate_cids);
+    EXPECT_EQ(
+        batch.resident,
+        (use_mmap ? cachinglayer::ResourceUsage{0, expected_batch_bytes}
+                  : cachinglayer::ResourceUsage{expected_batch_bytes, 0}));
+    // This schema contains ARRAY fields, whose memory scratch is doubled.
+    const cachinglayer::ResourceUsage expected_overhead{
+        2 * expected_batch_bytes, use_mmap ? expected_batch_bytes : 0};
+    EXPECT_EQ(batch.private_overhead + batch.shared_overhead,
+              expected_overhead);
+    EXPECT_EQ(batch.shared_overhead,
+              translator->meta()->loading_overhead_config
+                  ? expected_overhead
+                  : cachinglayer::ResourceUsage{});
+    const auto empty = translator->estimated_loading_usage({});
+    EXPECT_EQ(empty.resident, cachinglayer::ResourceUsage{});
+    EXPECT_EQ(empty.private_overhead, cachinglayer::ResourceUsage{});
+    EXPECT_EQ(empty.shared_overhead, cachinglayer::ResourceUsage{});
 
     // getting cells - use all valid cell IDs
     std::vector<cachinglayer::cid_t> cids;
@@ -331,6 +552,7 @@ TEST_P(GroupChunkTranslatorTest, TestMultipleFiles) {
         GroupChunkType::DEFAULT,
         field_metas,
         column_group_info,
+        fs_,
         multi_file_paths,
         std::move(metadata.row_group_meta_list),
         use_mmap,
@@ -338,7 +560,8 @@ TEST_P(GroupChunkTranslatorTest, TestMultipleFiles) {
         schema_->get_field_ids().size(),
         milvus::proto::common::LoadPriority::LOW,
         /* warmup_policy */ "",
-        MmapChunkWritebackMode::Disabled);
+        MmapChunkWritebackMode::Disabled,
+        /* force_one_row_group_per_cell */ false);
 
     // Test total number of cells across all files
     // Cells never span files, so count per-file ceil. The cell-per-count is
@@ -427,7 +650,10 @@ TEST_P(GroupChunkTranslatorTest, TestMultipleFiles) {
     }
 
     for (size_t cid = 0; cid < translator->num_cells(); ++cid) {
-        auto usage = translator->estimated_byte_size_of_cell(cid).first;
+        auto usage = translator
+                         ->estimated_loading_usage(
+                             {static_cast<cachinglayer::cid_t>(cid)})
+                         .resident;
 
         // Calculate expected size by summing all row groups in this cell
         auto [rg_start, rg_end] = static_cast<GroupCTMeta*>(translator->meta())
@@ -457,6 +683,74 @@ TEST_P(GroupChunkTranslatorTest, TestMultipleFiles) {
     if (use_mmap && std::filesystem::exists(temp_dir)) {
         std::filesystem::remove_all(temp_dir);
     }
+}
+
+TEST_P(GroupChunkTranslatorTest,
+       SkipMetricsAreGroupOwnedAndRequireExactCellAlignment) {
+    auto temp_dir =
+        std::filesystem::path(TestLocalPath) / "gctt_skip_metrics_alignment";
+    std::filesystem::create_directory(temp_dir);
+    auto field_metas = schema_->get_fields();
+    const auto field_id = field_metas.begin()->first;
+
+    auto build_translator = [&](int64_t metric_count_delta) {
+        auto metadata =
+            LoadGroupChunkMetadata(paths_, {}, "test_group_skip_metrics");
+        size_t total_row_groups = 0;
+        for (const auto& file_metadata : metadata.row_group_meta_list) {
+            total_row_groups += file_metadata.size();
+        }
+        AssertInfo(total_row_groups > 0,
+                   "skip metrics test requires at least one row group");
+
+        const auto metric_count = static_cast<size_t>(
+            static_cast<int64_t>(total_row_groups) + metric_count_delta);
+        SkipMetricsByField metrics_by_field;
+        auto& metrics = metrics_by_field[field_id.get()];
+        metrics.reserve(metric_count);
+        for (size_t i = 0; i < metric_count; ++i) {
+            metrics.push_back(std::make_shared<index::NoneFieldChunkMetrics>());
+        }
+
+        auto translator = std::make_unique<GroupChunkTranslator>(
+            segment_id_,
+            GroupChunkType::DEFAULT,
+            field_metas,
+            FieldDataInfo(0, 3000, temp_dir.string()),
+            fs_,
+            paths_,
+            std::move(metadata.row_group_meta_list),
+            GetParam(),
+            true,
+            schema_->get_field_ids().size(),
+            milvus::proto::common::LoadPriority::LOW,
+            /* warmup_policy */ "",
+            MmapChunkWritebackMode::Disabled,
+            /* force_one_row_group_per_cell */ true,
+            std::move(metrics_by_field));
+        return std::make_pair(std::move(translator), total_row_groups);
+    };
+
+    auto [aligned, total_row_groups] = build_translator(0);
+    ASSERT_EQ(aligned->num_cells(), total_row_groups);
+    auto aligned_meta = static_cast<GroupCTMeta*>(aligned->meta());
+    ASSERT_TRUE(aligned_meta->HasSkipMetrics(field_id.get()));
+    for (size_t cell = 0; cell < aligned->num_cells(); ++cell) {
+        EXPECT_NE(aligned_meta->FindSkipMetric(field_id.get(), cell), nullptr)
+            << "aligned metrics must cover every cell, missing cell " << cell;
+    }
+    EXPECT_EQ(
+        aligned_meta->FindSkipMetric(field_id.get(), aligned->num_cells()),
+        nullptr)
+        << "lookup past the last cell must fail open";
+
+    auto [mismatched, mismatched_total_row_groups] = build_translator(-1);
+    EXPECT_EQ(mismatched->num_cells(), mismatched_total_row_groups);
+    auto mismatched_meta = static_cast<GroupCTMeta*>(mismatched->meta());
+    EXPECT_FALSE(mismatched_meta->HasSkipMetrics(field_id.get()))
+        << "a partial positional vector must disable pruning for the field";
+    EXPECT_EQ(mismatched_meta->FindSkipMetric(field_id.get(), 0), nullptr)
+        << "a dropped field must fail open on lookup";
 }
 
 INSTANTIATE_TEST_SUITE_P(GroupChunkTranslatorTest,

@@ -10,6 +10,9 @@ import (
 
 type CleanupContext struct {
 	PhysicalTimeTick uint64
+	// SummaryRetired proves the persisted manifest no longer needs this
+	// VChannel tombstone to recover its transform GC frontier.
+	SummaryRetired func(vchannel string, through uint64) bool
 }
 
 type ModuleName string
@@ -27,11 +30,15 @@ type WritePathRecoveryModuleSnapshot struct {
 	GrowingSegments map[int64]SegmentWritePathRecoveryState
 }
 
+// VChannelWritePathRecoveryState captures the state used for write admission.
+// Schema is shared with recovery history; it and its nested values must remain
+// immutable. Schema changes must use a new snapshot.
 type VChannelWritePathRecoveryState struct {
-	VChannel     string
-	CollectionID int64
-	PartitionIDs []int64
-	Schema       *schemapb.CollectionSchema
+	VChannel       string
+	CollectionID   int64
+	PartitionIDs   []int64
+	Schema         *schemapb.CollectionSchema
+	SchemaTimeTick uint64
 }
 
 type SegmentWritePathRecoveryState struct {
@@ -54,6 +61,8 @@ const (
 	SnapshotOpUpsert SnapshotOp = iota
 	SnapshotOpUpsertBase
 	SnapshotOpDelete
+	// SnapshotOpDeleteSchemas removes persisted schema tombstones only.
+	SnapshotOpDeleteSchemas
 )
 
 type DirtySnapshot interface {
@@ -70,7 +79,7 @@ type Runtime struct {
 }
 
 type AsyncTaskScheduler interface {
-	Submit(task nodescheduler.Task) nodescheduler.TaskHandle
+	Submit(task nodescheduler.Task, opts ...nodescheduler.Option) nodescheduler.TaskHandle
 }
 
 type ModuleNotifier interface {

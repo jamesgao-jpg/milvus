@@ -151,6 +151,7 @@ func createTextIndex(ctx context.Context,
 				CollectionID:              collectionID,
 				PartitionID:               partitionID,
 				SegmentID:                 segmentID,
+				NumRows:                   segment.GetNumOfRows(),
 				IndexVersion:              0,
 				InsertFiles:               files,
 				FieldSchema:               field,
@@ -228,20 +229,67 @@ func createTextIndex(ctx context.Context,
 
 // V1 readers do not share compaction's schema-reconciliation contract, so filter physical fields before opening them.
 func newCompactionSegmentRecordReader(ctx context.Context, segment *datapb.CompactionSegmentBinlogs, schema *schemapb.CollectionSchema, storageConfig *indexpb.StorageConfig, opts ...storage.RwOption) (storage.RecordReader, map[int64]struct{}, error) {
-	existingFields, err := compactionSegmentStorageFields(segment, storageConfig)
+	existingFields, err := compactionSegmentStorageFields(ctx, segment, schema, storageConfig)
 	if err != nil {
 		return nil, nil, err
 	}
 	return newCompactionSegmentRecordReaderWithFields(ctx, segment, schema, storageConfig, existingFields, opts...)
 }
 
-func compactionSegmentStorageFields(segment *datapb.CompactionSegmentBinlogs, storageConfig *indexpb.StorageConfig) (map[int64]struct{}, error) {
+func newTextDecodedCompactionSegmentRecordReader(
+	ctx context.Context,
+	segment *datapb.CompactionSegmentBinlogs,
+	schema *schemapb.CollectionSchema,
+	storageConfig *indexpb.StorageConfig,
+	textColumnConfigs []packed.TextColumnConfig,
+	opts ...storage.RwOption,
+) (storage.RecordReader, map[int64]struct{}, error) {
+	if segment.GetManifest() == "" || len(textColumnConfigs) == 0 {
+		return newCompactionSegmentRecordReader(ctx, segment, schema, storageConfig, opts...)
+	}
+	existingFields, err := compactionSegmentStorageFields(ctx, segment, schema, storageConfig)
+	if err != nil {
+		return nil, nil, err
+	}
+	readSchema := compactionReadSchema(schema, existingFields)
+	reader, err := storage.NewTextDecodedManifestRecordReader(
+		ctx,
+		segment.GetManifest(),
+		readSchema,
+		textColumnConfigs,
+		append(opts, storage.WithPresentFields(existingFields))...,
+	)
+	return reader, existingFields, err
+}
+
+func compactionSegmentStorageFields(ctx context.Context, segment *datapb.CompactionSegmentBinlogs, schema *schemapb.CollectionSchema, storageConfig *indexpb.StorageConfig) (map[int64]struct{}, error) {
 	if segment.GetManifest() != "" {
 		return packed.GetManifestFieldIDs(segment.GetManifest(), storageConfig)
 	}
-	return compactionSegmentBinlogFields(segment), nil
+	if segment.GetStorageVersion() == storage.StorageV1 {
+		return compactionSegmentBinlogFields(segment), nil
+	}
+	// Packed binlogs written by 2.6.0/2.6.1 carry no ChildFields and key FieldID
+	// by column group; the stored fields then come from the file footers.
+	fieldBinlogs := make([]*datapb.FieldBinlog, 0, len(segment.GetFieldBinlogs()))
+	for _, fieldBinlog := range lo.Compact(segment.GetFieldBinlogs()) {
+		fieldBinlogs = append(fieldBinlogs, proto.Clone(fieldBinlog).(*datapb.FieldBinlog))
+	}
+	rootPath := ""
+	if storageConfig != nil {
+		rootPath = storageConfig.GetRootPath()
+	}
+	if err := binlog.DecompressBinLogWithRootPath(rootPath, storage.InsertBinlog,
+		segment.GetCollectionID(), segment.GetPartitionID(), segment.GetSegmentID(), fieldBinlogs); err != nil {
+		return nil, err
+	}
+	return storage.PackedBinlogPresentFields(ctx, fieldBinlogs, schema,
+		storage.WithCollectionID(segment.GetCollectionID()),
+		storage.WithStorageConfig(storageConfig))
 }
 
+// compactionSegmentBinlogFields returns the fields of StorageV1 binlogs, whose
+// FieldID is the field id.
 func compactionSegmentBinlogFields(segment *datapb.CompactionSegmentBinlogs) map[int64]struct{} {
 	fields := make(map[int64]struct{})
 	for _, fieldBinlog := range segment.GetFieldBinlogs() {
@@ -279,8 +327,8 @@ func droppedSchemaFieldIDs(schema *schemapb.CollectionSchema, existingFields map
 	return dropped
 }
 
-func segmentDroppedFieldIDs(schema *schemapb.CollectionSchema, segment *datapb.CompactionSegmentBinlogs, storageConfig *indexpb.StorageConfig) ([]int64, error) {
-	existingFields, err := compactionSegmentStorageFields(segment, storageConfig)
+func segmentDroppedFieldIDs(ctx context.Context, schema *schemapb.CollectionSchema, segment *datapb.CompactionSegmentBinlogs, storageConfig *indexpb.StorageConfig) ([]int64, error) {
+	existingFields, err := compactionSegmentStorageFields(ctx, segment, schema, storageConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -316,6 +364,11 @@ func newCompactionSegmentRecordReaderWithFields(ctx context.Context, segment *da
 		return nil, nil, err
 	}
 
+	// existingFields is the segment's physically-present field set. Packed
+	// readers use it instead of reading the footers again; the V1 reader,
+	// whose binlogs were filtered to the read schema above, uses it to see
+	// struct sub-fields that were dropped since the segment was written.
+	opts = append(opts, storage.WithPresentFields(existingFields))
 	reader, err := storage.NewBinlogRecordReader(ctx, fieldBinlogs, readSchema, opts...)
 	return reader, existingFields, err
 }
@@ -334,20 +387,8 @@ func compactionReadSchema(schema *schemapb.CollectionSchema, existingFields map[
 	}
 	readSchema.Fields = fields
 
-	structFields := make([]*schemapb.StructArrayFieldSchema, 0, len(readSchema.GetStructArrayFields()))
-	for _, structField := range readSchema.GetStructArrayFields() {
-		childFields := make([]*schemapb.FieldSchema, 0, len(structField.GetFields()))
-		for _, field := range structField.GetFields() {
-			if compactionFieldReadable(field, existingFields) {
-				childFields = append(childFields, field)
-			}
-		}
-		if len(childFields) > 0 {
-			structField.Fields = childFields
-			structFields = append(structFields, structField)
-		}
-	}
-	readSchema.StructArrayFields = structFields
+	// Keep all struct children in the logical read schema. The storage reader
+	// projects the present subset and fills eligible missing children from it.
 	return readSchema
 }
 
@@ -361,6 +402,89 @@ func compactionFieldReadable(field *schemapb.FieldSchema, existingFields map[int
 		return true
 	}
 	return !field.GetIsFunctionOutput()
+}
+
+// validateSchemaBumpIntegrity checks the persisted schema against the physical
+// field set during schema-bump preflight. Function output ownership is
+// represented both by FunctionSchema.OutputFieldIds and
+// FieldSchema.IsFunctionOutput, so the two representations must agree and each
+// output field must have exactly one owning function.
+// Missing children in a partially present struct must be element-nullable.
+// Function outputs are top-level fields by schema contract.
+func validateSchemaBumpIntegrity(schema *schemapb.CollectionSchema, existingFields map[int64]struct{}) (map[int64]struct{}, error) {
+	declaredFunctionOutputs := make(map[int64]struct{})
+	outputOwners := make(map[int64]int)
+	topLevelFields := make(map[int64]*schemapb.FieldSchema, len(schema.GetFields()))
+	for _, field := range schema.GetFields() {
+		topLevelFields[field.GetFieldID()] = field
+	}
+
+	for functionIndex, functionSchema := range schema.GetFunctions() {
+		for _, outputFieldID := range functionSchema.GetOutputFieldIds() {
+			if ownerIndex, duplicate := outputOwners[outputFieldID]; duplicate {
+				if ownerIndex == functionIndex {
+					return nil, merr.WrapErrDataIntegrityMsg(
+						"function %s declares output field %d more than once",
+						functionSchema.GetName(), outputFieldID)
+				}
+				return nil, merr.WrapErrDataIntegrityMsg(
+					"function output field %d is declared by both function %s and function %s",
+					outputFieldID, schema.GetFunctions()[ownerIndex].GetName(), functionSchema.GetName())
+			}
+			outputOwners[outputFieldID] = functionIndex
+			declaredFunctionOutputs[outputFieldID] = struct{}{}
+			field, ok := topLevelFields[outputFieldID]
+			if !ok {
+				if typeutil.GetField(schema, outputFieldID) != nil {
+					return nil, merr.WrapErrDataIntegrityMsg(
+						"function %s output field %d must be a top-level field",
+						functionSchema.GetName(), outputFieldID)
+				}
+				return nil, merr.WrapErrDataIntegrityMsg(
+					"function %s output field %d not found in persisted schema",
+					functionSchema.GetName(), outputFieldID)
+			}
+			if !field.GetIsFunctionOutput() {
+				return nil, merr.WrapErrDataIntegrityMsg(
+					"function %s output field %d is not marked as a function output",
+					functionSchema.GetName(), outputFieldID)
+			}
+		}
+	}
+
+	for _, field := range schema.GetFields() {
+		if !field.GetIsFunctionOutput() {
+			continue
+		}
+		if _, hasProducer := declaredFunctionOutputs[field.GetFieldID()]; !hasProducer {
+			return nil, merr.WrapErrDataIntegrityMsg(
+				"function output field %d has no producing function", field.GetFieldID())
+		}
+	}
+
+	for _, structField := range schema.GetStructArrayFields() {
+		presentChildren := 0
+		missingRequired := false
+		for _, childField := range structField.GetFields() {
+			if childField.GetIsFunctionOutput() {
+				return nil, merr.WrapErrDataIntegrityMsg(
+					"struct array field %d child field %d cannot be a function output",
+					structField.GetFieldID(), childField.GetFieldID())
+			}
+			if _, present := existingFields[childField.GetFieldID()]; present {
+				presentChildren++
+			} else if !childField.GetElementNullable() {
+				missingRequired = true
+			}
+		}
+		if presentChildren != 0 && missingRequired {
+			return nil, merr.WrapErrDataIntegrityMsg(
+				"struct array field %d is partially present: %d of %d children exist",
+				structField.GetFieldID(), presentChildren, len(structField.GetFields()))
+		}
+	}
+
+	return declaredFunctionOutputs, nil
 }
 
 func filterV1CompactionFieldBinlogs(fieldBinlogs []*datapb.FieldBinlog, readFields map[int64]struct{}) []*datapb.FieldBinlog {

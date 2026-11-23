@@ -26,7 +26,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
-// Update applies a composite set of UpdateActions as a single write: each
+// Update applies a composite set of UpdateActions: each
 // action's Entry/Type pair is type-switched into the same kv encoding its
 // dedicated Catalog method uses, accumulated into a txn.Builder, which is
 // then committed via txn.Commit - atomically if the op count fits within
@@ -53,8 +53,8 @@ func (kc *Catalog) Update(ctx context.Context, ts typeutil.Timestamp, actions ..
 			// the collection key as the visibility point, so children are
 			// persisted before the collection key on the ordered fallback
 			// path.
-			if coll.State != pb.CollectionState_CollectionCreated {
-				return merr.WrapErrServiceInternalMsg("collection state should be created, collection name: %s, collection id: %d, state: %s", coll.Name, coll.CollectionID, coll.State)
+			if coll.State != pb.CollectionState_CollectionCreated && coll.State != pb.CollectionState_CollectionRestoring {
+				return merr.WrapErrServiceInternalMsg("collection state should be created or restoring, collection name: %s, collection id: %d, state: %s", coll.Name, coll.CollectionID, coll.State)
 			}
 
 			k1, v1, err := buildCollectionKV(coll)

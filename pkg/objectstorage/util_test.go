@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,9 +12,73 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"cloud.google.com/go/storage"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/api/googleapi"
 )
+
+func TestResolveCloudProvider(t *testing.T) {
+	for _, tc := range []struct {
+		name, provider, address, want string
+	}{
+		{"explicit_gcp", CloudProviderGCP, "custom.example.com", CloudProviderGCP},
+		{"explicit_aliyun", CloudProviderAliyun, "storage.googleapis.com", CloudProviderAliyun},
+		{"explicit_tencent", CloudProviderTencent, "storage.googleapis.com", CloudProviderTencent},
+		{"explicit_huawei", CloudProviderHuawei, "oss-cn-hangzhou.aliyuncs.com", CloudProviderHuawei},
+		{"default_gcp", "", "storage.googleapis.com", CloudProviderGCP},
+		{"aws_gcp_with_port", CloudProviderAWS, "storage.googleapis.com:443", CloudProviderGCP},
+		{"unknown_gcp", "minio", "storage.googleapis.com", CloudProviderGCP},
+		{"default_aliyun", "", "oss-cn-hangzhou.aliyuncs.com", CloudProviderAliyun},
+		{"aws_aliyun", CloudProviderAWS, "oss-cn-hangzhou.aliyuncs.com", CloudProviderAliyun},
+		{"gcp_endpoint_precedence", "", "storage.googleapis.com.oss.aliyuncs.com", CloudProviderGCP},
+		{"aws", CloudProviderAWS, "s3.amazonaws.com", CloudProviderAWS},
+		{"default_minio", "", "localhost:9000", ""},
+		{"unknown_provider", "minio", "localhost:9000", "minio"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := Config{CloudProvider: tc.provider, Address: tc.address}
+			original := config
+			assert.Equal(t, tc.want, ResolveCloudProvider(&config))
+			assert.Equal(t, original, config)
+			config.CloudProvider = tc.want
+			assert.Equal(t, tc.want, ResolveCloudProvider(&config), "resolution must be idempotent")
+		})
+	}
+}
+
+func TestIsGcsNotExist(t *testing.T) {
+	notFound := &googleapi.Error{Code: http.StatusNotFound}
+	// cloud.google.com/go/storage >= v1.51 formats not-found errors this way
+	// (see formatObjectErr / formatBucketError).
+	libBucketNotExist := fmt.Errorf("%w: %w", storage.ErrBucketNotExist, notFound)
+	libObjectNotExist := fmt.Errorf("%w: %w", storage.ErrObjectNotExist, notFound)
+
+	tests := []struct {
+		name         string
+		err          error
+		bucketExpect bool
+		objectExpect bool
+	}{
+		{"nil", nil, false, false},
+		{"unrelated", errors.New("boom"), false, false},
+		{"bare googleapi 404", notFound, false, false},
+		{"bare bucket sentinel", storage.ErrBucketNotExist, true, false},
+		{"bare object sentinel", storage.ErrObjectNotExist, false, true},
+		{"multi-wrapped bucket sentinel", libBucketNotExist, true, false},
+		{"multi-wrapped object sentinel", libObjectNotExist, false, true},
+		{"cockroach-wrapped multi-wrapped bucket", errors.Wrap(libBucketNotExist, "attrs"), true, false},
+		{"cockroach-wrapped multi-wrapped object", errors.Wrap(libObjectNotExist, "attrs"), false, true},
+		{"nested multi-wrapped object", fmt.Errorf("%w; %w", errors.New("other"), libObjectNotExist), false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.bucketExpect, IsGcsBucketNotExist(tt.err))
+			assert.Equal(t, tt.objectExpect, IsGcsObjectNotExist(tt.err))
+		})
+	}
+}
 
 func TestParseTLSMinVersion(t *testing.T) {
 	tests := []struct {
@@ -129,6 +194,26 @@ func TestNewTLSHTTPClientRejectsLowerVersion(t *testing.T) {
 		assert.Equal(t, uint16(tls.VersionTLS12), resp.TLS.Version)
 		t.Logf("confirmed: negotiated %s", tlsVersionName(resp.TLS.Version))
 	})
+}
+
+func TestNewMinioClientInferredGCP(t *testing.T) {
+	for _, provider := range []string{"", CloudProviderAWS} {
+		for _, useIAM := range []bool{false, true} {
+			t.Run(fmt.Sprintf("provider=%s/iam=%t", provider, useIAM), func(t *testing.T) {
+				config := Config{
+					Address: "storage.googleapis.com:443", CloudProvider: provider,
+					UseSSL: true, UseIAM: useIAM, SkipBucketCheck: true,
+					BucketName: "src-bucket", AccessKeyID: "access-key", SecretAccessKeyID: "secret-key",
+				}
+				original := config
+				client, err := NewMinioClient(context.Background(), &config)
+				require.NoError(t, err)
+				// The GCP constructor removes the port so the SDK recognizes GCS.
+				assert.Equal(t, "storage.googleapis.com", client.EndpointURL().Host)
+				assert.Equal(t, original, config)
+			})
+		}
+	}
 }
 
 func TestNewMinioClientSkipsBucketCheck(t *testing.T) {
@@ -486,4 +571,69 @@ func TestNewGcpNativeClientTLSVersion(t *testing.T) {
 		require.NotNil(t, client)
 		t.Logf("NewGcpObjectStorageClient(SslTLSMinVersion=<empty>): success (default behavior)")
 	})
+}
+
+func TestNewAzureClientSPNCredentialPath(t *testing.T) {
+	t.Setenv("AZURE_CLIENT_SECRET", "fake-secret")
+	t.Setenv("AZURE_CLIENT_ID", "00000000-0000-0000-0000-000000000001")
+	t.Setenv("AZURE_TENANT_ID", "00000000-0000-0000-0000-000000000002")
+
+	cfg := &Config{
+		Address:         "core.windows.net",
+		BucketName:      "container",
+		AccessKeyID:     "testaccount",
+		UseIAM:          true,
+		SkipBucketCheck: true,
+	}
+
+	client, err := NewAzureObjectStorageClient(context.Background(), cfg)
+	require.NoError(t, err)
+	assert.Equal(t, "https://testaccount.blob.core.windows.net/", client.URL())
+}
+
+func TestNewAzureClientSPNMissingVarsReturnsError(t *testing.T) {
+	// AZURE_CLIENT_SECRET set but AZURE_CLIENT_ID and AZURE_TENANT_ID missing —
+	// the SPN branch must return a hard error rather than silently falling through.
+	t.Setenv("AZURE_CLIENT_SECRET", "fake-secret")
+	t.Setenv("AZURE_CLIENT_ID", "")
+	t.Setenv("AZURE_TENANT_ID", "")
+	t.Setenv("AZURE_FEDERATED_TOKEN_FILE", "")
+
+	cfg := &Config{
+		Address:         "core.windows.net",
+		BucketName:      "container",
+		AccessKeyID:     "testaccount",
+		UseIAM:          true,
+		SkipBucketCheck: true,
+	}
+
+	_, err := NewAzureObjectStorageClient(context.Background(), cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "SPN authentication requires")
+}
+
+func TestNewAzureClientWITakesPriorityOverSPN(t *testing.T) {
+	// Set WI token file + SPN secret, but leave CLIENT_ID and TENANT_ID empty.
+	// WI is checked first (correct WI→SPN→MI order): NewWorkloadIdentityCredential
+	// fails because CLIENT_ID/TENANT_ID are missing — this is a WI construction error,
+	// NOT the SPN validation error ("SPN authentication requires..."), proving the WI
+	// branch was entered rather than the SPN branch.
+	t.Setenv("AZURE_FEDERATED_TOKEN_FILE", "/nonexistent/token/file")
+	t.Setenv("AZURE_CLIENT_SECRET", "fake-secret")
+	t.Setenv("AZURE_CLIENT_ID", "")
+	t.Setenv("AZURE_TENANT_ID", "")
+
+	cfg := &Config{
+		Address:         "core.windows.net",
+		BucketName:      "container",
+		AccessKeyID:     "testaccount",
+		UseIAM:          true,
+		SkipBucketCheck: true,
+	}
+
+	_, err := NewAzureObjectStorageClient(context.Background(), cfg)
+	// WI path taken: error is from WorkloadIdentityCredential (missing tenant/client),
+	// not from SPN validation (which would say "SPN authentication requires...").
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "SPN authentication requires")
 }

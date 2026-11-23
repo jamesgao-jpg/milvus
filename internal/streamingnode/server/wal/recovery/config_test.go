@@ -4,48 +4,72 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 )
 
-func TestNewConfig(t *testing.T) {
-	// Mock paramtable values
-	paramtable.Init()
-	cfg := newConfig()
+func TestRecoveryConfigValidatesTailWatermarks(t *testing.T) {
+	valid := config{
+		persistInterval:        time.Second,
+		maxDirtyMessages:       1,
+		tailLowWatermarkBytes:  1,
+		tailSoftWatermarkBytes: 2,
+		tailHighWatermarkBytes: 3,
+	}
+	require.NoError(t, valid.validate())
 
-	assert.Equal(t, 10*time.Second, cfg.persistInterval)
-	assert.Equal(t, 100, cfg.maxDirtyMessages)
-	assert.Equal(t, 3*time.Second, cfg.gracefulTimeout)
+	for _, watermarks := range [][3]uint64{
+		{0, 2, 3},
+		{1, 1, 3},
+		{1, 3, 3},
+		{3, 2, 1},
+	} {
+		cfg := valid
+		cfg.tailLowWatermarkBytes = watermarks[0]
+		cfg.tailSoftWatermarkBytes = watermarks[1]
+		cfg.tailHighWatermarkBytes = watermarks[2]
+		require.Error(t, cfg.validate())
+	}
 }
 
-func TestConfigValidate(t *testing.T) {
-	tests := []struct {
-		name             string
-		persistInterval  time.Duration
-		maxDirtyMessages int
-		gracefulTimeout  time.Duration
-		expectError      bool
-	}{
-		{"ValidConfig", 10 * time.Second, 100, 5 * time.Second, false},
-		{"InvalidPersistInterval", 0, 100, 5 * time.Second, true},
-		{"InvalidMaxDirtyMessages", 10 * time.Second, 0, 5 * time.Second, true},
-		{"InvalidGracefulTimeout", 10 * time.Second, 100, 0, true},
+func TestRecoveryFlushTriggerConfiguration(t *testing.T) {
+	params := paramtable.Get()
+	cfg := newConfig()
+	require.Equal(t, uint64(6<<30), cfg.flushSizeBytes)
+	require.Equal(t, uint64(6144), cfg.flushMessageCount)
+	require.Equal(t, uint64(512<<20), cfg.flushIdleMinBytes)
+	require.Equal(t, 10*time.Minute, cfg.flushIdleTimeout)
+	for _, item := range []*paramtable.ParamItem{
+		&params.StreamingCfg.WALRecoveryFlushSizeThreshold,
+		&params.StreamingCfg.WALRecoveryFlushMessageThreshold,
+		&params.StreamingCfg.WALRecoveryFlushIdleMinSize,
+		&params.StreamingCfg.WALRecoveryFlushIdleTimeout,
+	} {
+		old := item.GetValue()
+		t.Cleanup(func() { require.NoError(t, params.Save(item.Key, old)) })
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := &config{
-				persistInterval:  tt.persistInterval,
-				maxDirtyMessages: tt.maxDirtyMessages,
-				gracefulTimeout:  tt.gracefulTimeout,
-			}
-			err := cfg.validate()
-			if tt.expectError {
-				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
-			}
-		})
+	require.NoError(t, params.Save(params.StreamingCfg.WALRecoveryFlushSizeThreshold.Key, "32GB"))
+	require.NoError(t, params.Save(params.StreamingCfg.WALRecoveryFlushMessageThreshold.Key, "12"))
+	require.NoError(t, params.Save(params.StreamingCfg.WALRecoveryFlushIdleMinSize.Key, "1MB"))
+	require.NoError(t, params.Save(params.StreamingCfg.WALRecoveryFlushIdleTimeout.Key, "1s"))
+	cfg = newConfig()
+	require.Equal(t, uint64(32<<30), cfg.flushSizeBytes)
+	require.Equal(t, uint64(4<<30), cfg.tailLowWatermarkBytes)
+	require.Equal(t, uint64(8<<30), cfg.tailSoftWatermarkBytes)
+	require.Equal(t, uint64(16<<30), cfg.tailHighWatermarkBytes)
+	require.Equal(t, uint64(12), cfg.flushMessageCount)
+	require.Equal(t, uint64(1<<20), cfg.flushIdleMinBytes)
+	require.Equal(t, time.Second, cfg.flushIdleTimeout)
+	for _, value := range []string{"0", "-1"} {
+		require.NoError(t, params.Save(params.StreamingCfg.WALRecoveryFlushSizeThreshold.Key, value))
+		require.NoError(t, params.Save(params.StreamingCfg.WALRecoveryFlushMessageThreshold.Key, value))
+		require.NoError(t, params.Save(params.StreamingCfg.WALRecoveryFlushIdleMinSize.Key, value))
+		require.NoError(t, params.Save(params.StreamingCfg.WALRecoveryFlushIdleTimeout.Key, value+"s"))
+		cfg = newConfig()
+		require.Zero(t, cfg.flushSizeBytes)
+		require.Zero(t, cfg.flushMessageCount)
+		require.Zero(t, cfg.flushIdleMinBytes)
+		require.LessOrEqual(t, cfg.flushIdleTimeout, time.Duration(0))
 	}
 }

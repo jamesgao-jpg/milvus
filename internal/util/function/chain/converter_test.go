@@ -21,6 +21,8 @@ package chain
 import (
 	"math"
 	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/apache/arrow/go/v17/arrow"
@@ -29,9 +31,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"google.golang.org/protobuf/proto"
 
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/util/function/chain/types"
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
@@ -75,7 +81,7 @@ func (s *ConverterSuite) TestToArrowType() {
 		{schemapb.DataType_String, arrow.BinaryTypes.String, false},
 		{schemapb.DataType_VarChar, arrow.BinaryTypes.String, false},
 		{schemapb.DataType_Text, arrow.BinaryTypes.String, false},
-		{schemapb.DataType_JSON, nil, true},        // Unsupported
+		{schemapb.DataType_JSON, arrow.BinaryTypes.Binary, false},
 		{schemapb.DataType_FloatVector, nil, true}, // Unsupported
 	}
 
@@ -167,7 +173,7 @@ func (s *ConverterSuite) TestFromSearchResultData_Basic() {
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, s.pool, []string{"name", "age"})
+	df, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "name", "age"))
 	s.Require().NoError(err)
 	defer df.Release()
 
@@ -218,7 +224,7 @@ func (s *ConverterSuite) TestFromSearchResultData_NeededFieldsFilter() {
 		},
 	}
 
-	// nil neededFields: skip all field columns (same as empty)
+	// A nil plan skips all field columns.
 	df, err := FromSearchResultData(resultData, s.pool, nil)
 	s.Require().NoError(err)
 	s.True(df.HasColumn(types.IDFieldName))
@@ -227,8 +233,8 @@ func (s *ConverterSuite) TestFromSearchResultData_NeededFieldsFilter() {
 	s.False(df.HasColumn("age"))
 	df.Release()
 
-	// empty neededFields: skip all fields, only $id and $score
-	df, err = FromSearchResultData(resultData, s.pool, []string{})
+	// An empty plan skips all fields, leaving only $id and $score.
+	df, err = FromSearchResultData(resultData, s.pool, nil)
 	s.Require().NoError(err)
 	s.True(df.HasColumn(types.IDFieldName))
 	s.True(df.HasColumn(types.ScoreFieldName))
@@ -236,8 +242,8 @@ func (s *ConverterSuite) TestFromSearchResultData_NeededFieldsFilter() {
 	s.False(df.HasColumn("age"))
 	df.Release()
 
-	// specific neededFields: only import "name"
-	df, err = FromSearchResultData(resultData, s.pool, []string{"name"})
+	// A plan containing only "name" imports only that field.
+	df, err = FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "name"))
 	s.Require().NoError(err)
 	s.True(df.HasColumn("name"))
 	s.False(df.HasColumn("age"))
@@ -428,7 +434,7 @@ func (s *ConverterSuite) TestToSearchResultData() {
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, s.pool, []string{"name"})
+	df, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "name"))
 	s.Require().NoError(err)
 	defer df.Release()
 
@@ -599,7 +605,7 @@ func (s *ConverterSuite) TestGroupByFieldValue_RoundTrip() {
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, s.pool, []string{"name"})
+	df, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "name"))
 	s.Require().NoError(err)
 	defer df.Release()
 
@@ -902,7 +908,9 @@ func (s *ConverterSuite) TestImportExport_AllDataTypes() {
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, s.pool, []string{"bool_col", "int8_col", "int16_col", "int32_col", "int64_col", "float_col", "double_col", "varchar_col"})
+	df, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(
+		resultData, "bool_col", "int8_col", "int16_col", "int32_col", "int64_col", "float_col", "double_col", "varchar_col",
+	))
 	s.Require().NoError(err)
 	defer df.Release()
 
@@ -918,7 +926,19 @@ func (s *ConverterSuite) TestImportExport_AllDataTypes() {
 	exported, err := ToSearchResultData(df)
 	s.Require().NoError(err)
 
-	s.Len(exported.FieldsData, 8)
+	s.Require().Len(exported.FieldsData, len(resultData.FieldsData))
+	byName := make(map[string]*schemapb.FieldData, len(exported.FieldsData))
+	for _, field := range exported.FieldsData {
+		s.NotContains(byName, field.FieldName)
+		byName[field.FieldName] = field
+	}
+	for _, expected := range resultData.FieldsData {
+		actual := byName[expected.FieldName]
+		s.Require().NotNil(actual)
+		s.Equal(expected.FieldId, actual.FieldId)
+		s.Equal(expected.Type, actual.Type)
+		s.True(proto.Equal(expected.GetScalars(), actual.GetScalars()), expected.FieldName)
+	}
 	s.Equal([]float32{0.9, 0.8, 0.7}, exported.Scores)
 	s.Equal([]int64{1, 2, 3}, exported.Ids.GetIntId().GetData())
 }
@@ -982,7 +1002,7 @@ func (s *ConverterSuite) TestMemoryLeak_ImportExport() {
 	}
 
 	for range 10 {
-		df, err := FromSearchResultData(resultData, s.pool, []string{"name"})
+		df, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "name"))
 		s.Require().NoError(err)
 
 		_, err = ToSearchResultData(df)
@@ -1024,13 +1044,13 @@ func (s *ConverterSuite) TestFromSearchResultData_NullableField_Int64() {
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, s.pool, []string{"nullable_col"})
+	df, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "nullable_col"))
 	s.Require().NoError(err)
 	defer df.Release()
 
-	s.True(df.fieldNullables["nullable_col"])
-	s.False(df.fieldNullables[types.IDFieldName])
-	s.False(df.fieldNullables[types.ScoreFieldName])
+	s.True(df.FieldNullable("nullable_col"))
+	s.False(df.FieldNullable(types.IDFieldName))
+	s.False(df.FieldNullable(types.ScoreFieldName))
 
 	col := df.Column("nullable_col")
 	s.Require().NotNil(col)
@@ -1075,7 +1095,7 @@ func (s *ConverterSuite) TestFromSearchResultData_NullableField_String() {
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, s.pool, []string{"nullable_str"})
+	df, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "nullable_str"))
 	s.Require().NoError(err)
 	defer df.Release()
 
@@ -1120,7 +1140,7 @@ func (s *ConverterSuite) TestFromSearchResultData_NullableField_Int8() {
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, s.pool, []string{"nullable_int8"})
+	df, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "nullable_int8"))
 	s.Require().NoError(err)
 	defer df.Release()
 
@@ -1162,7 +1182,7 @@ func (s *ConverterSuite) TestFromSearchResultData_NullableField_Int16() {
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, s.pool, []string{"nullable_int16"})
+	df, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "nullable_int16"))
 	s.Require().NoError(err)
 	defer df.Release()
 
@@ -1205,7 +1225,7 @@ func (s *ConverterSuite) TestFromSearchResultData_NullableField_MultipleChunks()
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, s.pool, []string{"nullable_float"})
+	df, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "nullable_float"))
 	s.Require().NoError(err)
 	defer df.Release()
 
@@ -1280,13 +1300,15 @@ func (s *ConverterSuite) TestFromSearchResultData_NullableField_AllTypes() {
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, s.pool, []string{"nullable_bool", "nullable_int32", "nullable_double"})
+	df, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(
+		resultData, "nullable_bool", "nullable_int32", "nullable_double",
+	))
 	s.Require().NoError(err)
 	defer df.Release()
 
-	s.True(df.fieldNullables["nullable_bool"])
-	s.True(df.fieldNullables["nullable_int32"])
-	s.True(df.fieldNullables["nullable_double"])
+	s.True(df.FieldNullable("nullable_bool"))
+	s.True(df.FieldNullable("nullable_int32"))
+	s.True(df.FieldNullable("nullable_double"))
 
 	boolCol := df.Column("nullable_bool").Chunk(0).(*array.Boolean)
 	s.True(boolCol.IsValid(0))
@@ -1335,11 +1357,11 @@ func (s *ConverterSuite) TestFromSearchResultData_NonNullableField() {
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, s.pool, []string{"non_nullable_col"})
+	df, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "non_nullable_col"))
 	s.Require().NoError(err)
 	defer df.Release()
 
-	s.False(df.fieldNullables["non_nullable_col"])
+	s.False(df.FieldNullable("non_nullable_col"))
 
 	col := df.Column("non_nullable_col")
 	chunk := col.Chunk(0).(*array.Int64)
@@ -1405,7 +1427,7 @@ func TestFromSearchResultData_MemoryLeakOnError(t *testing.T) {
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, pool, []string{"name", "vector"})
+	df, err := FromSearchResultData(resultData, pool, testDataFrameInputPlan(resultData, "name", "vector"))
 	assert.Error(t, err)
 	assert.Nil(t, df)
 	assert.Contains(t, err.Error(), "unsupported")
@@ -1443,23 +1465,15 @@ func TestFromSearchResultData_MemoryLeakOnError_WithCheckedAllocator(t *testing.
 				},
 			},
 			{
-				Type:      schemapb.DataType_JSON, // Unsupported!
+				Type:      schemapb.DataType_JSON,
 				FieldName: "json_col",
 				FieldId:   101,
-				Field: &schemapb.FieldData_Scalars{
-					Scalars: &schemapb.ScalarField{
-						Data: &schemapb.ScalarField_JsonData{
-							JsonData: &schemapb.JSONArray{
-								Data: [][]byte{[]byte(`{}`), []byte(`{}`), []byte(`{}`), []byte(`{}`), []byte(`{}`)},
-							},
-						},
-					},
-				},
+				Field:     nil,
 			},
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, checkedPool, []string{"col1", "json_col"})
+	df, err := FromSearchResultData(resultData, checkedPool, testDataFrameInputPlan(resultData, "col1", "json_col"))
 	assert.Error(t, err)
 	assert.Nil(t, df)
 
@@ -1502,7 +1516,7 @@ func TestFromSearchResultData_NoLeakOnSuccess(t *testing.T) {
 	}
 
 	for i := 0; i < 10; i++ {
-		df, err := FromSearchResultData(resultData, checkedPool, []string{"name"})
+		df, err := FromSearchResultData(resultData, checkedPool, testDataFrameInputPlan(resultData, "name"))
 		require.NoError(t, err)
 		require.NotNil(t, df)
 		df.Release()
@@ -1559,7 +1573,7 @@ func TestFromSearchResultData_MemoryLeakQuantification(t *testing.T) {
 
 	iterations := 100
 	for i := 0; i < iterations; i++ {
-		df, err := FromSearchResultData(resultData, checkedPool, []string{"large_col", "vector"})
+		df, err := FromSearchResultData(resultData, checkedPool, testDataFrameInputPlan(resultData, "large_col", "vector"))
 		assert.Error(t, err)
 		assert.Nil(t, df)
 	}
@@ -1618,10 +1632,10 @@ func TestFromSearchResultData_DuplicateFieldNames(t *testing.T) {
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, pool, []string{"dup_field"})
+	df, err := FromSearchResultData(resultData, pool, testDataFrameInputPlan(resultData, "dup_field"))
 	assert.Error(t, err)
 	assert.Nil(t, df)
-	assert.Contains(t, err.Error(), "duplicate field name")
+	assert.Contains(t, err.Error(), "appears more than once")
 	assert.Contains(t, err.Error(), "dup_field")
 }
 
@@ -1675,7 +1689,9 @@ func TestFromSearchResultData_DuplicateFieldIDs(t *testing.T) {
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, pool, []string{"field_a", "field_b"})
+	df, err := FromSearchResultData(resultData, pool, &DataFrameInputPlan{Inputs: []ResolvedChainInput{{
+		LogicalName: "field_a", SourceFieldID: 100, FieldName: "field_a", DataType: schemapb.DataType_Int64,
+	}}})
 	assert.Error(t, err)
 	assert.Nil(t, df)
 	assert.Contains(t, err.Error(), "duplicate field id")
@@ -1752,7 +1768,7 @@ func TestMemoryLeakStress(t *testing.T) {
 	}
 
 	for range 100 {
-		df, err := FromSearchResultData(resultData, pool, []string{"col1", "col2", "col3"})
+		df, err := FromSearchResultData(resultData, pool, testDataFrameInputPlan(resultData, "col1", "col2", "col3"))
 		assert.NoError(t, err)
 
 		_ = df.Column(types.IDFieldName)
@@ -1840,7 +1856,7 @@ func (s *ConverterSuite) TestExportValidData_AllValid() {
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, s.pool, []string{"nullable_col"})
+	df, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "nullable_col"))
 	s.Require().NoError(err)
 	defer df.Release()
 
@@ -1848,7 +1864,7 @@ func (s *ConverterSuite) TestExportValidData_AllValid() {
 	exported, err := ToSearchResultData(df)
 	s.Require().NoError(err)
 
-	// Since all values are valid, exportValidData should return nil → ValidData is nil
+	// Search omits the all-valid bitmap after Arrow conversion.
 	s.Require().Len(exported.FieldsData, 1)
 	s.Nil(typeutil.GetFieldDataValidData(exported.FieldsData[0]))
 }
@@ -1888,14 +1904,14 @@ func (s *ConverterSuite) TestFromSearchResultData_NilScalars() {
 				},
 			}
 
-			_, err := FromSearchResultData(resultData, s.pool, []string{"test_field"})
+			_, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "test_field"))
 			s.Require().Error(err)
 			s.Contains(err.Error(), "scalars is nil")
 		})
 	}
 }
 
-func (s *ConverterSuite) TestFromSearchResultData_UnsupportedFieldType() {
+func (s *ConverterSuite) TestFromSearchResultData_RejectsCompleteJSONRoot() {
 	resultData := &schemapb.SearchResultData{
 		NumQueries: 1,
 		TopK:       1,
@@ -1916,9 +1932,9 @@ func (s *ConverterSuite) TestFromSearchResultData_UnsupportedFieldType() {
 		},
 	}
 
-	_, err := FromSearchResultData(resultData, s.pool, []string{"json_field"})
+	_, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "json_field"))
 	s.Require().Error(err)
-	s.Contains(err.Error(), "unsupported")
+	s.Contains(err.Error(), "unsupported complete JSON root")
 }
 
 // =============================================================================
@@ -2013,10 +2029,9 @@ func (s *ConverterSuite) TestFromSearchResultData_EmptyFieldName() {
 		},
 	}
 
-	// Empty field name not in filter, so it gets skipped
-	_, err := FromSearchResultData(resultData, s.pool, []string{""})
+	_, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, ""))
 	s.Error(err)
-	s.Contains(err.Error(), "field_name is empty")
+	s.Contains(err.Error(), "empty logical name")
 }
 
 func (s *ConverterSuite) TestFromSearchResultData_ValidDataTooShort() {
@@ -2047,7 +2062,7 @@ func (s *ConverterSuite) TestFromSearchResultData_ValidDataTooShort() {
 		},
 	}
 
-	_, err := FromSearchResultData(resultData, s.pool, []string{"col"})
+	_, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "col"))
 	s.Error(err)
 	s.Contains(err.Error(), "validData length")
 	s.Contains(err.Error(), "less than totalRows")
@@ -2080,7 +2095,7 @@ func (s *ConverterSuite) TestFromSearchResultData_FieldDataTooShort() {
 		},
 	}
 
-	_, err := FromSearchResultData(resultData, s.pool, []string{"col"})
+	_, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "col"))
 	s.Error(err)
 	s.Contains(err.Error(), "data length")
 	s.Contains(err.Error(), "less than totalRows")
@@ -2115,7 +2130,7 @@ func (s *ConverterSuite) TestFromSearchResultData_NilBoolData() {
 		},
 	}
 
-	_, err := FromSearchResultData(resultData, s.pool, []string{"test_field"})
+	_, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "test_field"))
 	s.Error(err)
 	s.Contains(err.Error(), "bool data is nil")
 }
@@ -2145,7 +2160,7 @@ func (s *ConverterSuite) TestFromSearchResultData_NilIntData() {
 		},
 	}
 
-	_, err := FromSearchResultData(resultData, s.pool, []string{"test_field"})
+	_, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "test_field"))
 	s.Error(err)
 	s.Contains(err.Error(), "int data is nil")
 }
@@ -2175,7 +2190,7 @@ func (s *ConverterSuite) TestFromSearchResultData_NilLongData() {
 		},
 	}
 
-	_, err := FromSearchResultData(resultData, s.pool, []string{"test_field"})
+	_, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "test_field"))
 	s.Error(err)
 	s.Contains(err.Error(), "long data is nil")
 }
@@ -2205,7 +2220,7 @@ func (s *ConverterSuite) TestFromSearchResultData_NilFloatData() {
 		},
 	}
 
-	_, err := FromSearchResultData(resultData, s.pool, []string{"test_field"})
+	_, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "test_field"))
 	s.Error(err)
 	s.Contains(err.Error(), "float data is nil")
 }
@@ -2235,7 +2250,7 @@ func (s *ConverterSuite) TestFromSearchResultData_NilDoubleData() {
 		},
 	}
 
-	_, err := FromSearchResultData(resultData, s.pool, []string{"test_field"})
+	_, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "test_field"))
 	s.Error(err)
 	s.Contains(err.Error(), "double data is nil")
 }
@@ -2265,7 +2280,7 @@ func (s *ConverterSuite) TestFromSearchResultData_NilStringData() {
 		},
 	}
 
-	_, err := FromSearchResultData(resultData, s.pool, []string{"test_field"})
+	_, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "test_field"))
 	s.Error(err)
 	s.Contains(err.Error(), "string data is nil")
 }
@@ -2297,7 +2312,7 @@ func (s *ConverterSuite) TestExportIDs_UnsupportedType() {
 	s.Contains(exportErr.Error(), "unsupported ID type")
 }
 
-func (s *ConverterSuite) TestExportIntFieldData_UnsupportedChunkType() {
+func (s *ConverterSuite) TestExportFieldData_UnsupportedIntegerLayout() {
 	// Create a DataFrame with a field typed as Int8 but with Float64 Arrow column
 	builder := NewDataFrameBuilder()
 	defer builder.Release()
@@ -2331,8 +2346,8 @@ func (s *ConverterSuite) TestExportIntFieldData_UnsupportedChunkType() {
 	defer df.Release()
 
 	_, exportErr := ToSearchResultData(df)
-	s.Error(exportErr)
-	s.Contains(exportErr.Error(), "type mismatch")
+	s.ErrorIs(exportErr, merr.ErrServiceInternal)
+	s.Equal(merr.SystemError, merr.GetErrorType(exportErr))
 }
 
 func (s *ConverterSuite) TestExportScores_TypeMismatch() {
@@ -2366,7 +2381,7 @@ func (s *ConverterSuite) TestExportScores_TypeMismatch() {
 }
 
 // =============================================================================
-// Nullable Round-Trip with Actual Nulls (exercises exportValidData hasNull path)
+// Nullable Round-Trip with Actual Nulls
 // =============================================================================
 
 func (s *ConverterSuite) TestNullableRoundTrip_WithNulls() {
@@ -2397,7 +2412,7 @@ func (s *ConverterSuite) TestNullableRoundTrip_WithNulls() {
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, s.pool, []string{"nullable_col"})
+	df, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "nullable_col"))
 	s.Require().NoError(err)
 	defer df.Release()
 
@@ -2408,7 +2423,7 @@ func (s *ConverterSuite) TestNullableRoundTrip_WithNulls() {
 	s.Require().Len(exported.FieldsData, 1)
 	s.Require().NotNil(typeutil.GetFieldDataValidData(exported.FieldsData[0]))
 	s.Equal([]bool{true, false, true}, typeutil.GetFieldDataValidData(exported.FieldsData[0]))
-	s.Nil(exported.FieldsData[0].GetValidData())
+	s.Equal([]bool{true, false, true}, exported.FieldsData[0].GetValidData())
 
 	// Verify data values
 	longData := exported.FieldsData[0].GetScalars().GetLongData().GetData()
@@ -2444,7 +2459,7 @@ func (s *ConverterSuite) TestNullableRoundTrip_TimestamptzWithNulls() {
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, s.pool, []string{"ts"})
+	df, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "ts"))
 	s.Require().NoError(err)
 	defer df.Release()
 
@@ -2486,7 +2501,7 @@ func (s *ConverterSuite) TestNullableRoundTrip_BoolWithNulls() {
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, s.pool, []string{"nullable_bool"})
+	df, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "nullable_bool"))
 	s.Require().NoError(err)
 	defer df.Release()
 
@@ -2525,7 +2540,7 @@ func (s *ConverterSuite) TestNullableRoundTrip_StringWithNulls() {
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, s.pool, []string{"nullable_str"})
+	df, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "nullable_str"))
 	s.Require().NoError(err)
 	defer df.Release()
 
@@ -2534,6 +2549,53 @@ func (s *ConverterSuite) TestNullableRoundTrip_StringWithNulls() {
 	s.Require().Len(exported.FieldsData, 1)
 	s.NotNil(typeutil.GetFieldDataValidData(exported.FieldsData[0]))
 	s.Equal([]bool{true, false}, typeutil.GetFieldDataValidData(exported.FieldsData[0]))
+}
+
+func (s *ConverterSuite) TestExportGoStringsSurviveRelease() {
+	pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	resultData := &schemapb.SearchResultData{
+		NumQueries: 1,
+		TopK:       2,
+		Topks:      []int64{2},
+		Scores:     []float32{0.9, 0.8},
+		Ids: &schemapb.IDs{
+			IdField: &schemapb.IDs_StrId{
+				StrId: &schemapb.StringArray{Data: []string{"pk-1", "pk-2"}},
+			},
+		},
+		FieldsData: []*schemapb.FieldData{
+			{
+				Type:      schemapb.DataType_VarChar,
+				FieldName: "label",
+				FieldId:   100,
+				Field: &schemapb.FieldData_Scalars{
+					Scalars: &schemapb.ScalarField{
+						Data: &schemapb.ScalarField_StringData{
+							StringData: &schemapb.StringArray{Data: []string{"red", "blue"}},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Limit the DataFrame lifetime to this scope so the exported strings are
+	// the remaining references to its Go-managed value buffers after release.
+	exported := func() *schemapb.SearchResultData {
+		df, err := FromSearchResultData(resultData, pool, testDataFrameInputPlan(resultData, "label"))
+		s.Require().NoError(err)
+		defer df.Release()
+
+		exported, err := ToSearchResultData(df)
+		s.Require().NoError(err)
+		return exported
+	}()
+	pool.AssertSize(s.T(), 0)
+	runtime.GC()
+
+	s.Equal([]string{"pk-1", "pk-2"}, exported.GetIds().GetStrId().GetData())
+	s.Require().Len(exported.GetFieldsData(), 1)
+	s.Equal([]string{"red", "blue"}, exported.GetFieldsData()[0].GetScalars().GetStringData().GetData())
 }
 
 // =============================================================================
@@ -2696,7 +2758,7 @@ func (s *ConverterSuite) TestFromSearchResultData_NullableInt8() {
 		},
 	}
 
-	df, err := FromSearchResultData(resultData, s.pool, []string{"int8_col"})
+	df, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "int8_col"))
 	s.Require().NoError(err)
 	defer df.Release()
 
@@ -2747,7 +2809,7 @@ func (s *ConverterSuite) TestFromSearchResultData_FloatFieldDataTooShort() {
 		},
 	}
 
-	_, err := FromSearchResultData(resultData, s.pool, []string{"float_col"})
+	_, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "float_col"))
 	s.Error(err)
 	s.Contains(err.Error(), "data length")
 	s.Contains(err.Error(), "less than totalRows")
@@ -2780,7 +2842,7 @@ func (s *ConverterSuite) TestFromSearchResultData_BoolFieldDataTooShort() {
 		},
 	}
 
-	_, err := FromSearchResultData(resultData, s.pool, []string{"bool_col"})
+	_, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "bool_col"))
 	s.Error(err)
 	s.Contains(err.Error(), "data length")
 	s.Contains(err.Error(), "less than totalRows")
@@ -2813,7 +2875,7 @@ func (s *ConverterSuite) TestFromSearchResultData_StringFieldDataTooShort() {
 		},
 	}
 
-	_, err := FromSearchResultData(resultData, s.pool, []string{"str_col"})
+	_, err := FromSearchResultData(resultData, s.pool, testDataFrameInputPlan(resultData, "str_col"))
 	s.Error(err)
 	s.Contains(err.Error(), "data length")
 	s.Contains(err.Error(), "less than totalRows")
@@ -2865,9 +2927,266 @@ func BenchmarkFromSearchResultData_ErrorPath(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		df, _ := FromSearchResultData(resultData, pool, []string{"col1", "vector"})
+		df, _ := FromSearchResultData(resultData, pool, testDataFrameInputPlan(resultData, "col1", "vector"))
 		if df != nil {
 			df.Release()
 		}
 	}
+}
+
+func TestToRetrieveResults(t *testing.T) {
+	for _, empty := range []bool{false, true} {
+		t.Run(map[bool]string{false: "rows", true: "empty"}[empty], func(t *testing.T) {
+			pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+			defer pool.AssertSize(t, 0)
+			rows := int64(2)
+			if empty {
+				rows = 0
+			}
+			builder := NewDataFrameBuilder().SetChunkSizes([]int64{rows})
+			defer builder.Release()
+			add := func(name string, dtype arrow.DataType, input string) {
+				if empty {
+					input = "[]"
+				}
+				values, _, err := array.FromJSON(pool, dtype, strings.NewReader(input))
+				require.NoError(t, err)
+				require.NoError(t, builder.AddColumnFromChunks(name, []arrow.Array{values}))
+			}
+			add(types.IDFieldName, arrow.BinaryTypes.String, `["pk-a","pk-b"]`)
+			add("text", arrow.BinaryTypes.String, `["ordinary",null]`)
+			vectors := array.NewFixedSizeBinaryBuilder(pool, &arrow.FixedSizeBinaryType{ByteWidth: 8})
+			if !empty {
+				vectors.Append(arrow.Float32Traits.CastToBytes([]float32{1, 2}))
+				vectors.Append(arrow.Float32Traits.CastToBytes([]float32{3, 4}))
+			}
+			require.NoError(t, builder.AddColumnFromChunks("vector", []arrow.Array{vectors.NewArray()}))
+			vectors.Release()
+			// Ordinary and computed outputs use their actual DataFrame column names.
+			matches := array.NewBinaryBuilder(pool, arrow.BinaryTypes.Binary)
+			if !empty {
+				matches.Append([]byte(`[10,20]`))
+				matches.Append([]byte(`[]`))
+			}
+			require.NoError(t, builder.SetComputedField(grepOutputField("matches")))
+			require.NoError(t, builder.AddColumnFromChunks("matches", []arrow.Array{matches.NewArray()}))
+			matches.Release()
+			add(types.TimestampFieldName, arrow.PrimitiveTypes.Int64, `[7,8]`)
+			schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, Name: "text", DataType: schemapb.DataType_VarChar, Nullable: true},
+				{FieldID: 101, Name: "vector", DataType: schemapb.DataType_FloatVector, TypeParams: []*commonpb.KeyValuePair{{Key: "dim", Value: "2"}}},
+			}}
+			for _, field := range schema.Fields {
+				builder.SetFieldSchema(field.Name, field)
+			}
+			frame := builder.Build()
+			defer func() {
+				if frame != nil {
+					frame.Release()
+				}
+			}()
+
+			result, err := ToRetrieveResults(frame)
+			frame.Release()
+			frame = nil
+			require.NoError(t, err)
+			require.Len(t, result.FieldsData, 3)
+			require.Len(t, result.ComputedResults, 1)
+			require.Equal(t, "matches", result.ComputedResults[0].FieldName)
+			require.Equal(t, int64(common.TimeStampField), result.FieldsData[2].FieldId)
+			if empty {
+				require.NotNil(t, result.Ids.GetStrId())
+				require.Empty(t, result.FieldsData[2].GetScalars().GetLongData().Data)
+				require.Empty(t, result.GetIds().GetStrId().GetData())
+				require.Empty(t, result.ComputedResults[0].GetScalars().GetJsonData().Data)
+			} else {
+				require.Equal(t, []string{"pk-a", "pk-b"}, result.Ids.GetStrId().Data)
+				require.Equal(t, []int64{7, 8}, result.FieldsData[2].GetScalars().GetLongData().Data)
+				require.Equal(t, "ordinary", result.FieldsData[0].GetScalars().GetStringData().Data[0])
+				require.Equal(t, []float32{1, 2, 3, 4}, result.FieldsData[1].GetVectors().GetFloatVector().Data)
+				require.JSONEq(t, `[10,20]`, string(result.ComputedResults[0].GetScalars().GetJsonData().Data[0]))
+			}
+		})
+	}
+}
+
+func TestToRetrieveResultsMissingFrameOrIdentity(t *testing.T) {
+	builder := NewDataFrameBuilder().SetChunkSizes([]int64{0})
+	frame := builder.Build()
+	defer frame.Release()
+	_, err := ToRetrieveResults(nil)
+	require.ErrorIs(t, err, merr.ErrServiceInternal)
+	result, err := ToRetrieveResults(frame)
+	require.ErrorIs(t, err, merr.ErrServiceInternal)
+	require.Nil(t, result)
+}
+
+func TestSharedFieldExportMultipleChunks(t *testing.T) {
+	pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer pool.AssertSize(t, 0)
+	builder := NewDataFrameBuilder().SetChunkSizes([]int64{1, 1})
+	defer builder.Release()
+	add := func(name string, dtype arrow.DataType, values ...string) {
+		chunks := make([]arrow.Array, 0, len(values))
+		for _, value := range values {
+			chunk, _, err := array.FromJSON(pool, dtype, strings.NewReader(value))
+			require.NoError(t, err)
+			chunks = append(chunks, chunk)
+		}
+		require.NoError(t, builder.AddColumnFromChunks(name, chunks))
+	}
+	add(types.IDFieldName, arrow.PrimitiveTypes.Int64, `[10]`, `[20]`)
+	add(types.ScoreFieldName, arrow.PrimitiveTypes.Float32, `[0.8]`, `[0.6]`)
+	add(types.TimestampFieldName, arrow.PrimitiveTypes.Int64, `[1]`, `[2]`)
+	add("text", arrow.BinaryTypes.String, `["first"]`, `[null]`)
+	builder.SetFieldNullable("text", true)
+	var matches []arrow.Array
+	for _, payload := range []string{`[{"content":"a","starts":[0],"ends":[1]}]`, `[{"content":"b","starts":[0],"ends":[1]}]`} {
+		b := array.NewBinaryBuilder(pool, arrow.BinaryTypes.Binary)
+		b.Append([]byte(payload))
+		matches = append(matches, b.NewArray())
+		b.Release()
+	}
+	require.NoError(t, builder.SetComputedField(grepOutputField("matches")))
+	require.NoError(t, builder.AddColumnFromChunks("matches", matches))
+	var vectors []arrow.Array
+	for _, values := range [][]float32{{1, 2}, {3, 4}} {
+		b := array.NewFixedSizeBinaryBuilder(pool, &arrow.FixedSizeBinaryType{ByteWidth: 8})
+		b.Append(arrow.Float32Traits.CastToBytes(values))
+		vectors = append(vectors, b.NewArray())
+		b.Release()
+	}
+	require.NoError(t, builder.AddColumnFromChunks("vector", vectors))
+	builder.SetFieldType("vector", schemapb.DataType_FloatVector)
+	collection := &schemapb.CollectionSchema{
+		Fields: []*schemapb.FieldSchema{
+			{Name: "text", FieldID: 100, DataType: schemapb.DataType_VarChar, Nullable: true},
+			{Name: "vector", FieldID: 101, DataType: schemapb.DataType_FloatVector, TypeParams: []*commonpb.KeyValuePair{{Key: "dim", Value: "2"}}},
+		},
+	}
+	for _, field := range collection.Fields {
+		builder.SetFieldSchema(field.Name, field)
+	}
+	frame := builder.Build()
+	defer frame.Release()
+	search, err := ToSearchResultDataWithOptions(frame, &ExportOptions{SkipColumns: []string{types.TimestampFieldName}})
+	require.NoError(t, err)
+	query, err := ToRetrieveResults(frame)
+	require.NoError(t, err)
+	require.Equal(t, search.Ids, query.Ids)
+	byName := make(map[string]*schemapb.FieldData)
+	for _, field := range search.FieldsData {
+		byName[field.FieldName] = field
+	}
+	require.Equal(t, byName["text"].GetScalars(), query.FieldsData[0].GetScalars())
+	require.Equal(t, []bool{true, false}, typeutil.GetFieldDataValidData(query.FieldsData[0]))
+	require.Equal(t, byName["vector"].GetVectors(), query.FieldsData[1].GetVectors())
+	require.Equal(t, []float32{1, 2, 3, 4}, query.FieldsData[1].GetVectors().GetFloatVector().Data)
+	require.Equal(t, byName["matches"], query.ComputedResults[0])
+}
+
+// Equal Arrow types are routed by saved declarations, not by a field ID alone.
+func TestToRetrieveResultsClassifiesColumnsByMetadata(t *testing.T) {
+	for _, rows := range []int64{0, 2} {
+		t.Run(strconv.FormatInt(rows, 10), func(t *testing.T) {
+			pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+			defer pool.AssertSize(t, 0)
+			builder := NewDataFrameBuilder().SetChunkSizes([]int64{rows})
+			defer builder.Release()
+			for _, name := range []string{types.IDFieldName, "computed", "ordinary", types.TimestampFieldName, types.SegOffsetFieldName, types.ScoreFieldName, types.ElementIndicesFieldName} {
+				b := array.NewInt64Builder(pool)
+				for i := int64(0); i < rows; i++ {
+					b.Append(i + 1)
+				}
+				require.NoError(t, builder.AddColumnFromChunks(name, []arrow.Array{b.NewArray()}))
+				b.Release()
+			}
+			// An ID without a declaration must not turn a computed column into a collection field.
+			builder.SetFieldID("computed", 100)
+			builder.SetFieldID("ordinary", 999)
+			builder.SetFieldSchema("ordinary", &schemapb.FieldSchema{Name: "ordinary", FieldID: 100, DataType: schemapb.DataType_Int64, Nullable: true})
+			frame := builder.Build()
+			defer frame.Release()
+			result, err := ToRetrieveResults(frame)
+			require.NoError(t, err)
+			require.Len(t, result.FieldsData, 2)
+			require.Equal(t, int64(100), result.FieldsData[0].FieldId)
+			require.Equal(t, int64(common.TimeStampField), result.FieldsData[1].FieldId)
+			require.Len(t, result.FieldsData[1].GetScalars().GetLongData().Data, int(rows))
+			require.Len(t, result.ComputedResults, 1)
+			require.Equal(t, "computed", result.ComputedResults[0].FieldName)
+			require.Zero(t, result.ComputedResults[0].FieldId)
+			require.Len(t, result.ComputedResults[0].GetScalars().GetLongData().Data, int(rows))
+			if rows > 0 {
+				require.Equal(t, []bool{true, true}, typeutil.GetFieldDataValidData(result.FieldsData[0]))
+			}
+		})
+	}
+}
+
+func TestToRetrieveResultsRejectsInvalidComputedValues(t *testing.T) {
+	for _, input := range []string{`[null]`} {
+		pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+		builder := NewDataFrameBuilder().SetChunkSizes([]int64{1})
+		ids := array.NewInt64Builder(pool)
+		ids.Append(1)
+		idColumn := ids.NewArray()
+		idColumn.Retain()
+		require.NoError(t, builder.AddColumnFromChunks(types.IDFieldName, []arrow.Array{idColumn}))
+		require.NoError(t, builder.AddColumnFromChunks(types.TimestampFieldName, []arrow.Array{idColumn}))
+		ids.Release()
+		values, _, err := array.FromJSON(pool, arrow.PrimitiveTypes.Int64, strings.NewReader(input))
+		require.NoError(t, err)
+		require.NoError(t, builder.AddColumnFromChunks("computed", []arrow.Array{values}))
+		frame := builder.Build()
+		_, err = ToRetrieveResults(frame)
+		require.ErrorIs(t, err, merr.ErrServiceInternal)
+		require.Equal(t, merr.SystemError, merr.GetErrorType(err))
+		frame.Release()
+		builder.Release()
+		pool.AssertSize(t, 0)
+	}
+}
+
+func TestToRetrieveResultsRejectsMalformedTimestamp(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		typ   arrow.DataType
+		value string
+	}{
+		{"null", arrow.PrimitiveTypes.Int64, `[null]`},
+		{"wrong_type", arrow.BinaryTypes.String, `["1"]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+			defer pool.AssertSize(t, 0)
+			builder := NewDataFrameBuilder().SetChunkSizes([]int64{1})
+			defer builder.Release()
+			ids, _, err := array.FromJSON(pool, arrow.PrimitiveTypes.Int64, strings.NewReader(`[1]`))
+			require.NoError(t, err)
+			require.NoError(t, builder.AddColumnFromChunks(types.IDFieldName, []arrow.Array{ids}))
+			ts, _, err := array.FromJSON(pool, tc.typ, strings.NewReader(tc.value))
+			require.NoError(t, err)
+			require.NoError(t, builder.AddColumnFromChunks(types.TimestampFieldName, []arrow.Array{ts}))
+			frame := builder.Build()
+			defer frame.Release()
+			result, err := ToRetrieveResults(frame)
+			require.Nil(t, result)
+			require.ErrorIs(t, err, merr.ErrServiceInternal)
+			require.Equal(t, merr.SystemError, merr.GetErrorType(err))
+		})
+	}
+}
+
+func TestToRetrieveResultsRequiresTimestampForEmptyFrame(t *testing.T) {
+	builder := NewDataFrameBuilder().SetChunkSizes([]int64{0})
+	defer builder.Release()
+	ids := array.NewInt64Builder(memory.DefaultAllocator)
+	require.NoError(t, builder.AddColumnFromChunks(types.IDFieldName, []arrow.Array{ids.NewArray()}))
+	ids.Release()
+	frame := builder.Build()
+	defer frame.Release()
+	result, err := ToRetrieveResults(frame)
+	require.Nil(t, result)
+	require.ErrorIs(t, err, merr.ErrServiceInternal)
 }

@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strings"
 
 	"github.com/samber/lo"
 
@@ -28,6 +27,7 @@ import (
 	"github.com/milvus-io/milvus/internal/coordinator/snmanager"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/util/streamingutil"
+	"github.com/milvus-io/milvus/internal/views/coord/loadmgr"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
@@ -106,29 +106,28 @@ func RecoverAllCollection(m *meta.Meta) {
 	}
 }
 
+// ReplicaNumberByResourceGroup is the layout a load request asks for: how
+// many replicas in which resource group. It is the first thing AssignReplica
+// decides, and a caller that has to compare the request with what the
+// collection already holds before deciding whether to admit it reads the
+// same answer from here.
+func ReplicaNumberByResourceGroup(resourceGroups []string, replicaNumber int32) (map[string]int, error) {
+	return loadmgr.ReplicaNumberByResourceGroup(resourceGroups, replicaNumber)
+}
+
 func AssignReplica(ctx context.Context, m *meta.Meta, resourceGroups []string, replicaNumber int32, checkNodeNum bool) (map[string]int, error) {
-	if len(resourceGroups) != 0 && len(resourceGroups) != 1 && len(resourceGroups) != int(replicaNumber) {
-		return nil, merr.WrapErrParameterInvalidMsg("replica=[%d] resource group=[%s], resource group num can only be 0, 1 or same as replica number", replicaNumber, strings.Join(resourceGroups, ","))
+	replicaNumInRG, err := ReplicaNumberByResourceGroup(resourceGroups, replicaNumber)
+	if err != nil {
+		return nil, err
 	}
 
-	if streamingutil.IsStreamingServiceEnabled() && checkNodeNum {
+	// A replica needs a streaming query node of its own only when that is
+	// where its delegator goes; under an installed form it goes onto the
+	// replica's regular query nodes, and the regular bound below is the bound.
+	if streamingutil.UseStreamingQueryNodeAsDelegator() && checkNodeNum {
 		streamingNodeCount := snmanager.StaticStreamingNodeManager.GetStreamingQueryNodeIDs().Len()
 		if replicaNumber > int32(streamingNodeCount) {
 			return nil, merr.WrapErrStreamingNodeNotEnough(streamingNodeCount, int(replicaNumber), fmt.Sprintf("when load %d replica count", replicaNumber))
-		}
-	}
-
-	replicaNumInRG := make(map[string]int)
-	if len(resourceGroups) == 0 {
-		// All replicas should be spawned in default resource group.
-		replicaNumInRG[meta.DefaultResourceGroupName] = int(replicaNumber)
-	} else if len(resourceGroups) == 1 {
-		// All replicas should be spawned in the given resource group.
-		replicaNumInRG[resourceGroups[0]] = int(replicaNumber)
-	} else {
-		// replicas should be spawned in different resource groups one by one.
-		for _, rgName := range resourceGroups {
-			replicaNumInRG[rgName] += 1
 		}
 	}
 

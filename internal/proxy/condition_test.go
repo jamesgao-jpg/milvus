@@ -19,11 +19,13 @@ package proxy
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 )
@@ -119,4 +121,66 @@ func TestTaskCondition_Notify(t *testing.T) {
 		assert.NotEqual(t, nil, err)
 	}()
 	wg.Wait()
+}
+
+func TestTaskCondition_OnContextDone(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		condition := NewTaskCondition(context.Background())
+		var calls atomic.Int32
+		condition.SetOnContextDone(func() {
+			calls.Add(1)
+		})
+
+		condition.Notify(nil)
+		assert.NoError(t, condition.WaitToFinish())
+		assert.Zero(t, calls.Load())
+	})
+
+	t.Run("task error", func(t *testing.T) {
+		condition := NewTaskCondition(context.Background())
+		var calls atomic.Int32
+		condition.SetOnContextDone(func() {
+			calls.Add(1)
+		})
+
+		condition.Notify(errors.New("task failed"))
+		assert.Error(t, condition.WaitToFinish())
+		assert.Zero(t, calls.Load())
+	})
+
+	t.Run("context canceled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		condition := NewTaskCondition(ctx)
+		var calls atomic.Int32
+		condition.SetOnContextDone(func() {
+			calls.Add(1)
+		})
+
+		cancel()
+		assert.Error(t, condition.WaitToFinish())
+		assert.Equal(t, int32(1), calls.Load())
+	})
+}
+
+func TestTaskCondition_CompletedResultWinsOverContextDone(t *testing.T) {
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	expiredCtx, stop := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer stop()
+
+	for _, ctx := range []context.Context{canceledCtx, expiredCtx} {
+		for _, result := range []error{nil, errors.New("task failed")} {
+			for range 64 {
+				condition := NewTaskCondition(ctx)
+				canceled := false
+				condition.SetOnContextDone(func() {
+					canceled = true
+				})
+				condition.Notify(result)
+
+				require.Equal(t, result, condition.WaitToFinish(), "context error: %v", ctx.Err())
+				require.False(t, canceled, "completed tasks must not run the cancellation callback")
+			}
+		}
+	}
 }

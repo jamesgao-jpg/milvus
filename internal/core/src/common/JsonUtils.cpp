@@ -6,6 +6,7 @@
 #include <utility>
 #include <cstddef>
 #include <stdexcept>
+#include "common/EasyAssert.h"
 
 namespace milvus {
 
@@ -16,8 +17,9 @@ parse_json_pointer(const std::string& pointer) {
     if (pointer.empty())
         return tokens;  // Root path (entire document)
     if (pointer[0] != '/') {
-        throw std::invalid_argument(
-            "Invalid JSON Pointer: must start with '/'");
+        ThrowInfo(ErrorCode::InvalidParameter,
+                  "{}",
+                  std::string("Invalid JSON Pointer: must start with '/'"));
     }
     size_t start = 1;
     while (start < pointer.size()) {
@@ -77,5 +79,14 @@ path_exists(const simdjson::dom::element& root,
         }
     }
     return true;
+}
+
+bool
+path_exists(const simdjson::simdjson_result<simdjson::dom::element>& root,
+            const std::vector<std::string>& tokens) {
+    if (root.error() != simdjson::SUCCESS) {
+        return false;
+    }
+    return path_exists(root.value_unsafe(), tokens);
 }
 }  // namespace milvus

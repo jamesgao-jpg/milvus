@@ -17,12 +17,11 @@
 package funcutil
 
 import (
+	_ "embed"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"os"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -75,18 +74,18 @@ var rbacAnnotationAllowlist = map[protoreflect.Name]string{
 	"GetClientTelemetry": "root-only telemetry diagnostics",
 	// GetFlushAllState only polls global flush completion by timestamp.
 	"GetFlushAllState": "async global flush status polling",
-	// GetImportState is a v1 compatibility wrapper for import progress polling.
-	"GetImportState": "legacy import status polling",
+	// GetImportState delegates persisted resource authorization to Proxy.GetImportProgress.
+	"GetImportState": "resource authorization in Proxy.GetImportProgress",
 	// GetMetrics is a diagnostics endpoint for system metrics.
 	"GetMetrics": "system metrics diagnostics",
-	// GetPersistentSegmentInfo is a legacy segment diagnostics endpoint.
-	"GetPersistentSegmentInfo": "legacy segment diagnostics",
-	// GetQuerySegmentInfo is a legacy query-segment diagnostics endpoint.
-	"GetQuerySegmentInfo": "legacy query-segment diagnostics",
+	// GetPersistentSegmentInfo explicitly requires collection GetStatistics in Proxy.
+	"GetPersistentSegmentInfo": "explicit collection GetStatistics authorization",
+	// GetQuerySegmentInfo explicitly requires collection GetStatistics in Proxy.
+	"GetQuerySegmentInfo": "explicit collection GetStatistics authorization",
 	// GetRefreshExternalCollectionProgress only polls the state of an external-collection refresh job.
 	"GetRefreshExternalCollectionProgress": "async external-collection refresh status polling",
-	// GetReplicas is a legacy replica-topology diagnostics endpoint.
-	"GetReplicas": "legacy replica diagnostics",
+	// GetReplicas explicitly requires collection GetLoadState, resolving ID-only targets in Proxy.
+	"GetReplicas": "explicit collection GetLoadState authorization",
 	// GetReplicateInfo reports CDC checkpoint metadata for replication recovery.
 	"GetReplicateInfo": "CDC checkpoint diagnostics",
 	// GetRestoreSnapshotState only polls the state of a snapshot restore job.
@@ -97,8 +96,8 @@ var rbacAnnotationAllowlist = map[protoreflect.Name]string{
 	"HasCollection": "collection existence probe",
 	// ListDatabases is result-filtered by rootcoord using the caller roles.
 	"ListDatabases": "result-filtered by caller grants",
-	// ListImportTasks is a v1 compatibility wrapper for import task listing.
-	"ListImportTasks": "legacy import task listing",
+	// ListImportTasks delegates persisted resource filtering to Proxy.ListImports.
+	"ListImportTasks": "resource filtering in Proxy.ListImports",
 	// ListIndexedSegment is an unimplemented feder endpoint that returns service-unavailable.
 	"ListIndexedSegment": "unimplemented feder endpoint",
 	// ListRefreshExternalCollectionJobs lists external-collection refresh jobs, optionally scoped by collection.
@@ -264,17 +263,14 @@ func requireNoRBACAnnotationCoverageErrors(t *testing.T, title string, entries [
 	t.Errorf("%s:\n%s", title, strings.Join(entries, "\n"))
 }
 
+//go:embed rbac_annotation_coverage_test.go
+var rbacAnnotationTestSource string
+
 func requireAllowlistComments(t *testing.T) {
 	t.Helper()
 
-	_, filename, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("failed to locate current test file")
-	}
-	source, err := os.ReadFile(filename)
-	if err != nil {
-		t.Fatalf("failed to read current test file: %v", err)
-	}
+	const filename = "rbac_annotation_coverage_test.go"
+	source := rbacAnnotationTestSource
 
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, filename, source, parser.ParseComments)
@@ -287,7 +283,7 @@ func requireAllowlistComments(t *testing.T) {
 		t.Fatal("rbacAnnotationAllowlist declaration not found")
 	}
 
-	lines := strings.Split(string(source), "\n")
+	lines := strings.Split(source, "\n")
 	var missingComments []string
 	for _, elt := range allowlist.Elts {
 		kv, ok := elt.(*ast.KeyValueExpr)

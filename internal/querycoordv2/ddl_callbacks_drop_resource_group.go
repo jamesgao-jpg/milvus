@@ -21,28 +21,34 @@ import (
 	"fmt"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
-	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/broadcast"
-	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/registry"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 )
 
 func (s *Server) broadcastDropResourceGroup(ctx context.Context, req *milvuspb.DropResourceGroupRequest) (ignored bool, err error) {
-	broadcaster, err := broadcast.StartBroadcastWithResourceKeys(ctx, message.NewExclusiveClusterResourceKey())
+	// Resource groups describe this cluster's own nodes, so the change is applied on
+	// every replicate role and never replicated.
+	broadcaster, err := broadcast.StartUnreplicableBroadcastWithResourceKeys(ctx, message.NewExclusiveClusterResourceKey())
 	if err != nil {
-		if !shouldApplyLocallyOnNonPrimary(err, message.MessageTypeDropResourceGroup) {
-			return false, err
-		}
+		return false, err
 	}
-	if broadcaster != nil {
-		defer broadcaster.Close()
-	}
+	defer broadcaster.Close()
 
-	replicas := s.meta.GetByResourceGroup(ctx, req.GetResourceGroup())
-	if len(replicas) > 0 {
-		err := merr.WrapErrParameterInvalid("empty resource group", fmt.Sprintf("resource group %s has collection %d loaded", req.GetResourceGroup(), replicas[0].GetCollectionID()))
-		return false, merr.Wrapf(err, "some replicas still loaded in resource group[%s], release it first", req.GetResourceGroup())
+	if s.qviewsRuntime != nil {
+		for _, cfg := range s.qviewsRuntime.loadConfigStore.Snapshot().ConfigsMap() {
+			for _, replica := range cfg.Replicas {
+				if replica.ResourceGroup == req.GetResourceGroup() {
+					return false, merr.WrapErrParameterInvalidMsg("resource group %s has collection %d loaded; release it first", req.GetResourceGroup(), cfg.CollectionID)
+				}
+			}
+		}
+	} else {
+		replicas := s.meta.GetByResourceGroup(ctx, req.GetResourceGroup())
+		if len(replicas) > 0 {
+			err := merr.WrapErrParameterInvalid("empty resource group", fmt.Sprintf("resource group %s has collection %d loaded", req.GetResourceGroup(), replicas[0].GetCollectionID()))
+			return false, merr.Wrapf(err, "some replicas still loaded in resource group[%s], release it first", req.GetResourceGroup())
+		}
 	}
 	if ignored, err := s.meta.CheckIfResourceGroupDropable(ctx, req.GetResourceGroup()); err != nil || ignored {
 		return ignored, err
@@ -53,11 +59,9 @@ func (s *Server) broadcastDropResourceGroup(ctx context.Context, req *milvuspb.D
 			ResourceGroupName: req.GetResourceGroup(),
 		}).
 		WithBody(&message.DropResourceGroupMessageBody{}).
-		WithBroadcast([]string{streaming.WAL().ControlChannel()}).
+		WithUnreplicable().
+		WithControlChannelBroadcast().
 		MustBuildBroadcast()
-	if broadcaster == nil {
-		return false, registry.CallMessageAckCallback(ctx, msg, nil)
-	}
 	_, err = broadcaster.Broadcast(ctx, msg)
 	return false, err
 }

@@ -28,10 +28,13 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/proto/streamingpb"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/types"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v3/util/syncutil"
 )
 
 func TestAssignmentService(t *testing.T) {
+	useTestClusterPrefix(t)
+
 	resource.InitForTest()
 
 	mw := mock_streaming.NewMockWALAccesser(t)
@@ -198,6 +201,7 @@ func TestAssignmentService(t *testing.T) {
 }
 
 func TestForcePromoteValidation(t *testing.T) {
+	useTestClusterPrefix(t)
 	t.Run("valid_single_cluster_no_topology", func(t *testing.T) {
 		cfg := &commonpb.ReplicateConfiguration{
 			Clusters: []*commonpb.MilvusCluster{
@@ -250,6 +254,7 @@ func TestForcePromoteValidation(t *testing.T) {
 }
 
 func TestForcePromoteOnPrimaryCluster(t *testing.T) {
+	useTestClusterPrefix(t)
 	resource.InitForTest()
 
 	mw := mock_streaming.NewMockWALAccesser(t)
@@ -293,6 +298,8 @@ func TestForcePromoteOnPrimaryCluster(t *testing.T) {
 }
 
 func TestForcePromoteSuccess(t *testing.T) {
+	useTestClusterPrefix(t)
+
 	resource.InitForTest()
 
 	mw := mock_streaming.NewMockWALAccesser(t)
@@ -330,13 +337,17 @@ func TestForcePromoteSuccess(t *testing.T) {
 	balance.Register(b)
 
 	// Set up broadcaster with WithSecondaryClusterResourceKey (we are secondary)
+	var broadcastMsg message.BroadcastMutableMessage
 	mba := mock_broadcaster.NewMockBroadcastAPI(t)
-	mba.EXPECT().Broadcast(mock.Anything, mock.Anything).Return(&types.BroadcastAppendResult{
-		BroadcastID: 1,
-		AppendResults: map[string]*types.AppendResult{
-			"by-dev-1": {TimeTick: 100},
-		},
-	}, nil).Maybe()
+	mba.EXPECT().Broadcast(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, msg message.BroadcastMutableMessage) (*types.BroadcastAppendResult, error) {
+		broadcastMsg = msg
+		return &types.BroadcastAppendResult{
+			BroadcastID: 1,
+			AppendResults: map[string]*types.AppendResult{
+				"by-dev-1": {TimeTick: 100},
+			},
+		}, nil
+	}).Once()
 	mba.EXPECT().Close().Return().Maybe()
 
 	mb := mock_broadcaster.NewMockBroadcaster(t)
@@ -357,9 +368,17 @@ func TestForcePromoteSuccess(t *testing.T) {
 	})
 	assert.NoError(t, err)
 	assert.NotNil(t, resp)
+
+	// The control-channel copy must be pchannel-level so that the lock interceptor
+	// acquires the global write lock on the pchannel that hosts the control channel.
+	assert.Equal(t, []string{"by-dev-1_vcchan"}, broadcastMsg.BroadcastHeader().VChannels)
+	for _, msg := range broadcastMsg.WithBroadcastID(1).SplitIntoMutableMessage() {
+		assert.True(t, msg.IsPChannelLevel())
+	}
 }
 
 func TestForcePromoteIdempotent(t *testing.T) {
+	useTestClusterPrefix(t)
 	resource.InitForTest()
 
 	mw := mock_streaming.NewMockWALAccesser(t)
@@ -425,6 +444,7 @@ func TestForcePromoteIdempotent(t *testing.T) {
 }
 
 func TestAlterReplicateConfigCallbackForcePromote(t *testing.T) {
+	useTestClusterPrefix(t)
 	resource.InitForTest()
 
 	broadcast.ResetBroadcaster()
@@ -481,6 +501,7 @@ func TestAlterReplicateConfigCallbackForcePromote(t *testing.T) {
 }
 
 func TestAlterReplicateConfigCallbackIgnore(t *testing.T) {
+	useTestClusterPrefix(t)
 	// Test callback with ignore flag set - should skip all processing
 	resource.InitForTest()
 
@@ -529,6 +550,7 @@ func TestAlterReplicateConfigCallbackIgnore(t *testing.T) {
 }
 
 func TestForcePromoteBroadcastOtherError(t *testing.T) {
+	useTestClusterPrefix(t)
 	resource.InitForTest()
 
 	mw := mock_streaming.NewMockWALAccesser(t)
@@ -571,6 +593,7 @@ func TestForcePromoteBroadcastOtherError(t *testing.T) {
 }
 
 func TestForcePromoteBroadcastAppendError(t *testing.T) {
+	useTestClusterPrefix(t)
 	resource.InitForTest()
 
 	mw := mock_streaming.NewMockWALAccesser(t)
@@ -631,6 +654,7 @@ func TestForcePromoteBroadcastAppendError(t *testing.T) {
 }
 
 func TestAlterReplicateConfigCallbackErrors(t *testing.T) {
+	useTestClusterPrefix(t)
 	resource.InitForTest()
 
 	t.Run("update_config_error", func(t *testing.T) {
@@ -677,6 +701,7 @@ func TestAlterReplicateConfigCallbackErrors(t *testing.T) {
 }
 
 func TestUpdateReplicateConfigNonPrimaryBroadcastError(t *testing.T) {
+	useTestClusterPrefix(t)
 	resource.InitForTest()
 
 	mw := mock_streaming.NewMockWALAccesser(t)
@@ -733,6 +758,7 @@ func TestUpdateReplicateConfigNonPrimaryBroadcastError(t *testing.T) {
 }
 
 func TestUpdateReplicateConfigBroadcastError(t *testing.T) {
+	useTestClusterPrefix(t)
 	resource.InitForTest()
 
 	mw := mock_streaming.NewMockWALAccesser(t)
@@ -793,6 +819,7 @@ func TestUpdateReplicateConfigBroadcastError(t *testing.T) {
 }
 
 func TestUpdateReplicateConfigSecondValidateSameConfig(t *testing.T) {
+	useTestClusterPrefix(t)
 	// Tests the path where the second validateReplicateConfiguration returns errReplicateConfigurationSame
 	// (config became same between first check and getting the lock)
 	resource.InitForTest()
@@ -875,6 +902,7 @@ func TestUpdateReplicateConfigSecondValidateSameConfig(t *testing.T) {
 }
 
 func TestAssignmentDiscoverBalanceError(t *testing.T) {
+	useTestClusterPrefix(t)
 	resource.InitForTest()
 
 	broadcast.ResetBroadcaster()
@@ -901,6 +929,7 @@ func TestAssignmentDiscoverBalanceError(t *testing.T) {
 }
 
 func TestUpdateWALBalancePolicyError(t *testing.T) {
+	useTestClusterPrefix(t)
 	resource.InitForTest()
 
 	broadcast.ResetBroadcaster()
@@ -924,6 +953,7 @@ func TestUpdateWALBalancePolicyError(t *testing.T) {
 }
 
 func TestWaitUntilPrimaryChangeBalanceError(t *testing.T) {
+	useTestClusterPrefix(t)
 	// Covers waitUntilPrimaryChangeOrConfigurationSame balance.GetWithContext error (line 123-125)
 	resource.InitForTest()
 
@@ -952,6 +982,7 @@ func TestWaitUntilPrimaryChangeBalanceError(t *testing.T) {
 }
 
 func TestHandleForcePromoteBalanceError(t *testing.T) {
+	useTestClusterPrefix(t)
 	// Covers handleForcePromote balance.GetWithContext error
 	resource.InitForTest()
 
@@ -979,6 +1010,7 @@ func TestHandleForcePromoteBalanceError(t *testing.T) {
 }
 
 func TestHandleForcePromoteGetAssignmentError(t *testing.T) {
+	useTestClusterPrefix(t)
 	// Covers handleForcePromote GetLatestChannelAssignment error
 	resource.InitForTest()
 
@@ -1024,6 +1056,7 @@ func TestHandleForcePromoteGetAssignmentError(t *testing.T) {
 }
 
 func TestHandleForcePromoteSameConfigAfterBroadcasterCheck(t *testing.T) {
+	useTestClusterPrefix(t)
 	// Covers handleForcePromote double-check same config - auto-constructed config matches existing
 	resource.InitForTest()
 
@@ -1092,6 +1125,7 @@ func TestHandleForcePromoteSameConfigAfterBroadcasterCheck(t *testing.T) {
 }
 
 func TestHandleForcePromoteValidatorError(t *testing.T) {
+	useTestClusterPrefix(t)
 	// Covers handleForcePromote validator.Validate() error
 	// The validator may fail if pchannels in cluster view don't match cluster config
 	resource.InitForTest()
@@ -1154,6 +1188,7 @@ func TestHandleForcePromoteValidatorError(t *testing.T) {
 }
 
 func TestHandleForcePromoteNoCurrentConfig(t *testing.T) {
+	useTestClusterPrefix(t)
 	// Covers handleForcePromote when current config is nil
 	resource.InitForTest()
 
@@ -1205,6 +1240,7 @@ func TestHandleForcePromoteNoCurrentConfig(t *testing.T) {
 }
 
 func TestHandleForcePromoteClusterNotFound(t *testing.T) {
+	useTestClusterPrefix(t)
 	// Covers handleForcePromote when current cluster is not found in config
 	resource.InitForTest()
 
@@ -1260,6 +1296,7 @@ func TestHandleForcePromoteClusterNotFound(t *testing.T) {
 }
 
 func TestSecondValidateNonSameError(t *testing.T) {
+	useTestClusterPrefix(t)
 	// Covers line 111: second validateReplicateConfiguration returns non-same error
 	resource.InitForTest()
 
@@ -1330,6 +1367,7 @@ func TestSecondValidateNonSameError(t *testing.T) {
 }
 
 func TestAlterReplicateConfigCallbackBalanceError(t *testing.T) {
+	useTestClusterPrefix(t)
 	// Covers alterReplicateConfiguration balance.GetWithContext error (lines 345-347)
 	resource.InitForTest()
 
@@ -1367,6 +1405,7 @@ func TestAlterReplicateConfigCallbackBalanceError(t *testing.T) {
 }
 
 func TestForcePromoteMultiplePChannels(t *testing.T) {
+	useTestClusterPrefix(t)
 	// Tests force promote with multiple pchannels - auto-constructed config includes all pchannels
 	resource.InitForTest()
 
@@ -1433,4 +1472,13 @@ func TestForcePromoteMultiplePChannels(t *testing.T) {
 	})
 	assert.NoError(t, err)
 	assert.NotNil(t, resp)
+}
+
+// useTestClusterPrefix matches the replication fixtures without depending on the local environment.
+func useTestClusterPrefix(t *testing.T) {
+	t.Helper()
+	paramtable.Init()
+	prefix := &paramtable.Get().CommonCfg.ClusterPrefix
+	oldPrefix := prefix.SwapTempValue("by-dev")
+	t.Cleanup(func() { prefix.SwapTempValue(oldPrefix) })
 }

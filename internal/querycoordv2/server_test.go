@@ -22,7 +22,6 @@ import (
 	"math/rand"
 	"os"
 	"strconv"
-	"sync"
 	"testing"
 	"time"
 
@@ -36,6 +35,8 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/internal/metacache"
+	"github.com/milvus-io/milvus/internal/metacache/metacachetest"
 	coordMocks "github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/querycoordv2/checkers"
 	"github.com/milvus-io/milvus/internal/querycoordv2/dist"
@@ -45,6 +46,8 @@ import (
 	"github.com/milvus-io/milvus/internal/querycoordv2/params"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/task"
+	"github.com/milvus-io/milvus/internal/streamingcoord/server/balancer/channel"
+	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/broadcast"
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/registry"
 	kvfactory "github.com/milvus-io/milvus/internal/util/dependency/kv"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
@@ -52,13 +55,12 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/v3/proto/rootcoordpb"
+	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v3/util"
 	"github.com/milvus-io/milvus/pkg/v3/util/commonpbutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/metricsinfo"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/v3/util/syncutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/tikv"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
@@ -127,6 +129,26 @@ func (suite *ServerSuite) SetupSuite() {
 
 func (suite *ServerSuite) SetupTest() {
 	initStreamingSystem()
+	// Node lifecycle tests do not start StreamingCoord's ChannelManager.
+	channels := mockey.Mock(channel.GetClusterChannels).Return(message.ClusterChannels{}).Build()
+	suite.T().Cleanup(func() { channels.UnPatch() })
+	// These node lifecycle tests have no pending schema ALTER.
+	schemaTarget := mockey.Mock(broadcast.GetPendingSchemaTarget).Return(nil, nil).Build()
+	suite.T().Cleanup(func() { schemaTarget.UnPatch() })
+	provider := newRuntimeDataViewProvider(suite.T())
+	// Keep one allocator across runtime restarts, just as the coordinator's
+	// persisted allocator does. Node lifecycle tests do not run RootCoord RPCs.
+	allocateVersion := params.RandomIncrementIDAllocator()
+	var createRuntime func(context.Context, qviewsRuntimeDependencies) (*qviewsRuntime, error)
+	patch := mockey.Mock(newQViewsRuntime).Origin(&createRuntime).To(func(ctx context.Context, deps qviewsRuntimeDependencies) (*qviewsRuntime, error) {
+		deps.dataViewProvider = provider
+		deps.loadConfigDependencies.AllocateVersion = func(context.Context) (uint64, error) {
+			id, err := allocateVersion()
+			return uint64(id), err
+		}
+		return createRuntime(ctx, deps)
+	}).Build()
+	suite.T().Cleanup(func() { patch.UnPatch() })
 
 	var err error
 	suite.tikvCli = tikv.SetupLocalTxn()
@@ -136,6 +158,13 @@ func (suite *ServerSuite) SetupTest() {
 	suite.hackServer()
 	err = suite.server.Start()
 	suite.NoError(err)
+
+	// DDL callbacks are registered by mixCoord.enableExternalAccess in
+	// production, which the unit test ServerSuite bypasses; register them here
+	// so LoadCollection/alter-load-config broadcasts can find their ack
+	// callbacks (same as ServiceSuite.SetupTest).
+	registry.ResetRegistration()
+	RegisterDDLCallbacks(suite.server)
 
 	for i := range suite.nodes {
 		suite.nodes[i] = mocks.NewMockQueryNode(suite.T(), suite.server.etcdCli, int64(i))
@@ -149,8 +178,7 @@ func (suite *ServerSuite) SetupTest() {
 
 	suite.loadAll()
 	for _, collection := range suite.collections {
-		suite.True(suite.server.meta.Exist(suite.ctx, collection))
-		suite.updateCollectionStatus(collection, querypb.LoadStatus_Loaded)
+		suite.True(suite.server.qviewsRuntime.loadConfigStore.Contains(collection))
 	}
 }
 
@@ -180,7 +208,7 @@ func (suite *ServerSuite) TestRecover() {
 	suite.NoError(err)
 
 	for _, collection := range suite.collections {
-		suite.True(suite.server.meta.Exist(suite.ctx, collection))
+		suite.True(suite.server.qviewsRuntime.loadConfigStore.Contains(collection))
 	}
 
 	suite.True(suite.server.nodeMgr.IsStoppingNode(suite.nodes[0].ID))
@@ -188,7 +216,7 @@ func (suite *ServerSuite) TestRecover() {
 
 func (suite *ServerSuite) TestNodeUp() {
 	node1 := mocks.NewMockQueryNode(suite.T(), suite.server.etcdCli, 100)
-	node1.EXPECT().GetDataDistribution(mock.Anything, mock.Anything).Return(&querypb.GetDataDistributionResponse{Status: merr.Success()}, nil)
+	node1.EXPECT().GetDataDistribution(mock.Anything, mock.Anything).Return(&querypb.GetDataDistributionResponse{Status: merr.Success()}, nil).Maybe()
 	err := node1.Start()
 	suite.NoError(err)
 	defer node1.Stop()
@@ -198,13 +226,9 @@ func (suite *ServerSuite) TestNodeUp() {
 		if node == nil {
 			return false
 		}
-		for _, collection := range suite.collections {
-			replica := suite.server.meta.GetByCollectionAndNode(suite.ctx, collection, node1.ID)
-			if replica == nil {
-				return false
-			}
-		}
-		return true
+		// QueryView placement uses the published node cache, not legacy
+		// per-collection replica membership.
+		return suite.server.qviewsRuntime.balanceCache.GetNode(node1.ID) != nil
 	}, 5*time.Second, time.Second)
 }
 
@@ -228,13 +252,7 @@ func (suite *ServerSuite) TestNodeDown() {
 		if node != nil {
 			return false
 		}
-		for _, collection := range suite.collections {
-			replica := suite.server.meta.GetByCollectionAndNode(suite.ctx, collection, downNode.ID)
-			if replica != nil {
-				return false
-			}
-		}
-		return true
+		return suite.server.qviewsRuntime.balanceCache.GetNode(downNode.ID) == nil
 	}, 5*time.Second, time.Second)
 }
 
@@ -323,287 +341,6 @@ func (suite *ServerSuite) TestStop() {
 	suite.server.Stop()
 }
 
-func (suite *ServerSuite) TestUpdateAutoBalanceConfigLoop() {
-	suite.server.Stop()
-
-	Params.Save(Params.QueryCoordCfg.CheckAutoBalanceConfigInterval.Key, "1")
-	defer Params.Reset(Params.QueryCoordCfg.CheckAutoBalanceConfigInterval.Key)
-
-	suite.Run("test old node exist", func() {
-		Params.Save(Params.QueryCoordCfg.AutoBalance.Key, "false")
-		defer Params.Reset(Params.QueryCoordCfg.AutoBalance.Key)
-		server := &Server{}
-		mockSession := sessionutil.NewMockSession(suite.T())
-		server.session = mockSession
-
-		oldSessions := make(map[string]*sessionutil.Session)
-		oldSessions["s1"] = sessionutil.NewSession(context.Background())
-		mockSession.EXPECT().GetSessionsWithVersionRange(mock.Anything, mock.Anything).Return(oldSessions, 0, nil).Maybe()
-
-		ctx, cancel := context.WithCancel(context.Background())
-		wg := &sync.WaitGroup{}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			time.Sleep(1500 * time.Millisecond)
-			server.updateBalanceConfigLoop(ctx)
-		}()
-		// old query node exist, disable auto balance
-		suite.Eventually(func() bool {
-			return !Params.QueryCoordCfg.AutoBalance.GetAsBool()
-		}, 5*time.Second, 1*time.Second)
-
-		cancel()
-		wg.Wait()
-	})
-
-	suite.Run("all old node down", func() {
-		Params.Save(Params.QueryCoordCfg.AutoBalance.Key, "false")
-		defer Params.Reset(Params.QueryCoordCfg.AutoBalance.Key)
-		server := &Server{}
-		mockSession := sessionutil.NewMockSession(suite.T())
-		server.session = mockSession
-		mockSession.EXPECT().GetSessionsWithVersionRange(mock.Anything, mock.Anything).Return(nil, 0, nil).Maybe()
-
-		ctx, cancel := context.WithCancel(context.Background())
-		wg := &sync.WaitGroup{}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			time.Sleep(1500 * time.Millisecond)
-			server.updateBalanceConfigLoop(ctx)
-		}()
-		// all old query node down, enable auto balance
-		suite.Eventually(func() bool {
-			return Params.QueryCoordCfg.AutoBalance.GetAsBool()
-		}, 5*time.Second, 1*time.Second)
-
-		cancel()
-		wg.Wait()
-	})
-}
-
-func TestApplyLoadConfigChanges(t *testing.T) {
-	mockey.PatchConvey("TestApplyLoadConfigChanges", t, func() {
-		ctx := context.Background()
-
-		// Create mock server
-		testServer := &Server{}
-		testServer.meta = &meta.Meta{}
-		testServer.ctx = ctx
-
-		// Create mock collection with IsUserSpecifiedReplicaMode = false
-		mockCollection1 := &meta.Collection{
-			CollectionLoadInfo: &querypb.CollectionLoadInfo{
-				CollectionID:             1001,
-				UserSpecifiedReplicaMode: false,
-			},
-		}
-
-		// Create mock collection with IsUserSpecifiedReplicaMode = true
-		mockCollection2 := &meta.Collection{
-			CollectionLoadInfo: &querypb.CollectionLoadInfo{
-				CollectionID:             1002,
-				UserSpecifiedReplicaMode: true,
-			},
-		}
-
-		// Mock meta.CollectionManager.GetAll to return collection IDs
-		mockey.Mock((*meta.CollectionManager).GetAll).Return([]int64{1001, 1002}).Build()
-
-		// Mock meta.CollectionManager.GetCollection to return different collections
-		mockey.Mock((*meta.CollectionManager).GetCollection).To(func(m *meta.CollectionManager, ctx context.Context, collectionID int64) *meta.Collection {
-			switch collectionID {
-			case 1001:
-				return mockCollection1
-			case 1002:
-				return mockCollection2
-			}
-			return nil
-		}).Build()
-
-		// Mock paramtable.ParamItem.GetAsUint32() for ClusterLevelLoadReplicaNumber
-		mockey.Mock((*paramtable.ParamItem).GetAsInt32).Return(int32(2)).Build()
-
-		// Mock paramtable.ParamItem.GetAsStrings() for ClusterLevelLoadResourceGroups
-		mockey.Mock((*paramtable.ParamItem).GetAsStrings).Return([]string{"default", "rg1"}).Build()
-
-		// Mock force override config disabled by default.
-		mockey.Mock((*paramtable.ParamItem).GetAsBool).Return(false).Build()
-
-		// Mock UpdateLoadConfig to capture the call
-		var updateLoadConfigCalled bool
-		var capturedCollectionIDs []int64
-		var capturedReplicaNum int32
-		var capturedRGs []string
-		mockey.Mock((*Server).updateLoadConfig).To(func(s *Server, ctx context.Context, collectionIDs []int64, newReplicaNum int32, newRGs []string, needWaitRGReady ...bool) error {
-			updateLoadConfigCalled = true
-			capturedCollectionIDs = collectionIDs
-			capturedReplicaNum = newReplicaNum
-			capturedRGs = newRGs
-			return nil
-		}).Build()
-
-		// Call applyLoadConfigChanges
-		watcher := &LoadConfigWatcher{
-			s:         testServer,
-			notifier:  syncutil.NewAsyncTaskNotifier[struct{}](),
-			triggerCh: make(chan struct{}, 10),
-		}
-		watcher.applyLoadConfigChanges()
-
-		// Verify UpdateLoadConfig was called
-		assert.True(t, updateLoadConfigCalled, "UpdateLoadConfig should be called")
-
-		// Verify that only collections with IsUserSpecifiedReplicaMode = false are included
-		assert.Equal(t, []int64{1001}, capturedCollectionIDs, "Only collections with IsUserSpecifiedReplicaMode = false should be included")
-		assert.Equal(t, int32(2), capturedReplicaNum, "ReplicaNumber should match cluster level config")
-		assert.Equal(t, []string{"default", "rg1"}, capturedRGs, "ResourceGroups should match cluster level config")
-
-		watcher = NewLoadConfigWatcher(testServer)
-		watcher.Trigger()
-		time.Sleep(1 * time.Second)
-		watcher.Close()
-	})
-}
-
-func TestApplyLoadConfigChangesForceOverrideUserSpecifiedReplicaMode(t *testing.T) {
-	mockey.PatchConvey("TestApplyLoadConfigChangesForceOverrideUserSpecifiedReplicaMode", t, func() {
-		ctx := context.Background()
-
-		testServer := &Server{}
-		testServer.meta = &meta.Meta{}
-		testServer.ctx = ctx
-
-		mockCollection1 := &meta.Collection{
-			CollectionLoadInfo: &querypb.CollectionLoadInfo{
-				CollectionID:             1001,
-				UserSpecifiedReplicaMode: false,
-			},
-		}
-		mockCollection2 := &meta.Collection{
-			CollectionLoadInfo: &querypb.CollectionLoadInfo{
-				CollectionID:             1002,
-				UserSpecifiedReplicaMode: true,
-			},
-		}
-
-		mockey.Mock((*meta.CollectionManager).GetAll).Return([]int64{1001, 1002}).Build()
-		mockey.Mock((*meta.CollectionManager).GetCollection).To(func(m *meta.CollectionManager, ctx context.Context, collectionID int64) *meta.Collection {
-			switch collectionID {
-			case 1001:
-				return mockCollection1
-			case 1002:
-				return mockCollection2
-			}
-			return nil
-		}).Build()
-		mockey.Mock((*paramtable.ParamItem).GetAsInt32).Return(int32(2)).Build()
-		mockey.Mock((*paramtable.ParamItem).GetAsStrings).Return([]string{"default", "rg1"}).Build()
-		mockey.Mock((*paramtable.ParamItem).GetAsBool).Return(true).Build()
-
-		var capturedCollectionIDs []int64
-		mockey.Mock((*Server).updateLoadConfig).To(func(s *Server, ctx context.Context, collectionIDs []int64, newReplicaNum int32, newRGs []string, needWaitRGReady ...bool) error {
-			capturedCollectionIDs = collectionIDs
-			return nil
-		}).Build()
-
-		watcher := &LoadConfigWatcher{
-			s:         testServer,
-			notifier:  syncutil.NewAsyncTaskNotifier[struct{}](),
-			triggerCh: make(chan struct{}, 10),
-		}
-		watcher.applyLoadConfigChanges()
-
-		assert.Equal(t, []int64{1001, 1002}, capturedCollectionIDs, "Force override should include user-specified replica mode collections")
-	})
-}
-
-func TestApplyLoadConfigChangesSkipsReleasedCollection(t *testing.T) {
-	mockey.PatchConvey("TestApplyLoadConfigChangesSkipsReleasedCollection", t, func() {
-		ctx := context.Background()
-
-		testServer := &Server{}
-		testServer.meta = &meta.Meta{}
-		testServer.ctx = ctx
-
-		mockCollection := &meta.Collection{
-			CollectionLoadInfo: &querypb.CollectionLoadInfo{
-				CollectionID:             1001,
-				UserSpecifiedReplicaMode: false,
-			},
-		}
-
-		mockey.Mock((*meta.CollectionManager).GetAll).Return([]int64{1001, 1002}).Build()
-		mockey.Mock((*meta.CollectionManager).GetCollection).To(func(m *meta.CollectionManager, ctx context.Context, collectionID int64) *meta.Collection {
-			if collectionID == 1001 {
-				return mockCollection
-			}
-			return nil
-		}).Build()
-		mockey.Mock((*paramtable.ParamItem).GetAsInt32).Return(int32(2)).Build()
-		mockey.Mock((*paramtable.ParamItem).GetAsStrings).Return([]string{"default", "rg1"}).Build()
-		mockey.Mock((*paramtable.ParamItem).GetAsBool).Return(false).Build()
-
-		var capturedCollectionIDs []int64
-		mockey.Mock((*Server).updateLoadConfig).To(func(s *Server, ctx context.Context, collectionIDs []int64, newReplicaNum int32, newRGs []string, needWaitRGReady ...bool) error {
-			capturedCollectionIDs = collectionIDs
-			return nil
-		}).Build()
-
-		watcher := &LoadConfigWatcher{
-			s:         testServer,
-			notifier:  syncutil.NewAsyncTaskNotifier[struct{}](),
-			triggerCh: make(chan struct{}, 10),
-		}
-		watcher.applyLoadConfigChanges()
-
-		assert.Equal(t, []int64{1001}, capturedCollectionIDs)
-	})
-}
-
-func TestApplyLoadConfigChangesWhenForceOverrideConfigChanges(t *testing.T) {
-	mockey.PatchConvey("TestApplyLoadConfigChangesWhenForceOverrideConfigChanges", t, func() {
-		ctx := context.Background()
-
-		testServer := &Server{}
-		testServer.meta = &meta.Meta{}
-		testServer.ctx = ctx
-
-		mockCollection := &meta.Collection{
-			CollectionLoadInfo: &querypb.CollectionLoadInfo{
-				CollectionID:             1002,
-				UserSpecifiedReplicaMode: true,
-			},
-		}
-
-		mockey.Mock((*meta.CollectionManager).GetAll).Return([]int64{1002}).Build()
-		mockey.Mock((*meta.CollectionManager).GetCollection).Return(mockCollection).Build()
-		mockey.Mock((*paramtable.ParamItem).GetAsInt32).Return(int32(2)).Build()
-		mockey.Mock((*paramtable.ParamItem).GetAsStrings).Return([]string{"default", "rg1"}).Build()
-		mockey.Mock((*paramtable.ParamItem).GetAsBool).Return(true).Build()
-
-		var updateLoadConfigCalled bool
-		mockey.Mock((*Server).updateLoadConfig).To(func(s *Server, ctx context.Context, collectionIDs []int64, newReplicaNum int32, newRGs []string, needWaitRGReady ...bool) error {
-			updateLoadConfigCalled = true
-			assert.Equal(t, []int64{1002}, collectionIDs)
-			return nil
-		}).Build()
-
-		watcher := &LoadConfigWatcher{
-			s:                                    testServer,
-			notifier:                             syncutil.NewAsyncTaskNotifier[struct{}](),
-			triggerCh:                            make(chan struct{}, 10),
-			previousReplicaNum:                   2,
-			previousRGs:                          []string{"default", "rg1"},
-			previousForceOverrideUserReplicaMode: false,
-		}
-		watcher.applyLoadConfigChanges()
-
-		assert.True(t, updateLoadConfigCalled, "force override config change should trigger load config update even when replica/RG config is unchanged")
-	})
-}
-
 func (suite *ServerSuite) waitNodeUp(node *mocks.MockQueryNode, timeout time.Duration) bool {
 	start := time.Now()
 	for time.Since(start) < timeout {
@@ -662,7 +399,10 @@ func (suite *ServerSuite) expectGetRecoverInfo(collection int64) {
 			})
 		}
 	}
+	suite.broker.EXPECT().GetRecoveryInfoV2(mock.Anything, collection, mock.Anything).Maybe().Return(vChannels, segmentInfos, nil)
+	suite.broker.EXPECT().GetRecoveryInfoV2(mock.Anything, collection, mock.Anything, mock.Anything).Maybe().Return(vChannels, segmentInfos, nil)
 	suite.broker.EXPECT().GetRecoveryInfoV2(mock.Anything, collection).Maybe().Return(vChannels, segmentInfos, nil)
+	suite.broker.EXPECT().GetIndexInfo(mock.Anything, collection, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Maybe().Return(map[int64][]*querypb.FieldIndexInfo{}, nil)
 }
 
 func (suite *ServerSuite) expectLoadAndReleasePartitions(querynode *mocks.MockQueryNode) {
@@ -734,7 +474,7 @@ func (suite *ServerSuite) updateCollectionStatus(collectionID int64, status quer
 func (suite *ServerSuite) hackServer() {
 	suite.broker = meta.NewMockBroker(suite.T())
 	suite.server.broker = suite.broker
-	suite.server.targetMgr = meta.NewTargetManager(suite.broker, suite.server.meta)
+	suite.server.targetMgr = meta.NewTargetManager(suite.broker, suite.server.meta, metacache.NewMetaStore(nil))
 	suite.server.taskScheduler = task.NewScheduler(
 		suite.server.ctx,
 		suite.server.meta,
@@ -779,15 +519,13 @@ func (suite *ServerSuite) hackServer() {
 	)
 
 	suite.broker.EXPECT().ListIndexes(mock.Anything, mock.Anything).Return(nil, nil).Maybe()
-	suite.broker.EXPECT().DescribeDatabase(mock.Anything, mock.Anything).Return(&rootcoordpb.DescribeDatabaseResponse{}, nil).Maybe()
 	for _, collection := range suite.collections {
-		suite.broker.EXPECT().GetPartitions(mock.Anything, collection).Return(suite.partitions[collection], nil).Maybe()
 		suite.broker.EXPECT().DescribeCollection(mock.Anything, collection).Return(&milvuspb.DescribeCollectionResponse{
 			DbName:         util.DefaultDBName,
 			DbId:           1,
 			CollectionID:   collection,
 			CollectionName: "collection_" + strconv.FormatInt(collection, 10),
-			Schema:         &schemapb.CollectionSchema{},
+			Schema:         &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{{FieldID: 100}, {FieldID: 101}, {FieldID: 102}}},
 		}, nil).Maybe()
 		suite.expectGetRecoverInfo(collection)
 	}
@@ -806,7 +544,7 @@ func (suite *ServerSuite) hackBroker(server *Server) {
 	for _, collection := range suite.collections {
 		mockRootCoord.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
 			Status: merr.Success(),
-			Schema: &schemapb.CollectionSchema{},
+			Schema: &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{{FieldID: 100}, {FieldID: 101}, {FieldID: 102}}},
 		}, nil).Maybe()
 		req := &milvuspb.ShowPartitionsRequest{
 			Base: commonpbutil.NewMsgBase(
@@ -822,6 +560,26 @@ func (suite *ServerSuite) hackBroker(server *Server) {
 	server.SetMixCoord(mockRootCoord)
 }
 
+// newMetaView returns a MetaStore whose collection view holds the suite's
+// collections, as RootCoord would publish them.
+func (suite *ServerSuite) newMetaView() metacache.MetaStore {
+	store := metacache.NewMetaStore(nil)
+	metacachetest.Collections(store).PutDatabase(&metacache.DatabaseInfo{ID: 1, Name: util.DefaultDBName})
+	for _, collection := range suite.collections {
+		store.PutCollection(&metacache.CollectionInfo{
+			ID:           collection,
+			DatabaseName: util.DefaultDBName,
+			DatabaseID:   1,
+			Partitions:   suite.partitions[collection],
+			Schema: &schemapb.CollectionSchema{
+				Name:   "collection_" + strconv.FormatInt(collection, 10),
+				Fields: []*schemapb.FieldSchema{{FieldID: 100}, {FieldID: 101}, {FieldID: 102}},
+			},
+		})
+	}
+	return store
+}
+
 func (suite *ServerSuite) newQueryCoord() (*Server, error) {
 	server, err := NewQueryCoord(context.Background())
 	if err != nil {
@@ -832,6 +590,7 @@ func (suite *ServerSuite) newQueryCoord() (*Server, error) {
 	server.SetTiKVClient(suite.tikvCli)
 
 	server.SetQueryNodeCreator(session.DefaultQueryNodeCreator)
+	server.SetMetaView(suite.newMetaView())
 	suite.hackBroker(server)
 	registry.ResetRegistration()
 	err = server.Init()
@@ -1063,6 +822,13 @@ func createSimpleTestServer() *Server {
 	return server
 }
 
+func TestInitMetaRequiresMetaView(t *testing.T) {
+	server := createSimpleTestServer()
+	err := server.initMeta()
+	assert.ErrorIs(t, err, merr.ErrServiceInternal)
+	assert.Nil(t, server.meta)
+}
+
 // Helper function to create a test session
 func createTestSession(nodeID int64, address string, stopping bool) *sessionutil.Session {
 	session := &sessionutil.Session{
@@ -1099,7 +865,7 @@ func TestGetLeakedResourcesByCollection(t *testing.T) {
 	}
 	newServer := func() *Server {
 		return &Server{
-			meta: meta.NewMeta(idAllocator(), nil, session.NewNodeManager()),
+			meta: meta.NewMeta(idAllocator(), nil, session.NewNodeManager(), metacache.NewMetaStore(nil)),
 			dist: meta.NewDistributionManager(session.NewNodeManager()),
 		}
 	}
@@ -1192,7 +958,7 @@ func TestCheckAllReplicasServiceable(t *testing.T) {
 		nodeMgr := session.NewNodeManager()
 		targetMgr := meta.NewMockTargetManager(t)
 		return &Server{
-			meta:      meta.NewMeta(idAllocator(), nil, nodeMgr),
+			meta:      meta.NewMeta(idAllocator(), nil, nodeMgr, metacache.NewMetaStore(nil)),
 			dist:      meta.NewDistributionManager(nodeMgr),
 			nodeMgr:   nodeMgr,
 			targetMgr: targetMgr,
@@ -1241,7 +1007,8 @@ func TestCheckAllReplicasServiceable(t *testing.T) {
 		// Segment exists in target but not in leader's view -> CheckDelegatorDataReady fails
 		s.targetMgr.(*meta.MockTargetManager).EXPECT().GetSealedSegmentsByChannel(mock.Anything, collectionID, channelName, meta.CurrentTarget).Return(map[int64]*datapb.SegmentInfo{
 			42: {ID: 42, CollectionID: collectionID},
-		})
+		}).Maybe()
+		s.targetMgr.(*meta.MockTargetManager).EXPECT().GetSealedSegmentIDsByChannel(mock.Anything, collectionID, channelName, meta.CurrentTarget).Return(typeutil.NewUniqueSet(42))
 
 		s.dist.ChannelDistManager.Update(10, &meta.DmChannel{
 			VchannelInfo: &datapb.VchannelInfo{CollectionID: collectionID, ChannelName: channelName},
@@ -1268,7 +1035,8 @@ func TestCheckAllReplicasServiceable(t *testing.T) {
 		})
 		s.targetMgr.(*meta.MockTargetManager).EXPECT().GetSealedSegmentsByChannel(mock.Anything, collectionID, channelName, meta.CurrentTarget).Return(map[int64]*datapb.SegmentInfo{
 			42: {ID: 42, CollectionID: collectionID},
-		})
+		}).Maybe()
+		s.targetMgr.(*meta.MockTargetManager).EXPECT().GetSealedSegmentIDsByChannel(mock.Anything, collectionID, channelName, meta.CurrentTarget).Return(typeutil.NewUniqueSet(42))
 
 		s.dist.ChannelDistManager.Update(10, &meta.DmChannel{
 			VchannelInfo: &datapb.VchannelInfo{CollectionID: collectionID, ChannelName: channelName},
@@ -1295,7 +1063,8 @@ func TestCheckAllReplicasServiceable(t *testing.T) {
 		})
 		s.targetMgr.(*meta.MockTargetManager).EXPECT().GetSealedSegmentsByChannel(mock.Anything, collectionID, channelName, meta.CurrentTarget).Return(map[int64]*datapb.SegmentInfo{
 			42: {ID: 42, CollectionID: collectionID},
-		})
+		}).Maybe()
+		s.targetMgr.(*meta.MockTargetManager).EXPECT().GetSealedSegmentIDsByChannel(mock.Anything, collectionID, channelName, meta.CurrentTarget).Return(typeutil.NewUniqueSet(42))
 
 		s.dist.ChannelDistManager.Update(10, &meta.DmChannel{
 			VchannelInfo: &datapb.VchannelInfo{CollectionID: collectionID, ChannelName: channelName},
@@ -1319,7 +1088,8 @@ func TestCheckAllReplicasServiceable(t *testing.T) {
 		s.targetMgr.(*meta.MockTargetManager).EXPECT().GetDmChannelsByCollection(mock.Anything, collectionID, meta.CurrentTarget).Return(map[string]*meta.DmChannel{
 			channelName: {VchannelInfo: &datapb.VchannelInfo{CollectionID: collectionID, ChannelName: channelName}},
 		})
-		s.targetMgr.(*meta.MockTargetManager).EXPECT().GetSealedSegmentsByChannel(mock.Anything, collectionID, channelName, meta.CurrentTarget).Return(map[int64]*datapb.SegmentInfo{})
+		s.targetMgr.(*meta.MockTargetManager).EXPECT().GetSealedSegmentsByChannel(mock.Anything, collectionID, channelName, meta.CurrentTarget).Return(map[int64]*datapb.SegmentInfo{}).Maybe()
+		s.targetMgr.(*meta.MockTargetManager).EXPECT().GetSealedSegmentIDsByChannel(mock.Anything, collectionID, channelName, meta.CurrentTarget).Return(typeutil.NewUniqueSet())
 
 		s.dist.ChannelDistManager.Update(10, &meta.DmChannel{
 			VchannelInfo: &datapb.VchannelInfo{CollectionID: collectionID, ChannelName: channelName},
@@ -1334,5 +1104,185 @@ func TestCheckAllReplicasServiceable(t *testing.T) {
 
 		err := s.CheckAllReplicasServiceable(context.Background(), collectionID)
 		assert.NoError(t, err)
+	})
+}
+
+func TestGetLeakedResourcesByCollectionPerRG(t *testing.T) {
+	const collectionID int64 = 100
+
+	// Replica in meta holds nodes {10, 11}. Any segment/channel on a different node is leaked.
+	replica := meta.NewReplica(&querypb.Replica{
+		ID:           1,
+		CollectionID: collectionID,
+		Nodes:        []int64{10, 11},
+	}, typeutil.NewUniqueSet(10, 11))
+
+	idAllocator := func() func() (int64, error) {
+		var id int64
+		return func() (int64, error) {
+			id++
+			return id, nil
+		}
+	}
+	newServer := func() *Server {
+		nodeMgr := session.NewNodeManager()
+		return &Server{
+			meta:    meta.NewMeta(idAllocator(), nil, nodeMgr, metacache.NewMetaStore(nil)),
+			dist:    meta.NewDistributionManager(nodeMgr),
+			nodeMgr: nodeMgr,
+		}
+	}
+
+	t.Run("no leaked resources returns empty map", func(t *testing.T) {
+		s := newServer()
+		mocker := mockey.Mock((*meta.ReplicaManager).GetByCollection).Return([]*meta.Replica{replica}).Build()
+		defer mocker.UnPatch()
+
+		leaked := s.GetLeakedResourcesByCollectionPerRG(context.Background(), collectionID, nil)
+		assert.Empty(t, leaked)
+	})
+
+	t.Run("leaked resources attributed to the resource group of the holding node", func(t *testing.T) {
+		s := newServer()
+		mocker := mockey.Mock((*meta.ReplicaManager).GetByCollection).Return([]*meta.Replica{replica}).Build()
+		defer mocker.UnPatch()
+		// Authoritative mapping: leaked node 99 belongs to rg2, node 98 belongs to rg3.
+		mockerRG := mockey.Mock((*meta.ResourceManager).GetResourceGroupByNodeID).To(func(_ *meta.ResourceManager, nodeID int64) string {
+			switch nodeID {
+			case 99:
+				return "rg2"
+			case 98:
+				return "rg3"
+			}
+			return ""
+		}).Build()
+		defer mockerRG.UnPatch()
+
+		// Node 10 is in replica -> not leaked. Nodes 99 (rg2, 2 segments) and 98 (rg3, 1 channel) are leaked.
+		s.dist.SegmentDistManager.Update(10, meta.SegmentFromInfo(&datapb.SegmentInfo{ID: 1, CollectionID: collectionID}))
+		s.dist.SegmentDistManager.Update(99, meta.SegmentFromInfo(&datapb.SegmentInfo{ID: 2, CollectionID: collectionID}),
+			meta.SegmentFromInfo(&datapb.SegmentInfo{ID: 3, CollectionID: collectionID}))
+		s.dist.ChannelDistManager.Update(98, meta.DmChannelFromVChannel(&datapb.VchannelInfo{CollectionID: collectionID, ChannelName: "c1"}))
+
+		// ResourceManager remains authoritative when both mappings contain a node.
+		leaked := s.GetLeakedResourcesByCollectionPerRG(context.Background(), collectionID, map[int64]string{99: "other", 98: "other"})
+		assert.Equal(t, map[string]int{"rg2": 2, "rg3": 1}, leaked)
+	})
+
+	t.Run("leaked node in no resource group attributed to empty group", func(t *testing.T) {
+		s := newServer()
+		mocker := mockey.Mock((*meta.ReplicaManager).GetByCollection).Return([]*meta.Replica{replica}).Build()
+		defer mocker.UnPatch()
+		mockerRG := mockey.Mock((*meta.ResourceManager).GetResourceGroupByNodeID).Return("").Build()
+		defer mockerRG.UnPatch()
+
+		s.dist.SegmentDistManager.Update(99, meta.SegmentFromInfo(&datapb.SegmentInfo{ID: 1, CollectionID: collectionID}))
+
+		leaked := s.GetLeakedResourcesByCollectionPerRG(context.Background(), collectionID, nil)
+		assert.Equal(t, map[string]int{"": 1}, leaked)
+	})
+
+	t.Run("embedded query node residual uses streaming node RG until released", func(t *testing.T) {
+		ctx := context.Background()
+		s := newServer()
+		mocker := mockey.Mock((*meta.ReplicaManager).GetByCollection).Return([]*meta.Replica{replica}).Build()
+		defer mocker.UnPatch()
+		// Use the real ResourceManager: embedded QueryNodes never enter its RG map.
+		// Role-specific QueryNode labels need not match the StreamingNode's RG.
+		s.nodeMgr.Add(session.NewNodeInfo(session.ImmutableNodeInfo{
+			NodeID: 98,
+			Labels: map[string]string{
+				sessionutil.LabelStreamingNodeEmbeddedQueryNode: "1",
+				sessionutil.LabelResourceGroup:                  "querynode-label",
+			},
+		}))
+		s.meta.HandleNodeUp(ctx, 98)
+		assert.Empty(t, s.meta.GetResourceGroupByNodeID(98))
+		s.dist.ChannelDistManager.Update(98, meta.DmChannelFromVChannel(&datapb.VchannelInfo{CollectionID: collectionID, ChannelName: "c1"}))
+
+		assert.Equal(t, map[string]int{"B": 1}, s.GetLeakedResourcesByCollectionPerRG(ctx, collectionID, map[int64]string{98: "B"}))
+		assert.Equal(t, map[string]int{meta.DefaultResourceGroupName: 1}, s.GetLeakedResourcesByCollectionPerRG(ctx, collectionID, map[int64]string{98: meta.DefaultResourceGroupName}))
+		assert.Equal(t, map[string]int{"": 1}, s.GetLeakedResourcesByCollectionPerRG(ctx, collectionID, nil))
+
+		s.dist.ChannelDistManager.Update(98)
+		assert.Empty(t, s.GetLeakedResourcesByCollectionPerRG(ctx, collectionID, map[int64]string{98: "B"}))
+	})
+}
+
+func TestCheckReplicasServiceable(t *testing.T) {
+	const collectionID int64 = 100
+	const channelName = "test-channel-1"
+
+	idAllocator := func() func() (int64, error) {
+		var id int64
+		return func() (int64, error) {
+			id++
+			return id, nil
+		}
+	}
+	newServer := func() *Server {
+		nodeMgr := session.NewNodeManager()
+		targetMgr := meta.NewMockTargetManager(t)
+		return &Server{
+			meta:      meta.NewMeta(idAllocator(), nil, nodeMgr, metacache.NewMetaStore(nil)),
+			dist:      meta.NewDistributionManager(nodeMgr),
+			nodeMgr:   nodeMgr,
+			targetMgr: targetMgr,
+		}
+	}
+
+	t.Run("no replicas returns empty map", func(t *testing.T) {
+		s := newServer()
+		mocker := mockey.Mock((*meta.ReplicaManager).GetByCollection).Return([]*meta.Replica{}).Build()
+		defer mocker.UnPatch()
+
+		errs := s.CheckReplicasServiceable(context.Background(), collectionID)
+		assert.Empty(t, errs)
+	})
+
+	t.Run("collects errors for every unserviceable replica without failing fast", func(t *testing.T) {
+		s := newServer()
+		// Two replicas, each missing a shard leader for the channel -> both unserviceable.
+		replicas := []*meta.Replica{
+			meta.NewReplica(&querypb.Replica{ID: 1, CollectionID: collectionID, ResourceGroup: "rg1", Nodes: []int64{10, 11}}, typeutil.NewUniqueSet(10, 11)),
+			meta.NewReplica(&querypb.Replica{ID: 2, CollectionID: collectionID, ResourceGroup: "rg2", Nodes: []int64{20, 21}}, typeutil.NewUniqueSet(20, 21)),
+		}
+		mocker := mockey.Mock((*meta.ReplicaManager).GetByCollection).Return(replicas).Build()
+		defer mocker.UnPatch()
+		s.targetMgr.(*meta.MockTargetManager).EXPECT().GetDmChannelsByCollection(mock.Anything, collectionID, meta.CurrentTarget).Return(map[string]*meta.DmChannel{
+			channelName: {VchannelInfo: &datapb.VchannelInfo{CollectionID: collectionID, ChannelName: channelName}},
+		})
+
+		errs := s.CheckReplicasServiceable(context.Background(), collectionID)
+		// Both replicas reported, keyed by replica ID (not just the first failure).
+		assert.Len(t, errs, 2)
+		assert.ErrorContains(t, errs[1], "no leader for channel")
+		assert.ErrorContains(t, errs[2], "no leader for channel")
+	})
+
+	t.Run("serviceable replica is absent from the map", func(t *testing.T) {
+		s := newServer()
+		replica := meta.NewReplica(&querypb.Replica{ID: 1, CollectionID: collectionID, ResourceGroup: "rg1", Nodes: []int64{10, 11}}, typeutil.NewUniqueSet(10, 11))
+		mocker := mockey.Mock((*meta.ReplicaManager).GetByCollection).Return([]*meta.Replica{replica}).Build()
+		defer mocker.UnPatch()
+		s.nodeMgr.Add(session.NewNodeInfo(session.ImmutableNodeInfo{NodeID: 10, Address: "localhost:10", Hostname: "localhost"}))
+		s.targetMgr.(*meta.MockTargetManager).EXPECT().GetDmChannelsByCollection(mock.Anything, collectionID, meta.CurrentTarget).Return(map[string]*meta.DmChannel{
+			channelName: {VchannelInfo: &datapb.VchannelInfo{CollectionID: collectionID, ChannelName: channelName}},
+		})
+		s.targetMgr.(*meta.MockTargetManager).EXPECT().GetSealedSegmentsByChannel(mock.Anything, collectionID, channelName, meta.CurrentTarget).Return(map[int64]*datapb.SegmentInfo{}).Maybe()
+		s.targetMgr.(*meta.MockTargetManager).EXPECT().GetSealedSegmentIDsByChannel(mock.Anything, collectionID, channelName, meta.CurrentTarget).Return(typeutil.NewUniqueSet())
+		s.dist.ChannelDistManager.Update(10, &meta.DmChannel{
+			VchannelInfo: &datapb.VchannelInfo{CollectionID: collectionID, ChannelName: channelName},
+			Node:         10,
+			Version:      1,
+			View: &meta.LeaderView{
+				ID: 10, CollectionID: collectionID, Channel: channelName,
+				Status:   &querypb.LeaderViewStatus{Serviceable: true},
+				Segments: map[int64]*querypb.SegmentDist{},
+			},
+		})
+
+		errs := s.CheckReplicasServiceable(context.Background(), collectionID)
+		assert.Empty(t, errs)
 	})
 }

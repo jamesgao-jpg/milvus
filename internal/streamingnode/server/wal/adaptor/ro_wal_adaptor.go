@@ -101,8 +101,7 @@ func (w *roWALAdaptorImpl) Read(ctx context.Context, opts wal.ReadOption) (wal.S
 		w.roWALImpls,
 		opts,
 		w.scanMetrics.NewScannerMetrics(),
-		func() { w.scanners.Remove(id) },
-		w.forceRecovery)
+		func() { w.scanners.Remove(id) }, scannerConfig{})
 	w.scanners.Insert(id, s)
 	return s, nil
 }
@@ -188,4 +187,8 @@ func (w *roWALAdaptorImpl) forceCancelAfterGracefulTimeout() {
 		// perform a force cancel to avoid resource leak.
 		w.availableCancel()
 	})
+}
+
+func (w *roWALAdaptorImpl) TransformLog() wal.TransformLogAccesser {
+	return wal.NewTransformLogErrorAccesser(status.NewUnrecoverableError("transform subscriptions require a read-write WAL"))
 }

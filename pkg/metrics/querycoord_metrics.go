@@ -21,6 +21,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
@@ -106,6 +107,22 @@ var (
 			Help:      "the number of tasks in QueryCoord's scheduler",
 		}, []string{QueryCoordTaskType})
 
+	QueryCoordLoadDemandMemoryBytes = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryCoordRole,
+			Name:      "load_demand_memory_bytes",
+			Help:      "cumulative estimated memory bytes required by load configuration changes successfully broadcast after resource precheck",
+		}, []string{ResourceGroupLabelName})
+
+	QueryCoordLoadDemandDiskBytes = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.QueryCoordRole,
+			Name:      "load_demand_disk_bytes",
+			Help:      "cumulative estimated disk bytes required by load configuration changes successfully broadcast after resource precheck",
+		}, []string{ResourceGroupLabelName})
+
 	QueryCoordNumQueryNodes = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: milvusNamespace,
@@ -114,7 +131,7 @@ var (
 			Help:      "number of QueryNodes managered by QueryCoord",
 		}, []string{})
 
-	QueryCoordCurrentTargetCheckpointUnixSeconds = prometheus.NewGaugeVec(
+	QueryCoordCurrentTargetCheckpointUnixSeconds = newVChannelGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: milvusNamespace,
 			Subsystem: typeutil.QueryCoordRole,
@@ -123,9 +140,9 @@ var (
 		}, []string{
 			nodeIDLabelName,
 			channelNameLabelName,
-		})
+		}, collectionGaugeAggregateDisabled)
 
-	QueryCoordCurrentTargetAllReplicasCheckpointUnixSeconds = prometheus.NewGaugeVec(
+	QueryCoordCurrentTargetAllReplicasCheckpointUnixSeconds = newVChannelGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: milvusNamespace,
 			Subsystem: typeutil.QueryCoordRole,
@@ -134,9 +151,9 @@ var (
 		}, []string{
 			nodeIDLabelName,
 			channelNameLabelName,
-		})
+		}, collectionGaugeAggregateDisabled)
 
-	QueryCoordTaskLatency = prometheus.NewHistogramVec(
+	QueryCoordTaskLatency = newCollectionVChannelHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: milvusNamespace,
 			Subsystem: typeutil.QueryCoordRole,
@@ -180,6 +197,9 @@ var (
 
 // RegisterQueryCoord registers QueryCoord metrics
 func RegisterQueryCoord(registry *prometheus.Registry) {
+	QueryCoordLoadDemandMemoryBytes.WithLabelValues(common.DefaultResourceGroupName).Add(0)
+	QueryCoordLoadDemandDiskBytes.WithLabelValues(common.DefaultResourceGroupName).Add(0)
+
 	registry.MustRegister(QueryCoordNumCollections)
 	registry.MustRegister(QueryCoordNumPartitions)
 	registry.MustRegister(QueryCoordLoadCount)
@@ -187,6 +207,8 @@ func RegisterQueryCoord(registry *prometheus.Registry) {
 	registry.MustRegister(QueryCoordLoadLatency)
 	registry.MustRegister(QueryCoordReleaseLatency)
 	registry.MustRegister(QueryCoordTaskNum)
+	registry.MustRegister(QueryCoordLoadDemandMemoryBytes)
+	registry.MustRegister(QueryCoordLoadDemandDiskBytes)
 	registry.MustRegister(QueryCoordNumQueryNodes)
 	registry.MustRegister(QueryCoordCurrentTargetCheckpointUnixSeconds)
 	registry.MustRegister(QueryCoordCurrentTargetAllReplicasCheckpointUnixSeconds)

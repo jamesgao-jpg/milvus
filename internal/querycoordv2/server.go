@@ -23,26 +23,25 @@ import (
 	"sync"
 	"time"
 
-	"github.com/blang/semver/v4"
 	"github.com/samber/lo"
 	"github.com/tidwall/gjson"
 	"github.com/tikv/client-go/v2/txnkv"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/atomic"
-	"golang.org/x/time/rate"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
 	"github.com/milvus-io/milvus/internal/allocator"
 	etcdkv "github.com/milvus-io/milvus/internal/kv/etcd"
 	"github.com/milvus-io/milvus/internal/kv/tikv"
+	"github.com/milvus-io/milvus/internal/metacache"
 	"github.com/milvus-io/milvus/internal/metastore"
 	"github.com/milvus-io/milvus/internal/metastore/kv/querycoord"
 	"github.com/milvus-io/milvus/internal/querycoordv2/assign"
 	"github.com/milvus-io/milvus/internal/querycoordv2/balance"
 	"github.com/milvus-io/milvus/internal/querycoordv2/checkers"
 	"github.com/milvus-io/milvus/internal/querycoordv2/dist"
-	"github.com/milvus-io/milvus/internal/querycoordv2/job"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/observers"
 	"github.com/milvus-io/milvus/internal/querycoordv2/params"
@@ -53,6 +52,7 @@ import (
 	"github.com/milvus-io/milvus/internal/util/proxyutil"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/internal/util/tsoutil"
+	qvresource "github.com/milvus-io/milvus/internal/views/coord/resource"
 	"github.com/milvus-io/milvus/pkg/v3/config"
 	"github.com/milvus-io/milvus/pkg/v3/kv"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
@@ -93,13 +93,15 @@ type Server struct {
 	targetMgr meta.TargetManagerInterface
 	broker    meta.Broker
 
+	// metaView is the shared metacache.MetaView injected by MixCoord.
+	metaView metacache.MetaView
+
 	// Session
 	cluster          session.Cluster
 	nodeMgr          *session.NodeManager
 	queryNodeCreator session.QueryNodeCreator
 
 	// Schedulers
-	jobScheduler  *job.Scheduler
 	taskScheduler task.Scheduler
 
 	// HeartBeat
@@ -133,6 +135,15 @@ type Server struct {
 
 	// load config watcher
 	loadConfigWatcher *LoadConfigWatcher
+
+	// query view runtime
+	qviewsRuntime *qviewsRuntime
+
+	// DQL activity tracking and TTL-based collection release.
+	collectionUsage *collectionUsageManager
+
+	// One shared automatic load and readiness wait per collection across Proxies.
+	autoLoadCollectionGroup singleflight.Group
 }
 
 type FileResourceObserver interface {
@@ -204,6 +215,9 @@ func (s *Server) registerMetricsRequest() {
 	}
 
 	QueryReplicasAction := func(ctx context.Context, req *milvuspb.GetMetricsRequest, jsonReq gjson.Result) (string, error) {
+		if s.qviewsRuntime != nil {
+			return s.qviewsReplicasJSON(ctx)
+		}
 		return s.meta.GetReplicasJSON(ctx, s.meta), nil
 	}
 
@@ -311,7 +325,6 @@ func (s *Server) initQueryCoord() error {
 
 	// Init schedulers
 	mlog.Info(s.ctx, "init schedulers")
-	s.jobScheduler = job.NewScheduler()
 	s.taskScheduler = task.NewScheduler(
 		s.ctx,
 		s.meta,
@@ -368,50 +381,68 @@ func (s *Server) initQueryCoord() error {
 	// Init load status cache
 	meta.GlobalFailedLoadCache = meta.NewFailedLoadCache()
 
-	RegisterDDLCallbacks(s)
+	if err := s.initQViewsRuntime(); err != nil {
+		return err
+	}
 	mlog.Info(s.ctx, "init querycoord done", mlog.FieldNodeID(paramtable.GetNodeID()), mlog.String("Address", s.address))
 	return err
+}
+
+func (s *Server) initQViewsRuntime() error {
+	mlog.Info(s.ctx, "init query view runtime")
+	deps := newDefaultQViewsRuntimeDependencies(
+		s.kv,
+		s.etcdCli,
+		s.meta.ResourceManager,
+		s.mixCoord,
+	)
+	deps.replicaResources = qviewsReplicaResources{ResourceManager: s.meta.ResourceManager, allocateID: s.idAllocator}
+	runtime, err := newQViewsRuntime(s.ctx, deps)
+	if err != nil {
+		return err
+	}
+	s.qviewsRuntime = runtime
+	qvresource.Init(runtime.resources)
+	s.collectionUsage = newCollectionUsageManager(
+		runtime.loadConfigStore,
+		s.broker,
+		s.autoReleaseCollection,
+	)
+	return nil
 }
 
 func (s *Server) initMeta() error {
 	record := timerecord.NewTimeRecorder("querycoord")
 
 	mlog.Info(s.ctx, "init meta")
+	// Targets and collection schemas resolve through the shared MetaView,
+	// which MixCoord injects via SetMetaView. Fail here rather than panic on
+	// the first resolution.
+	if s.metaView == nil {
+		return merr.WrapErrServiceInternal("querycoord meta view is not set")
+	}
 	s.store = querycoord.NewCatalog(s.kv)
-	s.meta = meta.NewMeta(s.idAllocator, s.store, s.nodeMgr)
+	s.meta = meta.NewMeta(s.idAllocator, s.store, s.nodeMgr, s.metaView)
 
 	s.broker = meta.NewCoordinatorBroker(
 		s.mixCoord,
 	)
 
-	mlog.Info(s.ctx, "recover meta...")
-	err := s.meta.CollectionManager.Recover(s.ctx, s.broker)
-	if err != nil {
-		mlog.Warn(s.ctx, "failed to recover collections", mlog.Err(err))
-		return err
-	}
-	collections := s.meta.GetAll(s.ctx)
-	mlog.Info(s.ctx, "recovering collections...", mlog.Int64s("collections", collections))
-
-	// We really update the metric after observers think the collection loaded.
+	// QueryView load intent is recovered by initQViewsRuntime's versioned catalog.
+	// Legacy load metadata is independent and is not used by this runtime.
+	// TODO: integrate legacy migration and crash recovery in a separate change.
 	metrics.QueryCoordNumCollections.WithLabelValues().Set(0)
+	metrics.QueryCoordNumPartitions.WithLabelValues().Set(0)
 
-	metrics.QueryCoordNumPartitions.WithLabelValues().Set(float64(len(s.meta.GetAllPartitions(s.ctx))))
-
-	err = s.meta.ReplicaManager.Recover(s.ctx, collections)
-	if err != nil {
-		mlog.Warn(s.ctx, "failed to recover replicas", mlog.Err(err))
-		return err
-	}
-
-	err = s.meta.ResourceManager.Recover(s.ctx)
+	err := s.meta.ResourceManager.Recover(s.ctx)
 	if err != nil {
 		mlog.Warn(s.ctx, "failed to recover resource groups", mlog.Err(err))
 		return err
 	}
 
 	s.dist = meta.NewDistributionManager(s.nodeMgr)
-	s.targetMgr = meta.NewTargetManager(s.broker, s.meta)
+	targetMgr := meta.NewTargetManager(s.broker, s.meta, s.metaView)
+	s.targetMgr = targetMgr
 	err = s.targetMgr.Recover(s.ctx, s.store)
 	if err != nil {
 		mlog.Warn(s.ctx, "failed to recover collection targets", mlog.Err(err))
@@ -469,13 +500,13 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) startQueryCoord() error {
-	mlog.Info(s.ctx, "start watcher...")
+	mlog.Info(s.ctx, "start querycoord in query view mode")
 	sessions, revision, err := s.session.GetSessions(s.ctx, typeutil.QueryNodeRole)
 	if err != nil {
 		return err
 	}
 
-	mlog.Info(s.ctx, "rewatch nodes", mlog.Any("sessions", sessions))
+	mlog.Info(s.ctx, "rewatch nodes for query view mode", mlog.Any("sessions", sessions))
 	err = s.rewatchNodes(sessions)
 	if err != nil {
 		return err
@@ -484,63 +515,47 @@ func (s *Server) startQueryCoord() error {
 	s.wg.Add(1)
 	go s.watchNodes(revision)
 
-	// check whether old node exist, if yes suspend auto balance until all old nodes down
-	s.updateBalanceConfigLoop(s.ctx)
-
-	if err := s.proxyWatcher.WatchProxy(s.ctx); err != nil {
-		mlog.Warn(s.ctx, "querycoord failed to watch proxy", mlog.Err(err))
-	}
-
 	s.startServerLoop()
 	s.afterStart()
 	s.UpdateStateCode(commonpb.StateCode_Healthy)
 	sessionutil.SaveServerInfo(typeutil.MixCoordRole, s.session.GetServerID())
-	// check replica changes after restart
-	// Note: this should be called after start progress is done
-	s.watchLoadConfigChanges()
 	return nil
 }
 
 func (s *Server) startServerLoop() {
-	// leader cache observer shall be started before `SyncAll` call
-	s.leaderCacheObserver.Start(s.ctx)
-	// Recover dist, to avoid generate too much task when dist not ready after restart
-	s.distController.SyncAll(s.ctx)
+	mlog.Info(s.ctx, "start resource observer...")
+	if s.resourceObserver != nil {
+		s.resourceObserver.Start()
+	}
 
-	// start the components from inside to outside,
-	// to make the dependencies ready for every component
-	mlog.Info(s.ctx, "start cluster...")
-	s.cluster.Start()
-
-	mlog.Info(s.ctx, "start observers...")
-	s.collectionObserver.Start()
-	s.targetObserver.Start()
-	s.replicaObserver.Start()
-	s.resourceObserver.Start()
-
-	mlog.Info(s.ctx, "start task scheduler...")
-	s.taskScheduler.Start()
-
-	mlog.Info(s.ctx, "start checker controller...")
-	s.checkerController.Start()
-
-	mlog.Info(s.ctx, "start job scheduler...")
-	s.jobScheduler.Start()
+	mlog.Info(s.ctx, "start query view runtime...")
+	if s.qviewsRuntime != nil {
+		s.qviewsRuntime.start(s.ctx)
+		s.watchLoadConfigChanges()
+	}
+	if s.collectionUsage != nil {
+		s.collectionUsage.start(s.ctx)
+	}
 }
 
 func (s *Server) Stop() error {
 	// FOLLOW the dependence graph:
-	// job scheduler -> checker controller -> task scheduler -> dist controller -> cluster -> session
+	// checker controller -> task scheduler -> dist controller -> cluster -> session
 	// observers -> dist controller
+
+	if s.collectionUsage != nil {
+		mlog.Info(s.ctx, "stop collection usage manager...")
+		s.collectionUsage.close()
+	}
 
 	if s.loadConfigWatcher != nil {
 		mlog.Info(s.ctx, "stop load config watcher...")
 		s.loadConfigWatcher.Close()
 	}
 
-	if s.jobScheduler != nil {
-		mlog.Info(s.ctx, "stop job scheduler...")
-		s.jobScheduler.Stop()
+	if s.qviewsRuntime != nil {
+		mlog.Info(s.ctx, "stop query view runtime...")
+		s.qviewsRuntime.stop()
 	}
 
 	if s.checkerController != nil {
@@ -629,6 +644,12 @@ func (s *Server) SetTiKVClient(client *txnkv.Client) {
 
 func (s *Server) SetMixCoord(mixCoord types.MixCoord) {
 	s.mixCoord = mixCoord
+}
+
+// SetMetaView sets the shared metacache.MetaView for QueryCoord to resolve
+// segment details from. Must be called before initMeta.
+func (s *Server) SetMetaView(view metacache.MetaView) {
+	s.metaView = view
 }
 
 func (s *Server) SetQueryNodeCreator(f func(ctx context.Context, addr string, nodeID int64) (types.QueryNodeClient, error)) {
@@ -760,6 +781,12 @@ func (s *Server) handleNodeUp(node int64) {
 		return
 	}
 
+	if s.qviewsRuntime != nil {
+		s.meta.HandleNodeUp(s.ctx, node)
+		s.metricsCacheManager.InvalidateSystemInfoMetrics()
+		return
+	}
+
 	// add executor to task scheduler
 	s.taskScheduler.AddExecutor(node)
 
@@ -774,6 +801,13 @@ func (s *Server) handleNodeUp(node int64) {
 }
 
 func (s *Server) handleNodeDown(node int64) {
+	if s.qviewsRuntime != nil {
+		s.meta.HandleNodeDown(context.Background(), node)
+		metrics.QueryCoordLastHeartbeatTimeStamp.DeleteLabelValues(fmt.Sprint(node))
+		s.metricsCacheManager.InvalidateSystemInfoMetrics()
+		return
+	}
+
 	s.taskScheduler.RemoveExecutor(node)
 	s.distController.Remove(node)
 
@@ -795,6 +829,11 @@ func (s *Server) handleNodeStopping(node int64) {
 	// mark node as stopping in node manager
 	s.nodeMgr.Stopping(node)
 
+	if s.qviewsRuntime != nil {
+		s.meta.HandleNodeStopping(context.Background(), node)
+		return
+	}
+
 	// mark node as stopping in resource manager
 	s.meta.HandleNodeStopping(context.Background(), node)
 
@@ -802,88 +841,38 @@ func (s *Server) handleNodeStopping(node int64) {
 	s.checkerController.Check()
 }
 
-func (s *Server) updateBalanceConfigLoop(ctx context.Context) {
-	success := s.updateBalanceConfig()
-	if success {
-		return
-	}
-
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		interval := Params.QueryCoordCfg.CheckAutoBalanceConfigInterval.GetAsDuration(time.Second)
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				mlog.Info(ctx, "update balance config loop exit!")
-				return
-
-			case <-ticker.C:
-				success := s.updateBalanceConfig()
-				if success {
-					return
-				}
-				// apply dynamic update only when changed
-				newInterval := Params.QueryCoordCfg.CheckAutoBalanceConfigInterval.GetAsDuration(time.Second)
-				if newInterval != interval {
-					interval = newInterval
-					select {
-					case <-ticker.C:
-					default:
-					}
-					ticker.Reset(interval)
-				}
-			}
-		}
-	}()
-}
-
-func (s *Server) updateBalanceConfig() bool {
-	r := semver.MustParseRange("<2.3.0")
-	sessions, _, err := s.session.GetSessionsWithVersionRange(typeutil.QueryNodeRole, r)
-	if err != nil {
-		mlog.Warn(s.ctx, "check query node version occur error on etcd", mlog.Err(err))
-		return false
-	}
-
-	if len(sessions) == 0 {
-		// only balance channel when all query node's version >= 2.3.0
-		Params.Reset(Params.QueryCoordCfg.AutoBalance.Key)
-		mlog.Info(s.ctx, "all old query node down, enable auto balance!")
-		return true
-	}
-
-	Params.Save(Params.QueryCoordCfg.AutoBalance.Key, "false")
-	mlog.RatedDebug(s.ctx, rate.Limit(10), "old query node exist", mlog.Strings("sessions", lo.Keys(sessions)))
-	return false
-}
-
 func (s *Server) watchLoadConfigChanges() {
 	w := NewLoadConfigWatcher(s)
 	s.loadConfigWatcher = w
+	w.handlers = make(map[string]config.EventHandler)
+	for _, key := range []string{
+		paramtable.Get().QueryCoordCfg.ClusterLevelLoadReplicaNumber.Key,
+		paramtable.Get().QueryCoordCfg.ClusterLevelLoadResourceGroups.Key,
+		paramtable.Get().QueryCoordCfg.ClusterLevelLoadForceOverrideUserReplicaMode.Key,
+	} {
+		handler := config.NewHandler("queryviewLoadConfigChanges", func(e *config.Event) { w.Trigger() })
+		w.handlers[key] = handler
+		paramtable.Get().Watch(key, handler)
+	}
 	w.Trigger()
-
-	replicaNumHandler := config.NewHandler("watchReplicaNumberChanges", func(e *config.Event) { w.Trigger() })
-	paramtable.Get().Watch(paramtable.Get().QueryCoordCfg.ClusterLevelLoadReplicaNumber.Key, replicaNumHandler)
-
-	rgHandler := config.NewHandler("watchResourceGroupChanges", func(e *config.Event) { w.Trigger() })
-	paramtable.Get().Watch(paramtable.Get().QueryCoordCfg.ClusterLevelLoadResourceGroups.Key, rgHandler)
-
-	forceOverrideHandler := config.NewHandler("watchForceOverrideUserReplicaModeChanges", func(e *config.Event) { w.Trigger() })
-	paramtable.Get().Watch(paramtable.Get().QueryCoordCfg.ClusterLevelLoadForceOverrideUserReplicaMode.Key, forceOverrideHandler)
 }
 
 // GetInternalReplicasByCollection returns replicas for a collection from internal meta.
 // This method provides access to internal replica information including resource groups.
 func (s *Server) GetInternalReplicasByCollection(ctx context.Context, collectionID int64) []*meta.Replica {
+	if s.qviewsRuntime != nil {
+		return s.qviewsReplicaSnapshot(collectionID)
+	}
 	return s.meta.GetByCollection(ctx, collectionID)
 }
 
 // IsCollectionUserSpecifiedReplicaMode returns whether the collection load config
 // was created from a request with an explicit replica number.
 func (s *Server) IsCollectionUserSpecifiedReplicaMode(ctx context.Context, collectionID int64) bool {
+	if s.qviewsRuntime != nil {
+		cfg := s.qviewsRuntime.loadConfigStore.GetConfig(collectionID)
+		return cfg != nil && cfg.UserSpecifiedReplicaMode
+	}
 	if s.meta == nil {
 		return false
 	}
@@ -897,6 +886,20 @@ func (s *Server) IsCollectionUserSpecifiedReplicaMode(ctx context.Context, colle
 // snapshot), this performs a live check against the distribution manager and so
 // reflects the real-time serviceability after scale-up / scale-down.
 func (s *Server) CheckAllReplicasServiceable(ctx context.Context, collectionID int64) error {
+	if s.qviewsRuntime != nil {
+		cfg, version := s.qviewsRuntime.loadConfigStore.GetConfigWithVersion(collectionID)
+		if cfg == nil || len(cfg.Replicas) == 0 {
+			return merr.WrapErrCollectionNotLoaded(collectionID)
+		}
+		for _, err := range s.qviewsReplicaErrors(ctx, collectionID) {
+			return err
+		}
+		current, currentVersion := s.qviewsRuntime.loadConfigStore.GetConfigWithVersion(collectionID)
+		if current != cfg || currentVersion != version {
+			return merr.WrapErrServiceNotReadyMsg("load configuration changed while reading replicas")
+		}
+		return nil
+	}
 	replicas := s.meta.GetByCollection(ctx, collectionID)
 	if len(replicas) == 0 {
 		return merr.WrapErrServiceInternalMsg("no replica found")
@@ -931,12 +934,30 @@ func (s *Server) checkReplicaServiceable(ctx context.Context, replica *meta.Repl
 	return nil
 }
 
+// CheckReplicasServiceable checks every replica of the collection and returns a map of replica ID
+// to error for each non-serviceable one, instead of failing fast on the first bad replica. This
+// allows per-resource-group compliance reporting to attribute each failure to the replica's own
+// resource group. An empty map with no error means every replica is serviceable.
+func (s *Server) CheckReplicasServiceable(ctx context.Context, collectionID int64) map[int64]error {
+	if s.qviewsRuntime != nil {
+		return s.qviewsReplicaErrors(ctx, collectionID)
+	}
+	replicas := s.meta.GetByCollection(ctx, collectionID)
+	errs := make(map[int64]error)
+	for _, replica := range replicas {
+		if err := s.checkReplicaServiceable(ctx, replica); err != nil {
+			errs[replica.GetID()] = err
+		}
+	}
+	return errs
+}
+
 // GetLeakedResourcesByCollection returns the number of segments and channels still held by
 // querynodes that are NOT part of any current replica of the collection. A non-zero result
 // means physical resources have not been fully released yet (e.g., during scale-down a
 // decommissioned replica's querynode may still hold segments while release RPCs are in flight).
 func (s *Server) GetLeakedResourcesByCollection(ctx context.Context, collectionID int64) (leakedSegments, leakedChannels int) {
-	replicas := s.meta.GetByCollection(ctx, collectionID)
+	replicas := s.GetInternalReplicasByCollection(ctx, collectionID)
 	validNodes := typeutil.NewUniqueSet()
 	for _, r := range replicas {
 		validNodes.Insert(r.GetNodes()...)
@@ -952,4 +973,38 @@ func (s *Server) GetLeakedResourcesByCollection(ctx context.Context, collectionI
 		}
 	}
 	return leakedSegments, leakedChannels
+}
+
+// GetLeakedResourcesByCollectionPerRG returns the number of segments and channels still held by
+// querynodes that are NOT part of any current replica of the collection, grouped by the resource
+// group of the holding querynode. Unlike GetLeakedResourcesByCollection, it preserves the per-RG
+// attribution so compliance reporting can mark exactly the resource groups that hold leaked
+// resources. Ordinary QueryNodes use the authoritative ResourceManager mapping.
+// Embedded QueryNodes are excluded from that manager, so their RGs are resolved
+// from the caller's complete StreamingNode snapshot, including frozen nodes.
+// Nodes absent from both mappings are attributed to the empty RG (global).
+func (s *Server) GetLeakedResourcesByCollectionPerRG(ctx context.Context, collectionID int64, streamingNodeRGs map[int64]string) map[string]int {
+	replicas := s.GetInternalReplicasByCollection(ctx, collectionID)
+	validNodes := typeutil.NewUniqueSet()
+	for _, r := range replicas {
+		validNodes.Insert(r.GetNodes()...)
+	}
+	leaked := make(map[string]int)
+	rgOf := func(nodeID int64) string {
+		if rg := s.meta.GetResourceGroupByNodeID(nodeID); rg != "" {
+			return rg
+		}
+		return streamingNodeRGs[nodeID]
+	}
+	for _, seg := range s.dist.SegmentDistManager.GetByFilter(meta.WithCollectionID(collectionID)) {
+		if !validNodes.Contain(seg.Node) {
+			leaked[rgOf(seg.Node)]++
+		}
+	}
+	for _, ch := range s.dist.ChannelDistManager.GetByFilter(meta.WithCollectionID2Channel(collectionID)) {
+		if !validNodes.Contain(ch.Node) {
+			leaked[rgOf(ch.Node)]++
+		}
+	}
+	return leaked
 }

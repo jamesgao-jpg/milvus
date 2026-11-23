@@ -32,6 +32,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/keepalive"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
@@ -55,6 +56,8 @@ type GrpcComponent interface {
 // clientConnWrapper is the wrapper for client & conn.
 type clientConnWrapper[T GrpcComponent] struct {
 	client T
+	// nodeID is the identity captured by this connection's interceptors.
+	nodeID int64
 	conn   *grpc.ClientConn
 	mut    sync.RWMutex
 }
@@ -93,6 +96,23 @@ type GrpcClient[T GrpcComponent] interface {
 	SetSession(sess *sessionutil.Session)
 }
 
+type failFastOnConnectionErrorKey struct{}
+
+// WithFailFastOnConnectionError lets a caller retry an established RPC while
+// returning immediately if a connection cannot be acquired. Pinned worker
+// reads use this so Proxy can try another replica after a failed dial.
+func WithFailFastOnConnectionError(ctx context.Context) context.Context {
+	return context.WithValue(ctx, failFastOnConnectionErrorKey{}, true)
+}
+
+// connectionAttempt publishes one dial result to all concurrent waiters.
+type connectionAttempt[T GrpcComponent] struct {
+	done    chan struct{}
+	cancel  context.CancelFunc
+	wrapper *clientConnWrapper[T]
+	err     error
+}
+
 // ClientBase is a base of grpc client
 type ClientBase[T interface {
 	GetComponentStates(ctx context.Context, in *milvuspb.GetComponentStatesRequest, opts ...grpc.CallOption) (*milvuspb.ComponentStates, error)
@@ -109,12 +129,16 @@ type ClientBase[T interface {
 
 	// conn                   *grpc.ClientConn
 	grpcClientMtx sync.RWMutex
+	connecting    *connectionAttempt[T]
+	closed        bool
+	closedCh      chan struct{}
 	role          string
 	isNode        bool // pre-calculated is node flag
 
 	ClientMaxSendSize      int
 	ClientMaxRecvSize      int
 	CompressionEnabled     bool
+	CompressionAlgorithm   string
 	RetryServiceNameConfig string
 
 	DialTimeout      time.Duration
@@ -154,6 +178,7 @@ func NewClientBase[T interface {
 		InitialBackoff:          config.InitialBackoff.GetAsFloat(),
 		MaxBackoff:              config.MaxBackoff.GetAsFloat(),
 		CompressionEnabled:      config.CompressionEnabled.GetAsBool(),
+		CompressionAlgorithm:    config.CompressionAlgorithm.GetValue(),
 		minResetInterval:        config.MinResetInterval.GetAsDuration(time.Millisecond),
 		minSessionCheckInterval: config.MinSessionCheckInterval.GetAsDuration(time.Millisecond),
 		maxCancelError:          config.MaxCancelError.GetAsInt32(),
@@ -205,27 +230,76 @@ func (c *ClientBase[T]) SetNewGrpcClientFunc(f func(cc *grpc.ClientConn) T) {
 
 // GetGrpcClient returns grpc client
 func (c *ClientBase[T]) GetGrpcClient(ctx context.Context) (*clientConnWrapper[T], error) {
-	c.grpcClientMtx.RLock()
-
-	if !generic.IsZero(c.grpcClient) {
-		defer c.grpcClientMtx.RUnlock()
-		return c.grpcClient, nil
-	}
-	c.grpcClientMtx.RUnlock()
-
-	c.grpcClientMtx.Lock()
-	defer c.grpcClientMtx.Unlock()
-
-	if !generic.IsZero(c.grpcClient) {
-		return c.grpcClient, nil
-	}
-
-	err := c.connect(ctx)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	c.grpcClientMtx.RLock()
+	if !c.closed && c.grpcClient != nil {
+		wrapper := c.grpcClient
+		c.grpcClientMtx.RUnlock()
+		return wrapper, nil
+	}
+	c.grpcClientMtx.RUnlock()
+	c.grpcClientMtx.Lock()
+	if c.closed {
+		c.grpcClientMtx.Unlock()
+		return nil, grpc.ErrClientConnClosing
+	}
+	if c.grpcClient != nil {
+		wrapper := c.grpcClient
+		c.grpcClientMtx.Unlock()
+		return wrapper, nil
+	}
+	if c.closedCh == nil {
+		c.closedCh = make(chan struct{})
+	}
+	pending := c.connecting
+	if pending == nil {
+		// A connection is shared across requests, so its dial must outlive the
+		// caller that first noticed the missing connection. Keep context values
+		// for tracing, but give the dial its own cancellation lifetime.
+		dialCtx, cancel := context.WithCancel(context.WithoutCancel(ctx)) //nolint:gosec // G118: cancel is stored in pending.cancel and invoked by finishConnectionAttempt and Close.
+		pending = &connectionAttempt[T]{done: make(chan struct{}), cancel: cancel}
+		c.connecting = pending
+		go c.finishConnectionAttempt(dialCtx, pending)
+	}
+	closedCh := c.closedCh
+	c.grpcClientMtx.Unlock()
 
-	return c.grpcClient, nil
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-closedCh:
+		return nil, grpc.ErrClientConnClosing
+	case <-pending.done:
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		c.grpcClientMtx.RLock()
+		closed := c.closed
+		c.grpcClientMtx.RUnlock()
+		if closed {
+			return nil, grpc.ErrClientConnClosing
+		}
+		return pending.wrapper, pending.err
+	}
+}
+
+func (c *ClientBase[T]) finishConnectionAttempt(ctx context.Context, pending *connectionAttempt[T]) {
+	// Network I/O stays outside the state lock, and every caller waits using
+	// its own context. Close cancels this shared dial.
+	err := c.connect(ctx)
+	pending.cancel()
+	c.grpcClientMtx.Lock()
+	if err == nil && c.grpcClient == nil {
+		// Close/reset may win after connect publishes but before we return.
+		err = grpc.ErrClientConnClosing
+	}
+	pending.err = err
+	c.connecting = nil
+	pending.wrapper = c.grpcClient
+	close(pending.done)
+	c.grpcClientMtx.Unlock()
 }
 
 func (c *ClientBase[T]) resetConnection(wrapper *clientConnWrapper[T], forceReset bool) {
@@ -260,12 +334,23 @@ func (c *ClientBase[T]) connect(ctx context.Context) error {
 		return err
 	}
 
+	nodeID := c.GetNodeID()
 	dialContext, cancel := context.WithTimeout(ctx, c.DialTimeout)
 
 	var conn *grpc.ClientConn
 	compress := None
 	if c.CompressionEnabled {
-		compress = Zstd
+		compress = c.CompressionAlgorithm
+		if encoding.GetCompressor(compress) == nil {
+			// grpc fails every RPC on the connection with "Compressor is not
+			// installed" for an encoding it does not know, so degrade to the
+			// algorithm every build registers rather than taking the client down.
+			// An empty algorithm lands here too, and would otherwise disable
+			// compression silently despite CompressionEnabled being set.
+			mlog.Warn(ctx, "no compressor registered for the configured grpc compression algorithm, falling back to zstd",
+				mlog.String("compressionAlgorithm", c.CompressionAlgorithm))
+			compress = Zstd
+		}
 	}
 	if c.encryption {
 		mlog.Debug(ctx, "Running in internalTLS mode with encryption enabled")
@@ -288,13 +373,13 @@ func (c *ClientBase[T]) connect(ctx context.Context) error {
 			grpc.WithUnaryInterceptor(grpc_middleware.ChainUnaryClient(
 				mlog.UnaryClientInterceptor(),
 				interceptor.ClusterInjectionUnaryClientInterceptor(),
-				interceptor.ServerIDInjectionUnaryClientInterceptor(c.GetNodeID()),
+				interceptor.ServerIDInjectionUnaryClientInterceptor(nodeID),
 				interceptor.IdempotencyKeyPropagationUnaryClientInterceptor(),
 			)),
 			grpc.WithStreamInterceptor(grpc_middleware.ChainStreamClient(
 				mlog.StreamClientInterceptor(),
 				interceptor.ClusterInjectionStreamClientInterceptor(),
-				interceptor.ServerIDInjectionStreamClientInterceptor(c.GetNodeID()),
+				interceptor.ServerIDInjectionStreamClientInterceptor(nodeID),
 			)),
 			grpc.WithKeepaliveParams(keepalive.ClientParameters{
 				Time:                c.KeepAliveTime,
@@ -329,13 +414,13 @@ func (c *ClientBase[T]) connect(ctx context.Context) error {
 			grpc.WithUnaryInterceptor(grpc_middleware.ChainUnaryClient(
 				mlog.UnaryClientInterceptor(),
 				interceptor.ClusterInjectionUnaryClientInterceptor(),
-				interceptor.ServerIDInjectionUnaryClientInterceptor(c.GetNodeID()),
+				interceptor.ServerIDInjectionUnaryClientInterceptor(nodeID),
 				interceptor.IdempotencyKeyPropagationUnaryClientInterceptor(),
 			)),
 			grpc.WithStreamInterceptor(grpc_middleware.ChainStreamClient(
 				mlog.StreamClientInterceptor(),
 				interceptor.ClusterInjectionStreamClientInterceptor(),
-				interceptor.ServerIDInjectionStreamClientInterceptor(c.GetNodeID()),
+				interceptor.ServerIDInjectionStreamClientInterceptor(nodeID),
 			)),
 			grpc.WithKeepaliveParams(keepalive.ClientParameters{
 				Time:                c.KeepAliveTime,
@@ -363,10 +448,17 @@ func (c *ClientBase[T]) connect(ctx context.Context) error {
 		return wrapErrConnect(addr, err)
 	}
 
+	c.grpcClientMtx.Lock()
+	defer c.grpcClientMtx.Unlock()
+	if c.closed {
+		_ = conn.Close()
+		return grpc.ErrClientConnClosing
+	}
 	c.addr.Store(addr)
 	c.ctxCounter.Store(0)
 	c.grpcClient = &clientConnWrapper[T]{
 		client: c.newGrpcClient(conn),
+		nodeID: nodeID,
 		conn:   conn,
 	}
 	return nil
@@ -432,6 +524,13 @@ func (c *ClientBase[T]) checkGrpcErr(ctx context.Context, err error) (needRetry,
 		// canceled or deadline exceeded
 		return true, c.needResetCancel(), false, err
 	case funcutil.IsGrpcErr(err, codes.Unimplemented):
+		if c.isNode {
+			// A node at this address is the node the session points at (the
+			// ServerID interceptor catches a replaced node); Unimplemented only
+			// means it runs an older version. Resetting the shared connection
+			// would disturb every in-flight RPC on it, so fail fast and keep it.
+			return false, false, false, merr.WrapErrServiceUnimplemented(err)
+		}
 		// for unimplemented error, reset coord connection to avoid old coord's side effect.
 		// old coord's side effect: when coord changed, the connection in coord's client won't reset automatically.
 		// so if new interface appear in new coord, will got a unimplemented error
@@ -471,38 +570,28 @@ func (c *ClientBase[T]) checkNodeSessionExist(ctx context.Context) bool {
 
 func (c *ClientBase[T]) call(ctx context.Context, caller func(client T) (any, error)) (any, error) {
 	log := mlog.With(mlog.String("client_role", c.GetRole()))
-	var (
-		ret       any
-		clientErr error
-		wrapper   *clientConnWrapper[T]
-	)
-
-	wrapper, clientErr = c.GetGrpcClient(ctx)
-	if clientErr != nil {
-		log.Warn(ctx, "fail to get grpc client", mlog.Err(clientErr))
-	}
-
-	resetClientFunc := func(forceReset bool) {
-		c.resetConnection(wrapper, forceReset)
-		wrapper, clientErr = c.GetGrpcClient(ctx)
-		if clientErr != nil {
-			log.Warn(ctx, "fail to get grpc client in the retry state", mlog.Err(clientErr))
-		}
-	}
-
+	var ret any
+	var mismatched *clientConnWrapper[T]
+	attempts := retry.MaxAttemptsFromContextOrDefault(ctx, uint(c.MaxAttempts))
+	failFastOnConnectionError, _ := ctx.Value(failFastOnConnectionErrorKey{}).(bool)
+	// Single-attempt calls skip auxiliary session checks. retry.Handle owns
+	// the attempt limit and skips backoff after the final failure.
+	canRetry := attempts != 1
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	err := retry.Handle(ctx, func() (bool, error) {
-		if wrapper == nil {
-			if ok := c.checkNodeSessionExist(ctx); !ok {
-				// if session doesn't exist, no need to reset connection for datanode/indexnode/querynode
+		mismatched = nil
+		// Each attempt acquires a connection after any preceding backoff.
+		wrapper, clientErr := c.GetGrpcClient(ctx)
+		if clientErr != nil {
+			log.Warn(ctx, "fail to get grpc client", mlog.Err(clientErr))
+			if ctx.Err() != nil || !canRetry || failFastOnConnectionError || IsConnectionClosingErr(clientErr) {
+				return false, clientErr
+			}
+			if !c.checkNodeSessionExist(ctx) {
 				return false, merr.ErrNodeNotFound
 			}
-
-			err := errors.Wrap(clientErr, "empty grpc client")
-			log.Warn(ctx, "grpc client is nil, maybe fail to get client in the retry state", mlog.Err(err))
-			resetClientFunc(false)
-			return true, err
+			return true, clientErr
 		}
 
 		wrapper.Pin()
@@ -515,16 +604,19 @@ func (c *ClientBase[T]) call(ctx context.Context, caller func(client T) (any, er
 			needRetry, needReset, forceReset, err = c.checkGrpcErr(ctx, err)
 			if needReset {
 				log.Warn(ctx, "start to reset connection because of specific reasons", mlog.Err(err))
-				resetClientFunc(forceReset)
-			} else {
+				c.resetConnection(wrapper, forceReset)
+				if needRetry && !c.isNode && !failFastOnConnectionError && IsServerIDMismatchErr(err) {
+					mismatched = wrapper
+				}
+			} else if needRetry && canRetry && !failFastOnConnectionError {
 				// err occurs but no need to reset connection, try to verify session
 				err := c.verifySession(ctx)
 				if err != nil {
 					log.Warn(ctx, "failed to verify session, reset connection", mlog.Err(err))
-					resetClientFunc(forceReset)
+					c.resetConnection(wrapper, forceReset)
 				}
 			}
-			return needRetry, err
+			return needRetry && canRetry, err
 		}
 		// reset counter
 		c.ctxCounter.Store(0)
@@ -551,16 +643,37 @@ func (c *ClientBase[T]) call(ctx context.Context, caller func(client T) (any, er
 
 		err = merr.Error(status)
 		if err != nil && merr.IsRetryableErr(err) {
-			return true, err
+			return canRetry, err
 		}
 		return false, nil
-	}, retry.Attempts(retry.MaxAttemptsFromContextOrDefault(ctx, uint(c.MaxAttempts))),
+	}, retry.Attempts(attempts),
+		retry.RetryImmediately(func(error) bool {
+			if mismatched == nil {
+				return false
+			}
+			// Refresh only when another attempt is allowed. Compare connection
+			// identities, since a concurrent reset may already have changed NodeID.
+			wrapper, err := c.GetGrpcClient(ctx)
+			if err != nil {
+				// Let the next attempt return terminal acquisition errors promptly.
+				return ctx.Err() != nil || IsConnectionClosingErr(err)
+			}
+			if wrapper.nodeID != mismatched.nodeID {
+				return true
+			}
+			// A stale eager reconnect must not replace discovery after backoff:
+			// the new session may become visible while this call is sleeping.
+			// resetConnection only removes this wrapper, preserving a concurrent
+			// replacement installed by another caller.
+			c.resetConnection(wrapper, true)
+			return false
+		}),
 		// Because the previous InitialBackoff and MaxBackoff were float, and the unit was s.
 		// For compatibility, this is multiplied by 1000.
 		retry.Sleep(time.Duration(c.InitialBackoff*1000)*time.Millisecond),
 		retry.MaxSleepTime(time.Duration(c.MaxBackoff*1000)*time.Millisecond))
 	// default value list: MaxAttempts 10, InitialBackoff 0.2s, MaxBackoff 10s
-	// and consume 52.8s if all retry failed
+	// and consume 42.6s if all retry failed
 	if err != nil {
 		// make the error more friendly to user
 		if IsCrossClusterRoutingErr(err) {
@@ -601,9 +714,18 @@ func (c *ClientBase[T]) ReCall(ctx context.Context, caller func(client T) (any, 
 // Close close the client connection
 func (c *ClientBase[T]) Close() error {
 	c.grpcClientMtx.Lock()
-	defer c.grpcClientMtx.Unlock()
-	if c.grpcClient != nil {
-		return c.grpcClient.Close()
+	if !c.closed && c.closedCh != nil {
+		close(c.closedCh)
+	}
+	c.closed = true
+	if c.connecting != nil && c.connecting.cancel != nil {
+		c.connecting.cancel()
+	}
+	wrapper := c.grpcClient
+	c.grpcClient = nil
+	c.grpcClientMtx.Unlock()
+	if wrapper != nil {
+		return wrapper.Close()
 	}
 	return nil
 }

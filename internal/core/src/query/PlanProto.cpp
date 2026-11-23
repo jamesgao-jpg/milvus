@@ -65,31 +65,36 @@ namespace {
 void
 ParseStrictGroupSettings(SearchInfo& info) {
     auto& params = info.search_params_;
-    if (auto it = params.find(kStrictGroupAcceptanceThreshold);
-        it != params.end()) {
-        if (!it->is_number()) {
+    if (auto it = params.find(kStrictGroupSkipRefine); it != params.end()) {
+        if (!it->is_boolean()) {
             ThrowInfo(InvalidParameter,
-                      "strict group acceptance must be numeric");
+                      "strict group skip refine must be boolean");
         }
-        auto value = it->get<double>();
-        if (!std::isfinite(value) || value < 0 || value > 1) {
-            ThrowInfo(InvalidParameter,
-                      "strict group acceptance must be in [0,1]");
-        }
-        info.strict_group_acceptance_threshold_ = value;
+        info.strict_group_skip_refine_ = it->get<bool>();
         params.erase(it);
     }
-    if (auto it = params.find(kStrictGroupProbeCandidates);
+    if (auto it = params.find(kStrictGroupPhase1CandidateWeight);
         it != params.end()) {
         if (!it->is_number_integer() ||
             (it->is_number_unsigned() &&
              it->get<uint64_t>() >
                  static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) ||
-            it->get<int64_t>() <= 0) {
+            it->get<int64_t>() < 0) {
             ThrowInfo(InvalidParameter,
-                      "strict group probe must be a positive int64");
+                      "strict group phase-one candidate weight must be a "
+                      "nonnegative int64");
         }
-        info.strict_group_probe_candidates_ = it->get<int64_t>();
+        info.strict_group_phase1_candidate_weight_ = it->get<int64_t>();
+        params.erase(it);
+    }
+    if (auto it = params.find(kStrictGroupStrategy); it != params.end()) {
+        if (!it->is_string() || (*it != "original" && *it != "per_group")) {
+            ThrowInfo(InvalidParameter,
+                      "strict group strategy must be original or per_group");
+        }
+        info.strict_group_strategy_ = *it == "per_group"
+                                          ? StrictGroupStrategy::PerGroup
+                                          : StrictGroupStrategy::Original;
         params.erase(it);
     }
 }
@@ -100,6 +105,9 @@ ProtoParser::PlanOptionsFromProto(
     const proto::plan::PlanOption& plan_option_proto,
     PlanOptions& plan_options) {
     plan_options.expr_use_json_stats = plan_option_proto.expr_use_json_stats();
+    if (plan_option_proto.collect_feature_bits()) {
+        plan_options.feature_recorder = std::make_shared<FeatureRecorder>();
+    }
     LOG_TRACE("plan_options.expr_use_json_stats: {}",
               plan_options.expr_use_json_stats);
 }
@@ -494,11 +502,9 @@ BuildProjectAndAggregationNodes(
     // filtered rows, so AggregationNode always receives input where
     // size() == number of existing rows (needed for count(*)).
     {
-        auto project_field_id_list = std::vector<FieldId>(
-            project_id_list.begin(), project_id_list.end());
         plannode = std::make_shared<plan::ProjectNode>(
             milvus::plan::GetNextPlanNodeId(),
-            std::move(project_field_id_list),
+            std::move(project_id_list),
             std::move(project_name_list),
             std::move(project_type_list),
             sources);
@@ -512,7 +518,7 @@ BuildProjectAndAggregationNodes(
         std::move(groupingKeys),
         std::move(agg_names),
         std::move(aggregates),
-        agg_sources);
+        std::move(agg_sources));
 }
 // Helper function to build ProjectNode for ORDER BY queries.
 // Returns {ProjectNode, deferred_field_ids, pipeline_field_ids}.
@@ -651,11 +657,28 @@ BuildOrderByNode(const proto::plan::QueryPlanNode& query,
             order_by_field.ascending(), order_by_field.nulls_first()));
     }
 
+    // Proxy appends missing grouping keys to ORDER BY before dispatch.
+    // Keep the segment limit for grouped queries only when the received order
+    // covers every grouping key. Otherwise a later reducer may need a partial
+    // group discarded by this segment.
+    // Queries without grouping keys retain their existing local limit.
+    const bool has_complete_group_order = std::all_of(
+        query.group_by_field_ids().begin(),
+        query.group_by_field_ids().end(),
+        [&](int64_t group_id) {
+            return std::any_of(query.order_by_fields().begin(),
+                               query.order_by_fields().end(),
+                               [&](const auto& field) {
+                                   return field.field_id() == group_id;
+                               });
+        });
+    const bool can_apply_limit =
+        query.group_by_field_ids_size() == 0 || has_complete_group_order;
     return std::make_shared<plan::OrderByNode>(
         milvus::plan::GetNextPlanNodeId(),
         std::move(sorting_keys),
         std::move(sorting_orders),
-        query.limit(),
+        can_apply_limit ? query.limit() : -1,
         sources);
 }
 }  // namespace
@@ -1327,7 +1350,7 @@ ProtoParser::ParseUnaryRangeExprs(const proto::plan::UnaryRangeExpr& expr_pb) {
         expr::ColumnInfo(column_info),
         expr_pb.op(),
         expr_pb.value(),
-        extra_values);
+        std::move(extra_values));
 }
 
 expr::TypedExprPtr
@@ -1338,7 +1361,10 @@ ProtoParser::ParseNullExprs(const proto::plan::NullExpr& expr_pb) {
     auto data_type = field.get_data_type();
 
     if (column_info.is_element_level()) {
-        Assert(data_type == DataType::ARRAY);
+        // `$[x] IS NULL` checks one struct element of a scalar, nested Array
+        // or vector sub-field.
+        Assert(data_type == DataType::ARRAY ||
+               data_type == DataType::VECTOR_ARRAY);
         Assert(field.get_element_type() ==
                static_cast<DataType>(column_info.element_type()));
     } else {
@@ -1549,7 +1575,7 @@ ProtoParser::ParseTermExprs(const proto::plan::TermExpr& expr_pb) {
         values.emplace_back(expr_pb.values(i));
     }
     return std::make_shared<expr::TermFilterExpr>(
-        columnInfo, values, expr_pb.is_in_field());
+        columnInfo, std::move(values), expr_pb.is_in_field());
 }
 
 expr::TypedExprPtr
@@ -1638,7 +1664,16 @@ ProtoParser::ParseJsonContainsExprs(
                static_cast<DataType>(columnInfo.element_type()));
     } else {
         Assert(data_type == (DataType)columnInfo.data_type());
-        Assert(!field.is_nested_array());
+        if (field.is_nested_array()) {
+            // array_contains*(s[i][tags], ...): the inner Array of struct
+            // element i, typed by its leaf.
+            Assert(columnInfo.nested_path_size() == 1);
+            const auto& leaf =
+                field.get_array_type_schema().array_element().array_element();
+            Assert(leaf.has_leaf_type() &&
+                   static_cast<DataType>(leaf.leaf_type()) ==
+                       static_cast<DataType>(columnInfo.element_type()));
+        }
     }
     std::vector<::milvus::proto::plan::GenericValue> values;
     values.reserve(expr_pb.elements_size());
@@ -1762,7 +1797,7 @@ ProtoParser::ParseExprs(const proto::plan::Expr& expr_pb,
             break;
         }
         case ppe::kElementFilterExpr: {
-            ThrowInfo(ExprInvalid,
+            ThrowInfo(UnexpectedError,
                       "ElementFilterExpr should be handled at PlanNode level, "
                       "not in ParseExprs");
         }
@@ -1784,8 +1819,10 @@ ProtoParser::ParseExprs(const proto::plan::Expr& expr_pb,
             // node carries a client blob up to 128 MiB of user values — which
             // then travels back to the client and into logs. An old QueryNode
             // that does not know a newer node type lands here, so this is
-            // exactly the path a rolling upgrade exercises.
-            ThrowInfo(ExprInvalid,
+            // exactly the path a rolling upgrade exercises -- a version skew,
+            // not caller input, so it must not be blamed on the request
+            // (ExprInvalid is an InputError and would stop replica failover).
+            ThrowInfo(UnexpectedError,
                       "unsupported or unset expr proto node (expr_case: {})",
                       static_cast<int>(expr_pb.expr_case()));
         }
@@ -1793,8 +1830,9 @@ ProtoParser::ParseExprs(const proto::plan::Expr& expr_pb,
     if (type_check(result->type())) {
         return result;
     }
-    ThrowInfo(
-        ExprInvalid, "expr type check failed, actual type: {}", result->type());
+    ThrowInfo(UnexpectedError,
+              "expr type check failed, actual type: {}",
+              result->type());
 }
 
 std::shared_ptr<rescores::Scorer>
@@ -1842,7 +1880,7 @@ ProtoParser::ExtractFilterOnlyPlan(
             return nullptr;
         }
         if (std::dynamic_pointer_cast<plan::VectorSearchNode>(node)) {
-            auto sources = node->sources();
+            const auto& sources = node->sources();
             if (sources.empty()) {
                 return nullptr;
             }

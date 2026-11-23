@@ -44,6 +44,24 @@ const (
 
 var CheckBucketRetryAttempts uint = 20
 
+// ResolveCloudProvider applies the endpoint compatibility rules used by the
+// MinIO client factory without changing the caller's configuration.
+func ResolveCloudProvider(c *Config) string {
+	switch c.CloudProvider {
+	case CloudProviderAliyun, CloudProviderGCP, CloudProviderTencent, CloudProviderHuawei:
+		return c.CloudProvider
+	}
+	// Preserve endpoint inference for the default S3-compatible client path.
+	switch {
+	case strings.Contains(c.Address, gcp.GcsDefaultAddress):
+		return CloudProviderGCP
+	case strings.Contains(c.Address, aliyun.OSSAddressFeatureString):
+		return CloudProviderAliyun
+	default:
+		return c.CloudProvider
+	}
+}
+
 func NewMinioClient(ctx context.Context, c *Config) (*minio.Client, error) {
 	var creds *credentials.Credentials
 	newMinioFn := minio.New
@@ -53,8 +71,7 @@ func NewMinioClient(ctx context.Context, c *Config) (*minio.Client, error) {
 		bucketLookupType = minio.BucketLookupDNS
 	}
 
-	matchedDefault := false
-	switch c.CloudProvider {
+	switch ResolveCloudProvider(c) {
 	case CloudProviderAliyun:
 		// auto doesn't work for aliyun, so we set to dns deliberately
 		bucketLookupType = minio.BucketLookupDNS
@@ -81,34 +98,6 @@ func NewMinioClient(ctx context.Context, c *Config) (*minio.Client, error) {
 			creds = credentials.NewStaticV4(c.AccessKeyID, c.SecretAccessKeyID, "")
 		}
 	default: // aws, minio
-		matchedDefault = true
-	}
-
-	// Compatibility logic. If the cloud provider is not specified in the request,
-	// it shall be inferred based on the service address.
-	if matchedDefault {
-		matchedDefault = false
-		switch {
-		case strings.Contains(c.Address, gcp.GcsDefaultAddress):
-			newMinioFn = gcp.NewMinioClient
-			if !c.UseIAM {
-				creds = credentials.NewStaticV2(c.AccessKeyID, c.SecretAccessKeyID, "")
-			}
-		case strings.Contains(c.Address, aliyun.OSSAddressFeatureString):
-			// auto doesn't work for aliyun, so we set to dns deliberately
-			bucketLookupType = minio.BucketLookupDNS
-			if c.UseIAM {
-				newMinioFn = aliyun.NewMinioClient
-			} else {
-				creds = credentials.NewStaticV4(c.AccessKeyID, c.SecretAccessKeyID, "")
-			}
-		default:
-			matchedDefault = true
-		}
-	}
-
-	if matchedDefault {
-		// aws, minio
 		if c.UseIAM {
 			creds = credentials.NewIAM("")
 		} else {
@@ -202,27 +191,39 @@ func NewAzureObjectStorageClient(ctx context.Context, c *Config) (*service.Clien
 	if c.UseIAM {
 		var cred azcore.TokenCredential
 		var credErr error
+		// credentialType names the branch taken below so it can be logged.
+		// Only the type is logged: never client/tenant IDs, secrets or tokens.
+		var credentialType string
+		// Credential priority: WI → SPN → MI.
+		// WI is checked first so that pods with valid Workload Identity config are not
+		// silently switched to a different identity when AZURE_CLIENT_SECRET is also set.
 		if os.Getenv("AZURE_FEDERATED_TOKEN_FILE") != "" {
+			credentialType = "WorkloadIdentity"
 			cred, credErr = azidentity.NewWorkloadIdentityCredential(&azidentity.WorkloadIdentityCredentialOptions{
 				ClientID:      os.Getenv("AZURE_CLIENT_ID"),
 				TenantID:      os.Getenv("AZURE_TENANT_ID"),
 				TokenFilePath: os.Getenv("AZURE_FEDERATED_TOKEN_FILE"),
 			})
-		} else {
+		} else if secret := os.Getenv("AZURE_CLIENT_SECRET"); secret != "" {
+			credentialType = "ServicePrincipal"
+			tenantID := os.Getenv("AZURE_TENANT_ID")
 			clientID := os.Getenv("AZURE_CLIENT_ID")
-			managedIdentityID := azidentity.ClientID("") // Default to System Assigned
-
-			if clientID != "" {
-				managedIdentityID = azidentity.ClientID(clientID)
+			if tenantID == "" || clientID == "" {
+				return nil, merr.WrapErrParameterMissingMsg("SPN authentication requires AZURE_TENANT_ID, AZURE_CLIENT_ID and AZURE_CLIENT_SECRET")
 			}
-
-			cred, credErr = azidentity.NewManagedIdentityCredential(&azidentity.ManagedIdentityCredentialOptions{
-				ID: managedIdentityID,
-			})
+			cred, credErr = azidentity.NewClientSecretCredential(tenantID, clientID, secret, nil)
+		} else {
+			credentialType = "ManagedIdentity"
+			opts := &azidentity.ManagedIdentityCredentialOptions{}
+			if clientID := os.Getenv("AZURE_CLIENT_ID"); clientID != "" {
+				opts.ID = azidentity.ClientID(clientID)
+			}
+			cred, credErr = azidentity.NewManagedIdentityCredential(opts)
 		}
 		if credErr != nil {
 			return nil, credErr
 		}
+		mlog.Info(ctx, "azure object storage credential selected", mlog.String("credentialType", credentialType))
 		client, err = service.NewClient("https://"+c.AccessKeyID+".blob."+c.Address+"/", cred, svcOpts)
 	} else {
 		connectionString := ""
@@ -357,7 +358,7 @@ func NewGcpObjectStorageClient(ctx context.Context, c *Config) (*storage.Client,
 	checkBucketFn := func() error {
 		bucket := client.Bucket(c.BucketName)
 		_, err = bucket.Attrs(ctx)
-		if errors.Is(err, storage.ErrBucketNotExist) && c.CreateBucket {
+		if IsGcsBucketNotExist(err) && c.CreateBucket {
 			mlog.Info(ctx, "gcs bucket does not exist, create bucket.", mlog.String("bucket name", c.BucketName))
 			err = client.Bucket(c.BucketName).Create(ctx, projectId, nil)
 			if err != nil {
@@ -372,6 +373,42 @@ func NewGcpObjectStorageClient(ctx context.Context, c *Config) (*storage.Client,
 		return nil, err
 	}
 	return client, nil
+}
+
+// IsGcsBucketNotExist reports whether err carries storage.ErrBucketNotExist.
+//
+// cloud.google.com/go/storage (>= v1.51) returns not-found as
+// fmt.Errorf("%w: %w", ErrBucketNotExist, apiErr). That wrapper only exposes
+// Unwrap() []error, which errors.Is from cockroachdb/errors v1.9.1 does not
+// traverse, so a plain errors.Is against the sentinel silently returns false.
+func IsGcsBucketNotExist(err error) bool {
+	return isInErrorTree(err, storage.ErrBucketNotExist)
+}
+
+// IsGcsObjectNotExist reports whether err carries storage.ErrObjectNotExist.
+// See IsGcsBucketNotExist for why a plain errors.Is is not enough.
+func IsGcsObjectNotExist(err error) bool {
+	return isInErrorTree(err, storage.ErrObjectNotExist)
+}
+
+// isInErrorTree is errors.Is that also descends into multi-%w wrappers
+// (Unwrap() []error), which cockroachdb/errors v1.9.1 does not follow.
+func isInErrorTree(err, target error) bool {
+	if errors.Is(err, target) {
+		return true
+	}
+	for c := err; c != nil; c = errors.UnwrapOnce(c) {
+		multi, ok := c.(interface{ Unwrap() []error })
+		if !ok {
+			continue
+		}
+		for _, inner := range multi.Unwrap() {
+			if isInErrorTree(inner, target) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func parseTLSMinVersion(v string) (uint16, error) {

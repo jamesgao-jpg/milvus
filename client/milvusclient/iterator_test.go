@@ -21,9 +21,12 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/samber/lo"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 
@@ -57,6 +60,17 @@ func (s *SearchIteratorSuite) TestSearchIteratorOptionWithNamespace() {
 
 	s.Require().NoError(err)
 	s.Equal(namespace, req.GetNamespace())
+}
+
+func (s *SearchIteratorSuite) TestSearchIteratorOptionWithRLSContext() {
+	opt := NewSearchIteratorOption("coll", entity.FloatVector(lo.RepeatBy(128, func(_ int) float32 {
+		return rand.Float32()
+	}))).WithRLSPrincipal("alice").WithSkipRLS(true).WithBatchSize(10)
+	req, err := opt.SearchOption().Request()
+
+	s.Require().NoError(err)
+	s.Equal("alice", req.GetRlsPrincipal())
+	s.True(req.GetSkipRls())
 }
 
 func (s *SearchIteratorSuite) TestSearchIteratorInit() {
@@ -133,6 +147,21 @@ func (s *SearchIteratorSuite) TestSearchIteratorInit() {
 				return rand.Float32()
 			}))))
 			s.Error(err)
+		})
+
+		// The RPC succeeds but its status carries the error; the iterator must
+		// return it instead of searching without a collection ID and schema.
+		s.Run("describe_status_fail", func() {
+			collectionName := fmt.Sprintf("coll_%s", s.randString(6))
+
+			s.mock.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
+				Status: merr.Status(merr.WrapErrCollectionNotFound(collectionName)),
+			}, nil).Once()
+			_, err := s.client.SearchIterator(ctx, NewSearchIteratorOption(collectionName, entity.FloatVector(lo.RepeatBy(128, func(_ int) float32 {
+				return rand.Float32()
+			}))))
+			s.ErrorIs(err, merr.ErrCollectionNotFound)
+			s.NotErrorIs(err, ErrServerVersionIncompatible)
 		})
 
 		s.Run("not_v2_result", func() {
@@ -425,6 +454,91 @@ func (s *SearchIteratorSuite) TestNextWithLimit() {
 	s.ErrorIs(err, io.EOF, "limit reached, return EOF")
 }
 
+func (s *SearchIteratorSuite) TestNextMalformedResponse() {
+	ctx := context.Background()
+	token := fmt.Sprintf("iter_token_%s", s.randString(8))
+	idsOf := func(ids ...int64) *schemapb.IDs {
+		return &schemapb.IDs{IdField: &schemapb.IDs_IntId{IntId: &schemapb.LongArray{Data: ids}}}
+	}
+
+	cases := []struct {
+		name    string
+		results *schemapb.SearchResultData
+		errMsg  string
+	}{
+		{
+			name: "element indices mismatch hit count",
+			results: &schemapb.SearchResultData{
+				NumQueries:     1,
+				TopK:           2,
+				Ids:            idsOf(1, 2),
+				Scores:         []float32{0.2, 0.1},
+				Topks:          []int64{2},
+				ElementIndices: &schemapb.LongArray{Data: []int64{0}},
+			},
+			errMsg: "1 element indices for 2 hits",
+		},
+		{
+			name: "topk missing",
+			results: &schemapb.SearchResultData{
+				NumQueries: 1,
+				TopK:       1,
+				Ids:        idsOf(1),
+				Scores:     []float32{0.1},
+			},
+			errMsg: "topk not returned",
+		},
+		{
+			name: "no query",
+			results: &schemapb.SearchResultData{
+				NumQueries: 0,
+				TopK:       1,
+			},
+			errMsg: "no result set",
+		},
+	}
+
+	for _, tc := range cases {
+		s.Run(tc.name, func() {
+			collectionName := fmt.Sprintf("coll_%s", s.randString(6))
+			s.mock.EXPECT().DescribeCollection(mock.Anything, mock.Anything).Return(&milvuspb.DescribeCollectionResponse{
+				CollectionID: 1,
+				Schema:       s.schema.ProtoMessage(),
+			}, nil).Once()
+			// compatibility probe
+			s.mock.EXPECT().Search(mock.Anything, mock.Anything).Return(&milvuspb.SearchResults{
+				Status: merr.Success(),
+				Results: &schemapb.SearchResultData{
+					NumQueries:              1,
+					TopK:                    1,
+					Ids:                     idsOf(1),
+					Scores:                  []float32{0.1},
+					Topks:                   []int64{1},
+					SearchIteratorV2Results: &schemapb.SearchIteratorV2Results{Token: token},
+				},
+			}, nil).Once()
+
+			iter, err := s.client.SearchIterator(ctx, NewSearchIteratorOption(collectionName, entity.FloatVector(lo.RepeatBy(128, func(_ int) float32 {
+				return rand.Float32()
+			}))))
+			s.Require().NoError(err)
+
+			tc.results.SearchIteratorV2Results = &schemapb.SearchIteratorV2Results{Token: token}
+			s.mock.EXPECT().Search(mock.Anything, mock.Anything).Return(&milvuspb.SearchResults{
+				Status:  merr.Success(),
+				Results: tc.results,
+			}, nil).Once()
+
+			s.NotPanics(func() {
+				_, err = iter.Next(ctx)
+			})
+			s.Require().Error(err)
+			s.NotErrorIs(err, io.EOF)
+			s.ErrorContains(err, tc.errMsg)
+		})
+	}
+}
+
 func TestSearchIterator(t *testing.T) {
 	suite.Run(t, new(SearchIteratorSuite))
 }
@@ -450,6 +564,18 @@ func (s *QueryIteratorSuite) TestQueryIteratorOptionWithNamespace() {
 
 	s.Require().NoError(err)
 	s.Equal(namespace, req.GetNamespace())
+}
+
+func (s *QueryIteratorSuite) TestQueryIteratorOptionWithRLSContext() {
+	req, err := NewQueryIteratorOption("coll").
+		WithRLSPrincipal("alice").
+		WithSkipRLS(true).
+		WithBatchSize(10).
+		Request()
+
+	s.Require().NoError(err)
+	s.Equal("alice", req.GetRlsPrincipal())
+	s.True(req.GetSkipRls())
 }
 
 func (s *QueryIteratorSuite) TestQueryIteratorInit() {
@@ -724,4 +850,38 @@ func (s *QueryIteratorSuite) TestQueryIteratorWithFilter() {
 
 func TestQueryIterator(t *testing.T) {
 	suite.Run(t, new(QueryIteratorSuite))
+}
+
+func TestComposeIteratorExprVarChar(t *testing.T) {
+	newIt := func(expr string, pk any) *queryIterator {
+		return &queryIterator{
+			expr:    expr,
+			pkField: entity.NewField().WithName("ID").WithDataType(entity.FieldTypeVarChar),
+			lastPK:  pk,
+		}
+	}
+
+	t.Run("plain value", func(t *testing.T) {
+		assert.Equal(t, `ID > "abc"`, newIt("", "abc").composeIteratorExpr())
+	})
+
+	t.Run("value with double quote", func(t *testing.T) {
+		assert.Equal(t, `ID > "a\"b"`, newIt("", `a"b`).composeIteratorExpr())
+	})
+
+	t.Run("special characters round-trip", func(t *testing.T) {
+		// The emitted literal must unquote back to the original value, the way the
+		// server parses it, so iteration keeps advancing past such a key.
+		for _, pk := range []string{`a"b`, `a\b`, "a\nb", "trailing\\", "plain"} {
+			got := newIt("", pk).composeIteratorExpr()
+			literal := strings.TrimPrefix(got, "ID > ")
+			unquoted, err := strconv.Unquote(literal)
+			assert.NoError(t, err)
+			assert.Equal(t, pk, unquoted)
+		}
+	})
+
+	t.Run("combined with base expression", func(t *testing.T) {
+		assert.Equal(t, `(age > 10) and ID > "a\"b"`, newIt("age > 10", `a"b`).composeIteratorExpr())
+	})
 }

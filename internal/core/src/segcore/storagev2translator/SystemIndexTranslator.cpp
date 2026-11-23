@@ -32,22 +32,14 @@ namespace {
 
 int64_t
 estimate_timestamp_index_bytes(int64_t num_rows, int64_t num_chunks) {
-    auto num_slices = std::max<int64_t>(1, (num_rows + 4095) / 4096);
+    auto num_slices = std::max<int64_t>(
+        1,
+        (num_rows + (kTimestampIndexSliceRows - 1)) / kTimestampIndexSliceRows);
     return sizeof(TimestampIndex) +
            num_slices *
                static_cast<int64_t>(sizeof(int64_t) * 2 + sizeof(Timestamp)) +
            num_chunks *
                static_cast<int64_t>(sizeof(const Timestamp*) + sizeof(int64_t));
-}
-
-TimestampIndex
-build_timestamp_index(const Timestamp* data, size_t num_rows) {
-    TimestampIndex index;
-    auto min_slice_length = num_rows < 4096 ? 1 : 4096;
-    auto meta = GenerateFakeSlices(data, num_rows, min_slice_length);
-    index.set_length_meta(std::move(meta));
-    index.build_with(data, num_rows);
-    return index;
 }
 
 std::unique_ptr<OffsetMap>
@@ -153,10 +145,12 @@ TimestampIndexTranslator::cell_id_of(milvus::cachinglayer::uid_t) const {
     return 0;
 }
 
-std::pair<milvus::cachinglayer::ResourceUsage,
-          milvus::cachinglayer::ResourceUsage>
-TimestampIndexTranslator::estimated_byte_size_of_cell(
-    milvus::cachinglayer::cid_t) const {
+milvus::cachinglayer::LoadingResourceUsage
+TimestampIndexTranslator::estimated_loading_usage(
+    const std::vector<milvus::cachinglayer::cid_t>& cids) const {
+    if (cids.empty()) {
+        return {};
+    }
     return {
         {estimate_timestamp_index_bytes(num_rows_, column_->num_chunks()), 0},
         {0, 0}};
@@ -179,17 +173,22 @@ TimestampIndexTranslator::get_cells(
     // pins to GroupChunk cells — callers read raw timestamps by pinning the
     // timestamp column directly. This avoids a DList deadlock where evicting
     // this cell would unpin GroupChunk cells under the same list_mtx_.
+    // TODO(local-format): Keep this system column Raw and preserve GetAllChunks
+    // until the full-column pointer consumer accepts a cursor and can honor its
+    // borrowed-data lifetime, with equivalent pin/loading behavior.
     auto all_chunks = column_->GetAllChunks(ctx);
     TimestampIndex index;
     if (all_chunks.size() == 1) {
         auto* fixed_chunk = static_cast<FixedWidthChunk*>(all_chunks[0].get());
         auto span = fixed_chunk->Span();
         auto* ts_ptr = static_cast<const Timestamp*>(span.data());
-        AssertInfo(static_cast<int64_t>(span.row_count()) == num_rows_,
-                   "timestamp chunk row count {} != expected {}",
-                   span.row_count(),
-                   num_rows_);
-        index = build_timestamp_index(ts_ptr, num_rows_);
+        if (!(static_cast<int64_t>(span.row_count()) == num_rows_)) {
+            ThrowInfo(ErrorCode::DataFormatBroken,
+                      "timestamp chunk row count {} != expected {}",
+                      span.row_count(),
+                      num_rows_);
+        }
+        index = BuildTimestampIndex(ts_ptr, num_rows_);
     } else {
         std::vector<Timestamp> temp(num_rows_);
         size_t offset = 0;
@@ -202,11 +201,13 @@ TimestampIndexTranslator::get_cells(
                 span.row_count() * sizeof(*temp.data()));
             offset += span.row_count();
         }
-        AssertInfo(static_cast<int64_t>(offset) == num_rows_,
-                   "timestamp total row count {} != expected {}",
-                   offset,
-                   num_rows_);
-        index = build_timestamp_index(temp.data(), num_rows_);
+        if (!(static_cast<int64_t>(offset) == num_rows_)) {
+            ThrowInfo(ErrorCode::DataFormatBroken,
+                      "timestamp total row count {} != expected {}",
+                      offset,
+                      num_rows_);
+        }
+        index = BuildTimestampIndex(temp.data(), num_rows_);
     }
 
     std::vector<std::pair<milvus::cachinglayer::cid_t,
@@ -251,10 +252,12 @@ PkIndexTranslator::cell_id_of(milvus::cachinglayer::uid_t) const {
     return 0;
 }
 
-std::pair<milvus::cachinglayer::ResourceUsage,
-          milvus::cachinglayer::ResourceUsage>
-PkIndexTranslator::estimated_byte_size_of_cell(
-    milvus::cachinglayer::cid_t) const {
+milvus::cachinglayer::LoadingResourceUsage
+PkIndexTranslator::estimated_loading_usage(
+    const std::vector<milvus::cachinglayer::cid_t>& cids) const {
+    if (cids.empty()) {
+        return {};
+    }
     return {{estimate_pk_index_bytes(
                  data_type_, column_->NumRows(), is_sorted_by_pk_),
              0},

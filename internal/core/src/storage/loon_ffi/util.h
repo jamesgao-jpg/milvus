@@ -12,6 +12,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "common/type_c.h"
@@ -34,16 +35,22 @@ std::shared_ptr<milvus_storage::api::Properties>
 MakeInternalPropertiesFromStorageConfig(CStorageConfig c_storage_config);
 
 /**
- * @brief Create Properties for local filesystem storage
+ * @brief fs.root_path handed to the loon / Arrow filesystem for a storage
+ * config.
  *
- * Creates a minimal Properties object configured for local file storage
- * with the specified path as the root.
- *
- * @param c_path Local filesystem path to use as storage root
- * @return Shared pointer to Properties configured for local storage
+ * Milvus keys already carry the storage prefix: localStorage.path for local
+ * (`/var/lib/milvus/data/insert_log/...`) and minio.rootPath for remote
+ * (`files/insert_log/...`). The filesystem therefore has to be rooted at the
+ * namespace root, which is the bucket for remote (milvus-storage never
+ * applies root_path there) and "/" for local. Rooting the local
+ * SubTreeFileSystem at localStorage.path joins the prefix twice
+ * (milvus-storage #351, milvus #53051), making complete keys differ from their
+ * physical locations.
  */
-std::shared_ptr<milvus_storage::api::Properties>
-MakeInternalLocalProperies(const char* c_path);
+inline constexpr const char* kLoonLocalFSRootPath = "/";
+
+std::string
+LoonFSRootPath(const std::string& storage_type, const std::string& root_path);
 
 /**
  * @brief Convert StorageConfig to C-style CStorageConfig
@@ -71,7 +78,49 @@ ToCStorageConfig(const milvus::storage::StorageConfig& config);
 std::shared_ptr<milvus_storage::api::Manifest>
 GetLoonManifest(
     const std::string& path,
-    const std::shared_ptr<milvus_storage::api::Properties>& properties);
+    const std::shared_ptr<const milvus_storage::api::Properties>& properties);
+
+struct LoonManifestPath {
+    std::string base_path;
+    int64_t version = 0;
+    // Byte size of the manifest object of this revision as the path records it,
+    // or a non-positive value when unknown. A known size lets the read skip
+    // asking storage for it and must match the object exactly. It is not part
+    // of the revision identity.
+    int64_t size = -1;
+};
+
+/**
+ * @brief Parse a manifest path JSON
+ *
+ * @return the revision the path names, or std::nullopt when path is not a JSON
+ *         object with a string "base_path" and an integer "ver". An optional
+ *         "size" that is not an integer is ignored.
+ */
+std::optional<LoonManifestPath>
+ParseLoonManifestPath(const std::string& path);
+
+/**
+ * @brief Read the manifest of the revision a manifest path names
+ *
+ * Opens the revision with the size the path records, so the read can skip
+ * asking storage for it. Error classification is left to the caller.
+ */
+LoonFFIResult
+ReadLoonManifest(const LoonManifestPath& manifest_path,
+                 const LoonProperties* properties,
+                 LoonManifest** out_manifest);
+
+/**
+ * @brief Check whether two manifest paths name the same manifest revision
+ *
+ * A manifest path is identified by its "base_path" and "ver"; JSON key order
+ * and optional fields do not change the revision. Values that are not
+ * manifest path JSON are compared as plain strings. Mirrors Go's
+ * packed.SameManifestPath.
+ */
+bool
+IsSameLoonManifestPath(const std::string& lhs, const std::string& rhs);
 
 /**
  * @brief Inject every external_spec-derived property for external collections.
@@ -84,7 +133,8 @@ GetLoonManifest(
  *       Layer 1: derive storage_type / use_ssl / bucket_name / address from
  *                the external_source URI (Milvus form by default).
  *       Layer 2: apply external_spec.extfs JSON with allowlist gating.
- *       Post-process: AWS-form swap + Tier-1/2 endpoint derivation.
+ *       Post-process: explicit endpoint_url mapping, or the legacy AWS-form
+ *       swap + Tier-1/2 endpoint derivation when endpoint_url is absent.
  *   - format-layer — per-format keys derived from spec.format (e.g.
  *     reader.exttable.snapshot_id when format="iceberg-table").
  *
@@ -96,3 +146,11 @@ InjectExternalSpecProperties(milvus_storage::api::Properties& properties,
                              int64_t collection_id,
                              const std::string& external_source,
                              const std::string& external_spec);
+
+// Server-owned startup policy. An uninitialized or empty policy denies brokers.
+arrow::Result<std::string>
+NormalizeBrokerEndpoint(const std::string& raw);
+arrow::Status
+InitCredentialBrokerPolicy(const std::string& endpoints_json);
+arrow::Status
+CheckCredentialBrokerEndpoint(const std::string& endpoint);

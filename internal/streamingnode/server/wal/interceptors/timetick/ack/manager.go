@@ -5,16 +5,25 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
+
 	"github.com/milvus-io/milvus/internal/streamingnode/server/resource"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/metricsutil"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 // AckManager manages the timestampAck.
 type AckManager struct {
+	// Serialize allocation through registration so a later timestamp cannot be
+	// confirmed before an earlier timestamp has entered notAckHeap. Only Allocate
+	// takes this lock; waiting for the shared TSO allocator must not block ACKs.
+	allocateMu sync.Mutex
+	// Protect the acknowledgement state below. When both locks are needed,
+	// acquire allocateMu before mu; never wait for the TSO allocator while holding mu.
 	mu                    sync.Mutex
-	lastAllocatedTimeTick uint64                // The last allocated time tick, the latest timestamp allocated by the allocator.
+	lastAllocatedTimeTick uint64                // The latest timestamp registered in notAckHeap.
 	lastConfirmedTimeTick uint64                // The last confirmed time tick, the message which time tick less than lastConfirmedTimeTick has been committed into wal.
 	notAckHeap            typeutil.Heap[*Acker] // A minimum heap of timestampAck to search minimum allocated but not ack timestamp in list.
 	// Actually, the notAckHeap can be replaced by a list because of the the allocate operation is protected by mutex,
@@ -31,6 +40,7 @@ func NewAckManager(
 	metrics *metricsutil.TimeTickMetrics,
 ) *AckManager {
 	return &AckManager{
+		allocateMu:            sync.Mutex{},
 		mu:                    sync.Mutex{},
 		lastAllocatedTimeTick: 0,
 		notAckHeap:            typeutil.NewHeap[*Acker](&ackersOrderByTimestamp{}),
@@ -53,8 +63,8 @@ func (ta *AckManager) AllocateWithBarrier(ctx context.Context, barrierTimeTick u
 // Concurrent safe to call with Sync and Allocate.
 func (ta *AckManager) Allocate(ctx context.Context) (*Acker, error) {
 	metricsGuard := ta.metrics.StartAllocateTimeTick()
-	ta.mu.Lock()
-	defer ta.mu.Unlock()
+	ta.allocateMu.Lock()
+	defer ta.allocateMu.Unlock()
 
 	// allocate one from underlying allocator first.
 	ts, err := resource.Resource().TSOAllocator().Allocate(ctx)
@@ -62,6 +72,10 @@ func (ta *AckManager) Allocate(ctx context.Context) (*Acker, error) {
 		metricsGuard.Done(0, err)
 		return nil, err
 	}
+	// An append cannot reach the WAL before registration, so concurrent ACKs
+	// only need registered timestamps when capturing their EndTimestamp.
+	ta.mu.Lock()
+	defer ta.mu.Unlock()
 	ta.lastAllocatedTimeTick = ts
 
 	// create new timestampAck for ack process.
@@ -74,6 +88,39 @@ func (ta *AckManager) Allocate(ctx context.Context) (*Acker, error) {
 	ta.notAckHeap.Push(acker)
 	metricsGuard.Done(ts, err)
 	return acker, nil
+}
+
+// AllocateForAppend retries allocation until success or WAL lifecycle cancellation.
+// Neither the shared allocator's lock nor either AckManager lock is held across retry backoff.
+// Background TimeTick sync uses Allocate directly: its context belongs to the
+// process-wide inspector, so an infinite retry there could block a WAL's shutdown.
+func (ta *AckManager) AllocateForAppend(ctx context.Context, barrierTimeTick uint64) (*Acker, error) {
+	b := backoff.NewExponentialBackOff()
+	b.InitialInterval = 10 * time.Millisecond
+	b.MaxInterval = 5 * time.Second
+	b.MaxElapsedTime = 0
+	b.Reset()
+	for {
+		if ctx.Err() != nil {
+			return nil, context.Cause(ctx)
+		}
+		var acker *Acker
+		var err error
+		if barrierTimeTick == 0 {
+			acker, err = ta.Allocate(ctx)
+		} else {
+			acker, err = ta.AllocateWithBarrier(ctx, barrierTimeTick)
+		}
+		if err == nil {
+			return acker, nil
+		}
+		mlog.Warn(ctx, "allocate WAL timestamp failed, retrying", mlog.Err(err))
+		select {
+		case <-ctx.Done():
+			return nil, context.Cause(ctx)
+		case <-time.After(b.NextBackOff()):
+		}
+	}
 }
 
 // SyncAndGetAcknowledged syncs the ack records with allocator, and get the last all acknowledged info.

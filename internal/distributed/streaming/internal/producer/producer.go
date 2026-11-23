@@ -26,7 +26,12 @@ var errGracefulShutdown = errors.New("graceful shutdown")
 
 // ProducerOptions is the options for creating a producer.
 type ProducerOptions struct {
-	PChannel string
+	OnSchemaVersionMismatch func(vchannel string)
+	PChannel                string
+}
+
+type ProduceOption struct {
+	IdempotencyKey string
 }
 
 // NewResumableProducer creates a new producer.
@@ -83,6 +88,10 @@ type ResumableProducer struct {
 
 // BeginProduce begins a new produce task.
 func (p *ResumableProducer) BeginProduce(ctx context.Context, msgs ...message.MutableMessage) (*ProduceGuard, error) {
+	return p.BeginProduceWithOptions(ctx, msgs)
+}
+
+func (p *ResumableProducer) BeginProduceWithOptions(ctx context.Context, msgs []message.MutableMessage, opts ...ProduceOption) (*ProduceGuard, error) {
 	if len(msgs) == 0 {
 		panic("begin produce with no messages")
 	}
@@ -100,6 +109,7 @@ func (p *ResumableProducer) BeginProduce(ctx context.Context, msgs ...message.Mu
 		return &ProduceGuard{
 			producer: p,
 			msgs:     msgs,
+			opts:     opts,
 			r:        nil,
 		}, nil
 	}
@@ -111,6 +121,7 @@ func (p *ResumableProducer) BeginProduce(ctx context.Context, msgs ...message.Mu
 	return &ProduceGuard{
 		producer: p,
 		msgs:     msgs,
+		opts:     opts,
 		r:        r,
 	}, nil
 }
@@ -129,6 +140,9 @@ func (p *ResumableProducer) produceInternal(ctx context.Context, msg message.Mut
 		}
 		appendCtx, span := p.startDistAppendSpanIfRemote(ctx, producerHandler, msg)
 		produceResult, err := producerHandler.Append(appendCtx, msg)
+		if sErr := status.AsStreamingError(err); sErr != nil && sErr.IsSchemaVersionMismatch() && p.opts.OnSchemaVersionMismatch != nil {
+			p.opts.OnSchemaVersionMismatch(msg.VChannel())
+		}
 		if span != nil {
 			if err != nil {
 				span.RecordError(err)

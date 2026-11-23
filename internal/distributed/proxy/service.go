@@ -52,6 +52,7 @@ import (
 	"github.com/milvus-io/milvus/internal/distributed/proxy/httpserver"
 	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/distributed/utils"
+	"github.com/milvus-io/milvus/internal/featureusage"
 	mhttp "github.com/milvus-io/milvus/internal/http"
 	"github.com/milvus-io/milvus/internal/proxy"
 	"github.com/milvus-io/milvus/internal/proxy/accesslog"
@@ -110,6 +111,8 @@ type Server struct {
 
 	etcdCli        *clientv3.Client
 	mixCoordClient types.MixCoordClient
+
+	viewQueryClientClose func()
 }
 
 // NewServer create a Proxy server.
@@ -126,11 +129,26 @@ func NewServer(ctx context.Context, factory dependency.Factory) (*Server, error)
 	return server, err
 }
 
+// metricsPortAuthMiddleware protects the console API on the metrics port.
+// The retired non-underscore REST API is no longer mounted on this router.
+func metricsPortAuthMiddleware() gin.HandlerFunc {
+	consoleAuth := mhttp.GinAdminAuthMiddleware(true)
+	legacyEnabled := proxy.Params.CommonCfg.AuthorizationEnabled.GetAsBool()
+	return func(c *gin.Context) {
+		if mhttp.AdminAuthEnabled() {
+			consoleAuth(c)
+		} else if legacyEnabled {
+			authenticate(c)
+		}
+	}
+}
+
 func authenticate(c *gin.Context) {
 	username, password, ok := httpserver.ParseUsernamePassword(c)
 	if ok {
 		if proxy.PasswordVerify(c, username, password) {
-			mlog.Debug(context.TODO(), "auth successful", mlog.String("username", username))
+			mlog.Debug(c.Request.Context(), "auth successful", mlog.String("username", username))
+			featureusage.Hit(featureusage.FeatureAuthPassword)
 			c.Set(httpserver.ContextUsername, username)
 			c.Set(httpserver.ContextToken, fmt.Sprintf("%s%s%s", username, util.CredentialSeparator, password))
 			return
@@ -140,14 +158,15 @@ func authenticate(c *gin.Context) {
 	if rawToken != "" && !strings.Contains(rawToken, util.CredentialSeparator) {
 		user, err := proxy.VerifyAPIKey(rawToken)
 		if err == nil {
+			featureusage.Hit(featureusage.FeatureAuthAPIKey)
 			c.Set(httpserver.ContextUsername, user)
 			c.Set(httpserver.ContextToken, rawToken)
 			return
 		}
-		mlog.Warn(context.TODO(), "fail to verify apikey", mlog.Err(err))
+		mlog.Warn(c.Request.Context(), "fail to verify apikey", mlog.Err(err))
 	}
 
-	hookutil.GetExtension().ReportAction(context.Background(), nil, &milvuspb.BoolResponse{
+	hookutil.GetExtension().ReportAction(c.Request.Context(), nil, &milvuspb.BoolResponse{
 		Status: merr.Status(merr.ErrNeedAuthenticate),
 	}, nil, c.FullPath(), hookutil.ActionAuthorize)
 	c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{mhttp.HTTPReturnCode: merr.Code(merr.ErrNeedAuthenticate), mhttp.HTTPReturnMessage: merr.ErrNeedAuthenticate.Error()})
@@ -165,24 +184,41 @@ func (s *Server) registerHTTPServer() {
 	if !proxy.Params.HTTPCfg.DebugMode.GetAsBool() {
 		gin.SetMode(gin.ReleaseMode)
 	}
-	metricsGinHandler := gin.Default()
-	apiv1 := metricsGinHandler.Group(apiPathPrefix)
-	apiv1.Use(httpserver.RequestHandlerFunc)
-	// Add authentication middleware if authorization is enabled
-	// This ensures the metrics port follows the same security policy as the main HTTP server
-	if proxy.Params.CommonCfg.AuthorizationEnabled.GetAsBool() {
-		apiv1.Use(authenticate)
-	}
-	handlers := httpserver.NewHandlers(s.proxy)
-	handlers.RegisterRoutesTo(apiv1)
-	if p, ok := s.proxy.(*proxy.Proxy); ok {
-		p.RegisterRestRouter(apiv1)
-	}
 	mhttp.Register(&mhttp.Handler{
 		Path:        mhttp.RootPath,
 		HandlerFunc: nil,
-		Handler:     metricsGinHandler.Handler(),
+		Handler:     newMetricsPortEngine(gin.Default(), s.proxy).Handler(),
 	})
+}
+
+// newMetricsPortEngine mounts everything the proxy serves on the metrics port.
+//
+// One group, one auth middleware, passed to Group rather than Use'd after it,
+// so the handler slice the routes inherit is the one this builds. Tests drive
+// this function rather than repeating its shape, because a test that
+// reassembles the tree by hand cannot notice the assembly changing under it —
+// and the assembly is exactly what makes the gate apply.
+func newMetricsPortEngine(engine *gin.Engine, proxyComponent types.ProxyComponent) *gin.Engine {
+	if !proxy.Params.HTTPCfg.EnableV1.GetAsBool() {
+		return engine
+	}
+	apiv1 := engine.Group(apiPathPrefix,
+		httpserver.RequestHandlerFunc, metricsPortAuthMiddleware())
+	if p, ok := proxyComponent.(consoleRouterRegistrar); ok {
+		// The web console API — cluster info and configs, database and
+		// collection listings, slow queries, coordinator and node distribution,
+		// plus the telemetry routes that push commands to connected clients.
+		p.RegisterRestRouter(apiv1)
+	}
+	return engine
+}
+
+// consoleRouterRegistrar is what *proxy.Proxy satisfies. Asserting on the
+// behavior rather than the concrete type is what lets a test put the console
+// routes on this tree; with a concrete assertion the whole console surface is
+// unreachable from any test and silently uncovered.
+type consoleRouterRegistrar interface {
+	RegisterRestRouter(router gin.IRouter)
 }
 
 func (s *Server) httpHandler(ginHandler http.Handler) http.Handler {
@@ -222,14 +258,16 @@ func (s *Server) startHTTPServer(errChan chan error) {
 	if proxy.Params.CommonCfg.AuthorizationEnabled.GetAsBool() {
 		ginHandler.Use(authenticate)
 	}
-	app := ginHandler.Group("/v1")
-	httpserver.NewHandlersV1(s.proxy).RegisterRoutesToV1(app)
+	if proxy.Params.HTTPCfg.EnableV1.GetAsBool() {
+		app := ginHandler.Group("/v1")
+		httpserver.NewHandlersV1(s.proxy).RegisterRoutesToV1(app)
+	}
 	appV2 := ginHandler.Group("/v2/vectordb")
 	httpserver.NewHandlersV2(s.proxy).RegisterRoutesToV2(appV2)
 	http2Server := &http2.Server{}
 	Params := &proxy.Params.HTTPCfg
 	s.httpServer = &http.Server{
-		Handler:           h2c.NewHandler(s.httpHandler(ginHandler), http2Server),
+		Handler:           h2c.NewHandler(s.httpHandler(httpserver.DQLStreamingHTTPHandler(ginHandler)), http2Server),
 		ReadHeaderTimeout: Params.ReadHeaderTimeout.GetAsDurationByParse(),
 		ReadTimeout:       Params.ReadTimeout.GetAsDurationByParse(),
 		WriteTimeout:      Params.WriteTimeout.GetAsDurationByParse(),
@@ -592,6 +630,21 @@ func (s *Server) init() error {
 	s.proxy.SetMixCoordClient(s.mixCoordClient)
 	mlog.Debug(context.TODO(), "set MixCoord client for Proxy done")
 
+	viewQueryClientReady := false
+	if setter, ok := s.proxy.(viewQueryClientSetter); ok {
+		mlog.Debug(context.TODO(), "init view query client for Proxy")
+		if err := s.initViewQueryClient(setter); err != nil {
+			mlog.Warn(context.TODO(), "failed to init view query client for Proxy", mlog.Err(err))
+			return err
+		}
+		defer func() {
+			if !viewQueryClientReady {
+				s.closeViewQueryClient()
+			}
+		}()
+		mlog.Debug(context.TODO(), "init view query client for Proxy done")
+	}
+
 	if HTTPParams.Enabled.GetAsBool() {
 		registerHTTPHandlerOnce.Do(func() {
 			mlog.Info(context.TODO(), "register Proxy http server")
@@ -612,6 +665,7 @@ func (s *Server) init() error {
 	// Intentionally print to stdout, which is usually a sign that Milvus is ready to serve.
 	fmt.Println("---Milvus Proxy successfully initialized and ready to serve!---")
 
+	viewQueryClientReady = true
 	return nil
 }
 
@@ -656,6 +710,7 @@ func (s *Server) Stop() (err error) {
 	if s.etcdCli != nil {
 		defer s.etcdCli.Close()
 	}
+	defer s.closeViewQueryClient()
 
 	gracefulWg := sync.WaitGroup{}
 
@@ -1001,7 +1056,7 @@ func (s *Server) GetCompactionStateWithPlans(ctx context.Context, req *milvuspb.
 	return s.proxy.GetCompactionStateWithPlans(ctx, req)
 }
 
-// GetFlushState gets the flush state of the collection based on the provided flush ts and segment IDs.
+// GetFlushState gets the flush state based on the provided segment IDs.
 func (s *Server) GetFlushState(ctx context.Context, req *milvuspb.GetFlushStateRequest) (*milvuspb.GetFlushStateResponse, error) {
 	return s.proxy.GetFlushState(ctx, req)
 }
@@ -1149,6 +1204,38 @@ func (s *Server) OperatePrivilegeGroup(ctx context.Context, req *milvuspb.Operat
 	return s.proxy.OperatePrivilegeGroup(ctx, req)
 }
 
+func (s *Server) CreateRowPolicy(ctx context.Context, req *milvuspb.CreateRowPolicyRequest) (*commonpb.Status, error) {
+	return s.proxy.CreateRowPolicy(ctx, req)
+}
+
+func (s *Server) UpdateRowPolicy(ctx context.Context, req *milvuspb.UpdateRowPolicyRequest) (*commonpb.Status, error) {
+	return s.proxy.UpdateRowPolicy(ctx, req)
+}
+
+func (s *Server) DropRowPolicy(ctx context.Context, req *milvuspb.DropRowPolicyRequest) (*commonpb.Status, error) {
+	return s.proxy.DropRowPolicy(ctx, req)
+}
+
+func (s *Server) ListRowPolicies(ctx context.Context, req *milvuspb.ListRowPoliciesRequest) (*milvuspb.ListRowPoliciesResponse, error) {
+	return s.proxy.ListRowPolicies(ctx, req)
+}
+
+func (s *Server) SetRLSPrincipalTags(ctx context.Context, req *milvuspb.SetRLSPrincipalTagsRequest) (*commonpb.Status, error) {
+	return s.proxy.SetRLSPrincipalTags(ctx, req)
+}
+
+func (s *Server) GetRLSPrincipalTags(ctx context.Context, req *milvuspb.GetRLSPrincipalTagsRequest) (*milvuspb.GetRLSPrincipalTagsResponse, error) {
+	return s.proxy.GetRLSPrincipalTags(ctx, req)
+}
+
+func (s *Server) ListRLSPrincipals(ctx context.Context, req *milvuspb.ListRLSPrincipalsRequest) (*milvuspb.ListRLSPrincipalsResponse, error) {
+	return s.proxy.ListRLSPrincipals(ctx, req)
+}
+
+func (s *Server) DeleteRLSPrincipalTags(ctx context.Context, req *milvuspb.DeleteRLSPrincipalTagsRequest) (*commonpb.Status, error) {
+	return s.proxy.DeleteRLSPrincipalTags(ctx, req)
+}
+
 func (s *Server) RefreshPolicyInfoCache(ctx context.Context, req *proxypb.RefreshPolicyInfoCacheRequest) (*commonpb.Status, error) {
 	return s.proxy.RefreshPolicyInfoCache(ctx, req)
 }
@@ -1283,8 +1370,35 @@ func (s *Server) GetQuotaMetrics(ctx context.Context, req *internalpb.GetQuotaMe
 	return s.proxy.GetQuotaMetrics(ctx, req)
 }
 
+func (s *Server) GetFeatureUsage(ctx context.Context, req *internalpb.GetFeatureUsageRequest) (*internalpb.GetFeatureUsageResponse, error) {
+	return s.proxy.GetFeatureUsage(ctx, req)
+}
+
 func (s *Server) ClearReadTaskQueue(ctx context.Context, req *internalpb.ClearReadTaskQueueRequest) (*internalpb.ClearReadTaskQueueResponse, error) {
 	return s.proxy.ClearReadTaskQueue(ctx, req)
+}
+
+// ListRunningRequests is the public, cluster-wide call: this proxy asks the
+// coordinator, which fans out to every proxy.
+func (s *Server) ListRunningRequests(ctx context.Context, req *milvuspb.ListRunningRequestsRequest) (*milvuspb.ListRunningRequestsResponse, error) {
+	return s.proxy.ListRunningRequests(ctx, req)
+}
+
+// CancelRequests is the public, cluster-wide call.
+func (s *Server) CancelRequests(ctx context.Context, req *milvuspb.CancelRequestsRequest) (*milvuspb.CancelRequestsResponse, error) {
+	return s.proxy.CancelRequests(ctx, req)
+}
+
+// ListLocalRunningRequests is the internal call the coordinator makes: it
+// answers for this proxy alone.
+func (s *Server) ListLocalRunningRequests(ctx context.Context, req *milvuspb.ListRunningRequestsRequest) (*milvuspb.ListRunningRequestsResponse, error) {
+	return s.proxy.ListLocalRunningRequests(ctx, req)
+}
+
+// CancelLocalRequests is the internal call the coordinator makes: it cancels
+// on this proxy alone.
+func (s *Server) CancelLocalRequests(ctx context.Context, req *milvuspb.CancelRequestsRequest) (*milvuspb.CancelRequestsResponse, error) {
+	return s.proxy.CancelLocalRequests(ctx, req)
 }
 
 // AddFileResource add file resource

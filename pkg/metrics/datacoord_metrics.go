@@ -30,6 +30,7 @@ const (
 	StatFileLabel            = "stat_file"
 	IndexFileLabel           = "index_file"
 	segmentFileTypeLabelName = "segment_file_type"
+	quantileLabelName        = "quantile"
 )
 
 var (
@@ -65,7 +66,7 @@ var (
 			Help:      "number of collections",
 		}, []string{})
 
-	DataCoordSizeStoredL0Segment = prometheus.NewHistogramVec(
+	DataCoordSizeStoredL0Segment = newCollectionHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: milvusNamespace,
 			Subsystem: typeutil.DataCoordRole,
@@ -76,7 +77,7 @@ var (
 			collectionIDLabelName,
 		})
 
-	DataCoordL0DeleteEntriesNum = prometheus.NewGaugeVec(
+	DataCoordL0DeleteEntriesNum = newCollectionGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: milvusNamespace,
 			Subsystem: typeutil.DataCoordRole,
@@ -85,11 +86,83 @@ var (
 		}, []string{
 			databaseLabelName,
 			collectionIDLabelName,
-		})
+		}, collectionGaugeAggregateSum)
+
+	DataCoordL0DeltalogFileNum = newCollectionGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.DataCoordRole,
+			Name:      "l0_deltalog_file_num",
+			Help:      "total deltalog file count of Level zero segments",
+		}, []string{
+			databaseLabelName,
+			collectionIDLabelName,
+		}, collectionGaugeAggregateSum)
+
+	// DataCoordSegmentDeltalogFileCount publishes summary-style quantiles
+	// (0.5/0.9/0.99/1.0) of the per-segment deltalog file count over healthy
+	// FLUSHED non-L0 segments, split by segment_level, recomputed exactly on
+	// each metrics refresh round. The two single-compaction paths that call
+	// hasTooManyDeletions each cover one level (auto-compaction filters to L2,
+	// manual filters to L1), so the distributions are kept per level rather than
+	// blended. It approximates — not exactly equals — the candidate population:
+	// transient/stable candidacy predicates (isCompacting, IsSorted, IsInvisible,
+	// compaction-protected) are not applied here.
+	// Compare against dataCoord.compaction.single.deltalog.maxnum: the 1.0
+	// quantile shows how close the dirtiest segment is to triggering a
+	// delete-driven compaction, while p50/p90 rising toward the threshold
+	// reveals a same-batch cohort building up toward a synchronized
+	// compaction wave (a lone dirty segment leaves them unmoved).
+	// Quantiles do not add up across collections, so aggregate mode suppresses
+	// this gauge and the two below.
+	DataCoordSegmentDeltalogFileCount = newCollectionGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.DataCoordRole,
+			Name:      "segment_deltalog_file_count",
+			Help: "quantiles (0.5/0.9/0.99/1.0) of deltalog file count over healthy flushed " +
+				"non-L0 segments, by segment_level; compare against dataCoord.compaction.single.deltalog.maxnum",
+		}, []string{
+			databaseLabelName,
+			collectionIDLabelName,
+			segmentLevelLabelName,
+			quantileLabelName,
+		}, collectionGaugeAggregateDisabled)
+
+	DataCoordSegmentDeltalogSize = newCollectionGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.DataCoordRole,
+			Name:      "segment_deltalog_size",
+			Help: "quantiles (0.5/0.9/0.99/1.0) of accumulated deltalog size in bytes over " +
+				"healthy flushed non-L0 segments, by segment_level; compare against " +
+				"dataCoord.compaction.single.deltalog.maxsize (the varchar-PK trigger dimension)",
+		}, []string{
+			databaseLabelName,
+			collectionIDLabelName,
+			segmentLevelLabelName,
+			quantileLabelName,
+		}, collectionGaugeAggregateDisabled)
+
+	DataCoordSegmentDeletedRowsRatio = newCollectionGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.DataCoordRole,
+			Name:      "segment_deleted_rows_ratio",
+			Help: "quantiles (0.5/0.9/0.99/1.0) of deleted-rows/total-rows ratio over healthy " +
+				"flushed non-L0 segments, by segment_level; compare against dataCoord.compaction.single.ratio.threshold. " +
+				"May exceed 1.0 (deltalog entries count repeated deletes of the same PK); " +
+				"zero-row segments are excluded",
+		}, []string{
+			databaseLabelName,
+			collectionIDLabelName,
+			segmentLevelLabelName,
+			quantileLabelName,
+		}, collectionGaugeAggregateDisabled)
 
 	// DataCoordNumStoredRows all metrics will be cleaned up after removing matched collectionID and
 	// segment state labels in CleanupDataCoordNumStoredRows method.
-	DataCoordNumStoredRows = prometheus.NewGaugeVec(
+	DataCoordNumStoredRows = newCollectionGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: milvusNamespace,
 			Subsystem: typeutil.DataCoordRole,
@@ -100,9 +173,9 @@ var (
 			collectionIDLabelName,
 			collectionName,
 			segmentStateLabelName,
-		})
+		}, collectionGaugeAggregateSum)
 
-	DataCoordBulkVectors = prometheus.NewCounterVec(
+	DataCoordBulkVectors = newCollectionCounterVec(
 		prometheus.CounterOpts{
 			Namespace: milvusNamespace,
 			Subsystem: typeutil.DataCoordRole,
@@ -124,7 +197,7 @@ var (
 			channelNameLabelName,
 		})
 
-	DataCoordCheckpointUnixSeconds = prometheus.NewGaugeVec(
+	DataCoordCheckpointUnixSeconds = newVChannelGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: milvusNamespace,
 			Subsystem: typeutil.DataCoordRole,
@@ -133,9 +206,9 @@ var (
 		}, []string{
 			nodeIDLabelName,
 			channelNameLabelName,
-		})
+		}, collectionGaugeAggregateDisabled)
 
-	DataCoordStoredBinlogSize = prometheus.NewGaugeVec(
+	DataCoordStoredBinlogSize = newCollectionGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: milvusNamespace,
 			Subsystem: typeutil.DataCoordRole,
@@ -145,8 +218,8 @@ var (
 			databaseLabelName,
 			collectionIDLabelName,
 			segmentStateLabelName,
-		})
-	DataCoordSegmentBinLogFileCount = prometheus.NewGaugeVec(
+		}, collectionGaugeAggregateSum)
+	DataCoordSegmentBinLogFileCount = newCollectionGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: milvusNamespace,
 			Subsystem: typeutil.DataCoordRole,
@@ -154,9 +227,9 @@ var (
 			Help:      "number of binlog files for each segment",
 		}, []string{
 			collectionIDLabelName,
-		})
+		}, collectionGaugeAggregateSum)
 
-	DataCoordStoredIndexFilesSize = prometheus.NewGaugeVec(
+	DataCoordStoredIndexFilesSize = newCollectionGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: milvusNamespace,
 			Subsystem: typeutil.DataCoordRole,
@@ -166,7 +239,7 @@ var (
 			databaseLabelName,
 			collectionName,
 			collectionIDLabelName,
-		})
+		}, collectionGaugeAggregateDisabled)
 
 	DataCoordDmlChannelNum = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -199,7 +272,7 @@ var (
 			statusLabelName,
 		})
 
-	DataCoordCompactionLatency = prometheus.NewHistogramVec(
+	DataCoordCompactionLatency = newVChannelHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: milvusNamespace,
 			Subsystem: typeutil.DataCoordRole,
@@ -222,6 +295,7 @@ var (
 			Buckets:   longTaskBuckets,
 		}, []string{
 			importStageLabelName,
+			jobVersionLabelName,
 		})
 
 	ImportTaskLatency = prometheus.NewHistogramVec(
@@ -233,6 +307,7 @@ var (
 			Buckets:   longTaskBuckets,
 		}, []string{
 			importStageLabelName,
+			TaskTypeLabel,
 		})
 
 	FlushedSegmentFileNum = prometheus.NewHistogramVec(
@@ -262,6 +337,14 @@ var (
 			Subsystem: typeutil.DataCoordRole,
 			Name:      "gc_run_count",
 			Help:      "garbage collection running count",
+		}, []string{nodeIDLabelName})
+
+	GarbageCollectorInvalidManifestCount = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.DataCoordRole,
+			Name:      "gc_invalid_manifest_count",
+			Help:      "number of times garbage collection is blocked by an invalid segment manifest index entry",
 		}, []string{nodeIDLabelName})
 
 	/* hard to implement, commented now
@@ -313,13 +396,13 @@ var (
 
 	// IndexTaskNum records the number of index tasks of each type.
 	// Deprecated: please ues TaskNum after v2.5.5.
-	IndexTaskNum = prometheus.NewGaugeVec(
+	IndexTaskNum = newCollectionGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: milvusNamespace,
 			Subsystem: typeutil.DataCoordRole,
 			Name:      "index_task_count",
 			Help:      "number of index tasks of each type",
-		}, []string{collectionIDLabelName, indexTaskStatusLabelName})
+		}, []string{collectionIDLabelName, indexTaskStatusLabelName}, collectionGaugeAggregateDisabled)
 
 	// IndexNodeNum records the number of IndexNodes managed by IndexCoord.
 	IndexNodeNum = prometheus.NewGaugeVec(
@@ -336,7 +419,7 @@ var (
 			Subsystem: typeutil.DataCoordRole,
 			Name:      "import_jobs",
 			Help:      "the import jobs grouping by state",
-		}, []string{"import_state"})
+		}, []string{"import_state", jobVersionLabelName})
 
 	ImportTasks = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -427,13 +510,13 @@ var (
 	// held on source snapshots — primarily by restore jobs. Lets operators see
 	// which snapshots are currently protected from drop, flag drift vs. active
 	// CopySegmentJob count, and spot TTL expiry approaching for long-running restores.
-	DataCoordSnapshotActivePins = prometheus.NewGaugeVec(
+	DataCoordSnapshotActivePins = newCollectionGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: milvusNamespace,
 			Subsystem: typeutil.DataCoordRole,
 			Name:      "snapshot_active_pins",
 			Help:      "number of active (un-expired) pins on a given source snapshot",
-		}, []string{collectionIDLabelName, "snapshot_name"})
+		}, []string{collectionIDLabelName, "snapshot_name"}, collectionGaugeAggregateDisabled)
 
 	DataCoordSnapshotExportActiveJobs = prometheus.NewGauge(
 		prometheus.GaugeOpts{
@@ -450,6 +533,55 @@ var (
 			Name:      "snapshot_export_terminal_jobs_total",
 			Help:      "number of snapshot export jobs that reached a terminal state",
 		}, []string{statusLabelName})
+
+	// DataCoordManifestIndexBackfillPending is the number of historical
+	// finished StorageV3 SegmentIndex catalog rows still eligible to move into
+	// segment manifests. The scan recomputes it from in-memory durable-placement
+	// state on every tick.
+	DataCoordManifestIndexBackfillPending = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.DataCoordRole,
+			Name:      "manifest_index_backfill_pending_records",
+			Help:      "number of finished StorageV3 segment index catalog records waiting to move into segment manifests",
+		})
+
+	// DataCoordManifestIndexBackfillRecords counts individual record migration
+	// attempts. A persistently increasing failed label means the optional
+	// migration is not converging; stale and skipped are self-healing races.
+	DataCoordManifestIndexBackfillRecords = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: milvusNamespace,
+			Subsystem: typeutil.DataCoordRole,
+			Name:      "manifest_index_backfill_records_total",
+			Help:      "number of segment index catalog records handled by manifest backfill, by outcome",
+		}, []string{statusLabelName})
+
+	DataCoordManifestIndexRollbackPending = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: milvusNamespace, Subsystem: typeutil.DataCoordRole,
+		Name: "manifest_index_rollback_pending_segments",
+		Help: "number of candidate segments in the current rollback record scan before batch limiting",
+	})
+	DataCoordManifestIndexRollbackPendingRecords = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: milvusNamespace, Subsystem: typeutil.DataCoordRole,
+		Name: "manifest_index_rollback_pending_records",
+		Help: "number of in-memory segment index records still known to lack a catalog row",
+	})
+	DataCoordManifestIndexRollbackReady = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: milvusNamespace, Subsystem: typeutil.DataCoordRole,
+		Name: "manifest_index_rollback_ready",
+		Help: "one after an active complete scan finds no manifest-resident in-memory index records; zero otherwise",
+	})
+	DataCoordManifestIndexRollbackRecords = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: milvusNamespace, Subsystem: typeutil.DataCoordRole,
+		Name: "manifest_index_rollback_records_total",
+		Help: "number of segment index records successfully restored to etcd by rollback",
+	})
+	DataCoordManifestIndexRollbackAttempts = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: milvusNamespace, Subsystem: typeutil.DataCoordRole,
+		Name: "manifest_index_rollback_segments_total",
+		Help: "number of segment rollback attempts by outcome",
+	}, []string{statusLabelName})
 
 	DataCoordSnapshotExportJobLatency = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -481,6 +613,10 @@ func RegisterDataCoord(registry *prometheus.Registry) {
 	registry.MustRegister(ImportTaskLatency)
 	registry.MustRegister(DataCoordSizeStoredL0Segment)
 	registry.MustRegister(DataCoordL0DeleteEntriesNum)
+	registry.MustRegister(DataCoordL0DeltalogFileNum)
+	registry.MustRegister(DataCoordSegmentDeltalogFileCount)
+	registry.MustRegister(DataCoordSegmentDeltalogSize)
+	registry.MustRegister(DataCoordSegmentDeletedRowsRatio)
 	registry.MustRegister(FlushedSegmentFileNum)
 	registry.MustRegister(IndexRequestCounter)
 	registry.MustRegister(IndexTaskNum)
@@ -493,6 +629,7 @@ func RegisterDataCoord(registry *prometheus.Registry) {
 	registry.MustRegister(CopySegmentJobLatency)
 	registry.MustRegister(GarbageCollectorFileScanDuration)
 	registry.MustRegister(GarbageCollectorRunCount)
+	registry.MustRegister(GarbageCollectorInvalidManifestCount)
 	registry.MustRegister(DataCoordTaskExecuteLatency)
 	registry.MustRegister(IndexStatsTaskNum)
 	registry.MustRegister(TaskVersion)
@@ -501,6 +638,13 @@ func RegisterDataCoord(registry *prometheus.Registry) {
 	registry.MustRegister(DataCoordSnapshotExportActiveJobs)
 	registry.MustRegister(DataCoordSnapshotExportTerminalJobs)
 	registry.MustRegister(DataCoordSnapshotExportJobLatency)
+	registry.MustRegister(DataCoordManifestIndexBackfillPending)
+	registry.MustRegister(DataCoordManifestIndexBackfillRecords)
+	registry.MustRegister(DataCoordManifestIndexRollbackPending)
+	registry.MustRegister(DataCoordManifestIndexRollbackPendingRecords)
+	registry.MustRegister(DataCoordManifestIndexRollbackReady)
+	registry.MustRegister(DataCoordManifestIndexRollbackRecords)
+	registry.MustRegister(DataCoordManifestIndexRollbackAttempts)
 	registerStreamingCoord(registry)
 }
 
@@ -529,4 +673,37 @@ func CleanupDataCoordWithCollectionID(collectionID int64) {
 	DataCoordL0DeleteEntriesNum.DeletePartialMatch(prometheus.Labels{
 		collectionIDLabelName: fmt.Sprint(collectionID),
 	})
+	CleanupDataCoordDeltalogMetrics(fmt.Sprint(collectionID))
+}
+
+// CleanupDataCoordDeltalogMetrics removes one collection's deltalog
+// observability series; called on DropCollection and when a metrics refresh
+// round no longer observes the collection.
+func CleanupDataCoordDeltalogMetrics(collectionID string) {
+	DataCoordSegmentDeltalogFileCount.DeletePartialMatch(prometheus.Labels{
+		collectionIDLabelName: collectionID,
+	})
+	DataCoordSegmentDeltalogSize.DeletePartialMatch(prometheus.Labels{
+		collectionIDLabelName: collectionID,
+	})
+	DataCoordSegmentDeletedRowsRatio.DeletePartialMatch(prometheus.Labels{
+		collectionIDLabelName: collectionID,
+	})
+	DataCoordL0DeltalogFileNum.DeletePartialMatch(prometheus.Labels{
+		collectionIDLabelName: collectionID,
+	})
+}
+
+// CleanupDataCoordDeltalogLevelMetrics removes the per-level quantile series of
+// one (collection, segment level) pair; called when a metrics refresh round
+// observes the collection but no flushed segment of that level any more, so the
+// series do not freeze at their last published values.
+func CleanupDataCoordDeltalogLevelMetrics(collectionID, segmentLevel string) {
+	labels := prometheus.Labels{
+		collectionIDLabelName: collectionID,
+		segmentLevelLabelName: segmentLevel,
+	}
+	DataCoordSegmentDeltalogFileCount.DeletePartialMatch(labels)
+	DataCoordSegmentDeltalogSize.DeletePartialMatch(labels)
+	DataCoordSegmentDeletedRowsRatio.DeletePartialMatch(labels)
 }

@@ -146,6 +146,35 @@ FindFilterBitsNode(const std::shared_ptr<milvus::plan::PlanNode>& node) {
 
 }  // namespace
 
+// Internal-invariant producers must NOT carry ExprInvalid(2028): 2028 is an
+// InputError in merr, which blames the request and stops lb_policy's
+// cross-replica failover. ElementFilterExpr reaching ParseExprs is a plan
+// translator bug (it must be handled at PlanNode level), so it reports
+// UnexpectedError, and the unset-oneof default follows the same rule.
+TEST(PlanProto, InternalExprGuardsAreNotInputErrors) {
+    using namespace milvus;
+    using namespace milvus::query;
+    auto schema = BuildSchema();
+    ProtoParser parser(schema);
+
+    proto::plan::Expr elem_pb;
+    elem_pb.mutable_element_filter_expr();
+    try {
+        parser.ParseExprs(elem_pb);
+        FAIL() << "expected ElementFilterExpr in ParseExprs to throw";
+    } catch (const SegcoreError& e) {
+        EXPECT_EQ(e.get_error_code(), ErrorCode::UnexpectedError);
+    }
+
+    proto::plan::Expr unset_pb;
+    try {
+        parser.ParseExprs(unset_pb);
+        FAIL() << "expected unset expr oneof to throw";
+    } catch (const SegcoreError& e) {
+        EXPECT_EQ(e.get_error_code(), ErrorCode::UnexpectedError);
+    }
+}
+
 TEST(PlanProto, NotSetUnsupported) {
     using namespace milvus;
     using namespace milvus::query;
@@ -658,6 +687,53 @@ TEST(PlanProto, RetrievePlanCollectsFieldAccessInfo) {
         std::vector<milvus::FieldId>({predicate_field_id, output_field_id}));
 }
 
+TEST(PlanProto, GroupByOrderLimitRequiresEveryGroupingKey) {
+    namespace planpb = milvus::proto::plan;
+
+    auto schema = BuildSchema();
+    auto age = schema->get_field_id(milvus::FieldName("age"));
+    auto score = schema->get_field_id(milvus::FieldName("score"));
+
+    planpb::PlanNode plain_plan;
+    plain_plan.add_output_field_ids(age.get());
+    auto* plain_query = plain_plan.mutable_query();
+    plain_query->set_limit(1);
+    plain_query->add_order_by_fields()->set_field_id(age.get());
+    auto plain = milvus::query::CreateRetrievePlanByExpr(
+        schema,
+        plain_plan.SerializeAsString().data(),
+        plain_plan.ByteSizeLong());
+    auto plain_order_by = std::dynamic_pointer_cast<milvus::plan::OrderByNode>(
+        plain->plan_node_->plannodes_);
+    ASSERT_NE(plain_order_by, nullptr);
+    EXPECT_EQ(plain_order_by->Limit(), 1);
+
+    for (bool complete_order : {false, true}) {
+        planpb::PlanNode plan_node;
+        plan_node.add_output_field_ids(age.get());
+        auto* query = plan_node.mutable_query();
+        query->set_limit(1);
+        query->add_group_by_field_ids(age.get());
+        query->add_group_by_field_ids(score.get());
+        auto* aggregate = query->add_aggregates();
+        aggregate->set_op(planpb::sum);
+        aggregate->set_field_id(score.get());
+        query->add_order_by_fields()->set_field_id(age.get());
+        if (complete_order) {
+            query->add_order_by_fields()->set_field_id(score.get());
+        }
+
+        auto plan = milvus::query::CreateRetrievePlanByExpr(
+            schema,
+            plan_node.SerializeAsString().data(),
+            plan_node.ByteSizeLong());
+        auto order_by = std::dynamic_pointer_cast<milvus::plan::OrderByNode>(
+            plan->plan_node_->plannodes_);
+        ASSERT_NE(order_by, nullptr);
+        EXPECT_EQ(order_by->Limit(), complete_order ? 1 : -1);
+    }
+}
+
 TEST(PlanProto, StrictGroupSettings) {
     using namespace milvus;
     auto schema = std::make_shared<Schema>();
@@ -674,52 +750,63 @@ TEST(PlanProto, StrictGroupSettings) {
     info->set_metric_type("L2");
     info->set_topk(10);
     info->set_round_decimal(-1);
-    for (
-        const auto& params :
-        {R"({"nprobe":128})",
-         R"({"nprobe":128,"strict_group_acceptance_threshold":0,"strict_group_probe_candidates":1})",
-         R"({"nprobe":128,"strict_group_acceptance_threshold":0.1,"strict_group_probe_candidates":100})",
-         R"({"nprobe":128,"strict_group_acceptance_threshold":0.5,"strict_group_probe_candidates":17})",
-         R"({"nprobe":128,"strict_group_acceptance_threshold":1,"strict_group_probe_candidates":9223372036854775807})"}) {
-        info->set_search_params(params);
-        auto parsed = query::ProtoParser(schema).PlanNodeFromProto(node);
-        const auto& search = parsed->search_info_;
-        EXPECT_DOUBLE_EQ(search.strict_group_acceptance_threshold_,
-                         knowhere::Json::parse(params).value(
-                             kStrictGroupAcceptanceThreshold, 0.1));
-        EXPECT_FALSE(
-            search.search_params_.contains(kStrictGroupAcceptanceThreshold));
-        EXPECT_EQ(search.strict_group_probe_candidates_,
-                  knowhere::Json::parse(params).value(
-                      kStrictGroupProbeCandidates, int64_t(100)));
-        EXPECT_FALSE(
-            search.search_params_.contains(kStrictGroupProbeCandidates));
-        EXPECT_EQ(search.search_params_["nprobe"], 128);
-    }
-    for (const auto& key :
-         {kStrictGroupAcceptanceThreshold, kStrictGroupProbeCandidates}) {
-        for (const auto& value : {knowhere::Json(nullptr),
-                                  knowhere::Json(true),
-                                  knowhere::Json("0.5"),
-                                  knowhere::Json("NaN"),
-                                  knowhere::Json::array(),
-                                  knowhere::Json::object(),
-                                  knowhere::Json(-1),
-                                  knowhere::Json(1.1)}) {
-            info->set_search_params(knowhere::Json{{key, value}}.dump());
-            try {
-                query::ProtoParser(schema).PlanNodeFromProto(node);
-                FAIL() << "invalid strict group setting accepted";
-            } catch (const SegcoreError& error) {
-                EXPECT_EQ(error.get_error_code(), ErrorCode::InvalidParameter);
-            }
+    for (int64_t weight :
+         {int64_t(0), int64_t(50), std::numeric_limits<int64_t>::max()}) {
+        for (bool skip : {false, true}) {
+            info->set_search_params(knowhere::Json{
+                {kStrictGroupPhase1CandidateWeight, weight},
+                {kStrictGroupSkipRefine,
+                 skip}}.dump());
+            auto parsed = query::ProtoParser(schema).PlanNodeFromProto(node);
+            EXPECT_EQ(
+                parsed->search_info_.strict_group_phase1_candidate_weight_,
+                weight);
+            EXPECT_EQ(parsed->search_info_.strict_group_skip_refine_, skip);
+            EXPECT_TRUE(parsed->search_info_.search_params_.empty());
         }
     }
-    for (const auto& value : {knowhere::Json(0),
+    for (const auto& value : {knowhere::Json(-1),
                               knowhere::Json(1.0),
-                              knowhere::Json(uint64_t(1) << 63)}) {
+                              knowhere::Json(uint64_t(1) << 63),
+                              knowhere::Json("50"),
+                              knowhere::Json(nullptr),
+                              knowhere::Json(true)}) {
         info->set_search_params(
-            knowhere::Json{{kStrictGroupProbeCandidates, value}}.dump());
+            knowhere::Json{{kStrictGroupPhase1CandidateWeight, value}}.dump());
+        EXPECT_THROW(query::ProtoParser(schema).PlanNodeFromProto(node),
+                     SegcoreError);
+    }
+    for (const auto& value :
+         {knowhere::Json("true"), knowhere::Json(1), knowhere::Json(nullptr)}) {
+        info->set_search_params(
+            knowhere::Json{{kStrictGroupSkipRefine, value}}.dump());
+        EXPECT_THROW(query::ProtoParser(schema).PlanNodeFromProto(node),
+                     SegcoreError);
+    }
+    info->set_search_params(R"({"nprobe":128})");
+    auto defaults = query::ProtoParser(schema).PlanNodeFromProto(node);
+    EXPECT_EQ(defaults->search_info_.strict_group_strategy_,
+              StrictGroupStrategy::PerGroup);
+    EXPECT_EQ(defaults->search_info_.search_params_["nprobe"], 128);
+    for (const auto& [strategy, expected] :
+         std::vector<std::pair<std::string, StrictGroupStrategy>>{
+             {"original", StrictGroupStrategy::Original},
+             {"per_group", StrictGroupStrategy::PerGroup}}) {
+        info->set_search_params(
+            knowhere::Json{{kStrictGroupStrategy, strategy}}.dump());
+        auto parsed = query::ProtoParser(schema).PlanNodeFromProto(node);
+        EXPECT_EQ(parsed->search_info_.strict_group_strategy_, expected);
+        EXPECT_FALSE(
+            parsed->search_info_.search_params_.contains(kStrictGroupStrategy));
+    }
+    for (const auto& value : {knowhere::Json("invalid"),
+                              knowhere::Json("sampling"),
+                              knowhere::Json("filtered_iterator"),
+                              knowhere::Json(1),
+                              knowhere::Json(nullptr),
+                              knowhere::Json(true)}) {
+        info->set_search_params(
+            knowhere::Json{{kStrictGroupStrategy, value}}.dump());
         EXPECT_THROW(query::ProtoParser(schema).PlanNodeFromProto(node),
                      SegcoreError);
     }

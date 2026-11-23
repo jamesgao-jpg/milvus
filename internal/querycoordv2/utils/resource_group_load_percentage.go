@@ -209,6 +209,10 @@ import (
 //
 // This is a read-only composition over existing querycoord state. It adds no
 // proto field, no persisted state, and no change to the replica model.
+//
+// The figure is the minimum of ReplicaLoadPercentagesByResourceGroup, which
+// is where the walk lives; the per-replica split exists so the min is taken
+// across one consistent snapshot of the targets and the distribution.
 func LoadPercentageByResourceGroup(
 	ctx context.Context,
 	m *meta.Meta,
@@ -217,8 +221,47 @@ func LoadPercentageByResourceGroup(
 	collectionID int64,
 	rgName string,
 ) (int32, error) {
+	figures, err := ReplicaLoadPercentagesByResourceGroup(ctx, m, targetMgr, dist, collectionID, rgName)
+	if err != nil {
+		return -1, err
+	}
+	return MinReplicaLoadPercentage(figures), nil
+}
+
+// MinReplicaLoadPercentage folds per-replica figures into the group's figure:
+// the laggard, for the reason given under "Multiple replicas" on
+// LoadPercentageByResourceGroup. No figures at all is the "no replica here"
+// outcome, -1.
+func MinReplicaLoadPercentage(figures map[int64]int32) int32 {
+	if len(figures) == 0 {
+		return -1
+	}
+	percentage := int32(100)
+	for _, figure := range figures {
+		if figure < percentage {
+			percentage = figure
+		}
+	}
+	return percentage
+}
+
+// ReplicaLoadPercentagesByResourceGroup is LoadPercentageByResourceGroup
+// before the fold: one figure per selected replica, keyed by replica ID,
+// every one measured against the same snapshot of the targets and the
+// distribution. The outcomes and the error contract are those of
+// LoadPercentageByResourceGroup, with "-1, nil error" spelled as an empty map:
+// a collection that is not registered as loaded, or a group holding no
+// replica of it, has nothing to report a figure for.
+func ReplicaLoadPercentagesByResourceGroup(
+	ctx context.Context,
+	m *meta.Meta,
+	targetMgr meta.TargetManagerInterface,
+	dist *meta.DistributionManager,
+	collectionID int64,
+	rgName string,
+) (map[int64]int32, error) {
 	if m == nil || targetMgr == nil || dist == nil {
-		return -1, merr.WrapErrServiceNotReadyMsg("querycoord read stores are not wired up yet")
+		return nil, merr.WrapErrServiceNotReadyMsg("querycoord read stores are not wired up yet")
 	}
 
 	// Only the scoped form consults the resource manager, so only the scoped
@@ -233,10 +276,10 @@ func LoadPercentageByResourceGroup(
 	// whatever the collection's state.
 	if rgName != "" {
 		if m.ResourceManager == nil {
-			return -1, merr.WrapErrServiceNotReadyMsg("querycoord resource manager is not wired up yet")
+			return nil, merr.WrapErrServiceNotReadyMsg("querycoord resource manager is not wired up yet")
 		}
 		if !m.ContainResourceGroup(ctx, rgName) {
-			return -1, merr.WrapErrResourceGroupNotFound(rgName)
+			return nil, merr.WrapErrResourceGroupNotFound(rgName)
 		}
 	}
 
@@ -284,10 +327,10 @@ func LoadPercentageByResourceGroup(
 				// indistinguishable from one that is, and the caller would
 				// retry until the cache entry expires 24h later. The recorded
 				// cause is kept in the message.
-				return -1, merr.WrapErrCollectionNotLoaded(collectionID, err.Error())
+				return nil, merr.WrapErrCollectionNotLoaded(collectionID, err.Error())
 			}
 		}
-		return -1, nil
+		return nil, nil
 	}
 
 	// Query-invisible replicas (load-config updates spawn replicas invisible
@@ -305,7 +348,7 @@ func LoadPercentageByResourceGroup(
 		}
 	}
 	if len(replicas) == 0 {
-		return -1, nil
+		return nil, nil
 	}
 
 	// The targets are read ONCE for every selected replica, not per replica.
@@ -331,6 +374,12 @@ func LoadPercentageByResourceGroup(
 	// this deliberately does not.
 	channelTargets := targetMgr.GetDmChannelsByCollection(ctx, collectionID, meta.NextTargetFirst)
 	segmentTargets := targetMgr.GetSealedSegmentsByCollection(ctx, collectionID, meta.NextTargetFirst)
+	// Size the target by its own segment count: a segment the shared store can
+	// no longer resolve is still owed by the target, so counting only the
+	// resolvable ones would report a resource group as more loaded than it is.
+	// The numerator below walks this same ID set, so both sides share one
+	// basis; an unresolvable segment simply never counts as loaded.
+	segmentTargetIDs := targetMgr.GetSealedSegmentIDsByCollection(ctx, collectionID, meta.NextTargetFirst)
 
 	// One distribution lookup per CHANNEL, shared by every replica and by the
 	// segment walk. ChannelDistManager.GetByFilter with no node filter walks
@@ -341,13 +390,11 @@ func LoadPercentageByResourceGroup(
 	// channels.
 	delegators := prefetchDelegatorsByChannel(dist, channelTargets, segmentTargets)
 
-	percentage := int32(100)
+	figures := make(map[int64]int32, len(replicas))
 	for _, replica := range replicas {
-		if p := replicaLoadPercentage(replica, channelTargets, segmentTargets, delegators); p < percentage {
-			percentage = p
-		}
+		figures[replica.GetID()] = replicaLoadPercentage(replica, channelTargets, segmentTargets, segmentTargetIDs, delegators)
 	}
-	return percentage, nil
+	return figures, nil
 }
 
 // prefetchDelegatorsByChannel resolves every channel named by the target set
@@ -390,9 +437,10 @@ func replicaLoadPercentage(
 	replica *meta.Replica,
 	channelTargets map[string]*meta.DmChannel,
 	segmentTargets map[int64]*datapb.SegmentInfo,
+	segmentTargetIDs typeutil.UniqueSet,
 	delegators map[string][]*meta.DmChannel,
 ) int32 {
-	targetNum := len(channelTargets) + len(segmentTargets)
+	targetNum := len(channelTargets) + len(segmentTargetIDs)
 	if targetNum == 0 {
 		return 0
 	}
@@ -406,9 +454,15 @@ func replicaLoadPercentage(
 			}
 		}
 	}
-	for _, segment := range segmentTargets {
+	for segmentID := range segmentTargetIDs {
+		segment, ok := segmentTargets[segmentID]
+		if !ok {
+			// Owed by the target, unresolvable right now: counted in the
+			// denominator, never as loaded.
+			continue
+		}
 		for _, delegator := range delegators[segment.GetInsertChannel()] {
-			if replica.Contains(delegator.Node) && delegator.View.Segments[segment.GetID()] != nil {
+			if replica.Contains(delegator.Node) && delegator.View.Segments[segmentID] != nil {
 				loadedCount++
 				break
 			}

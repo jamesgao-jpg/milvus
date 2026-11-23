@@ -47,7 +47,33 @@ import (
 // may come from different replica group. We only need these shards to form a replica that serves query
 // requests.
 func (s *Server) checkAnyReplicaAvailable(collectionID int64) bool {
-	for _, replica := range s.meta.GetByCollection(s.ctx, collectionID) {
+	return s.anyReplicaAvailable(s.meta.GetByCollection(s.ctx, collectionID))
+}
+
+// checkAnyReplicaAvailableInResourceGroup is the answer a ShowLoadCollections
+// scoped to a resource group gives: whether THAT group can serve the
+// collection, which is the group's shard-leader readiness - every shard of
+// the collection has a serviceable leader in the group's replicas, on a node
+// the coordinator knows (utils.ShardLeaderReadinessByResourceGroup, the same
+// verdict the scoped load waits for). It is not the collection-wide rule
+// restricted to one group: that rule reads a replica with no read-only node
+// as available, so a replica just spawned into the group, holding nothing,
+// would read true beside a progress of 0.
+func (s *Server) checkAnyReplicaAvailableInResourceGroup(ctx context.Context, collectionID int64, rgName string) bool {
+	readiness, err := utils.ShardLeaderReadinessByResourceGroup(ctx, s.meta, s.targetMgr, s.dist, s.nodeMgr, collectionID, rgName)
+	if err != nil {
+		mlog.Warn(ctx, "the resource group's shard-leader readiness cannot be answered, reporting it as not serving",
+			mlog.Int64("collectionID", collectionID), mlog.String("resourceGroup", rgName), mlog.Err(err))
+		return false
+	}
+	return readiness.Ready
+}
+
+// anyReplicaAvailable is the collection-wide rule: a replica is available when
+// every one of its read-only nodes is still known to the node manager, and
+// the answer is yes as soon as one replica is.
+func (s *Server) anyReplicaAvailable(replicas []*meta.Replica) bool {
+	for _, replica := range replicas {
 		isAvailable := true
 		for _, node := range replica.GetRONodes() {
 			if s.nodeMgr.Get(node) == nil {
@@ -490,62 +516,6 @@ func (s *Server) tryGetNodesMetrics(ctx context.Context, req *milvuspb.GetMetric
 		ret = append(ret, resp)
 	}
 	return ret
-}
-
-func (s *Server) fillReplicaInfo(ctx context.Context, replica *meta.Replica, withShardNodes bool) *milvuspb.ReplicaInfo {
-	info := &milvuspb.ReplicaInfo{
-		ReplicaID:         replica.GetID(),
-		CollectionID:      replica.GetCollectionID(),
-		NodeIds:           replica.GetNodes(),
-		ResourceGroupName: replica.GetResourceGroup(),
-		NumOutboundNode:   s.meta.GetOutgoingNodeNumByReplica(ctx, replica),
-	}
-
-	channels := s.targetMgr.GetDmChannelsByCollection(ctx, replica.GetCollectionID(), meta.CurrentTarget)
-	if len(channels) == 0 {
-		mlog.Warn(context.TODO(), "failed to get channels, collection may be not loaded or in recovering", mlog.Int64("collectionID", replica.GetCollectionID()))
-		return info
-	}
-	shardReplicas := make([]*milvuspb.ShardReplica, 0, len(channels))
-
-	var segments []*meta.Segment
-	if withShardNodes {
-		segments = s.dist.SegmentDistManager.GetByFilter(meta.WithCollectionID(replica.GetCollectionID()))
-	}
-
-	for _, channel := range channels {
-		leader := s.dist.ChannelDistManager.GetShardLeader(channel.ChannelName, replica)
-		var leaderInfo *session.NodeInfo
-		if leader != nil {
-			leaderInfo = s.nodeMgr.Get(leader.Node)
-		}
-		if leaderInfo == nil {
-			mlog.Warn(context.TODO(), "failed to get shard leader for shard",
-				mlog.Int64("collectionID", replica.GetCollectionID()),
-				mlog.Int64("replica", replica.GetID()),
-				mlog.String("shard", channel.GetChannelName()))
-			return info
-		}
-
-		shard := &milvuspb.ShardReplica{
-			LeaderID:      leader.Node,
-			LeaderAddr:    leaderInfo.Addr(),
-			DmChannelName: channel.GetChannelName(),
-			NodeIds:       []int64{leader.Node},
-		}
-		if withShardNodes {
-			shardNodes := lo.FilterMap(segments, func(segment *meta.Segment, _ int) (int64, bool) {
-				if replica.Contains(segment.Node) {
-					return segment.Node, true
-				}
-				return 0, false
-			})
-			shard.NodeIds = typeutil.NewUniqueSet(shardNodes...).Collect()
-		}
-		shardReplicas = append(shardReplicas, shard)
-	}
-	info.ShardReplicas = shardReplicas
-	return info
 }
 
 // GetQueryCoordTopology returns QueryCoord topology directly without JSON serialization

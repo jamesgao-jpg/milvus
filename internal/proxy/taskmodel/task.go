@@ -26,6 +26,9 @@ import (
 )
 
 const (
+	InsertTaskName = "InsertTask"
+	DeleteTaskName = "DeleteTask"
+	UpsertTaskName = "UpsertTask"
 	SearchTaskName = "SearchTask"
 	QueryTaskName  = "QueryTask"
 )
@@ -47,6 +50,7 @@ type Task interface {
 	PostExecute(ctx context.Context) error
 	WaitToFinish() error
 	Notify(err error)
+	SetOnContextDone(handler func())
 	CanSkipAllocTimestamp() bool
 	GetMetaCache() metacache.Cache
 	SetOnEnqueueTime()

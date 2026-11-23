@@ -2,7 +2,6 @@ package balancer
 
 import (
 	"context"
-	"sync"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -91,9 +90,6 @@ type balancerImpl struct {
 	freezeNodes            *typeutil.ConcurrentSet[int64]        // freezeNodes is the nodes that will be frozen, no more wal will be assigned to these nodes and wal will be removed from these nodes.
 	primaryRGChangedCh     chan struct{}                         // primaryRGChangedCh wakes the balance loop when streaming.primaryResourceGroup changes.
 	primaryRGChangeHandler config.EventHandler
-
-	fileResourceChecker FileResourceChecker
-	checkerMu           sync.RWMutex
 }
 
 func (b *balancerImpl) watchPrimaryResourceGroupChanges() {
@@ -106,18 +102,6 @@ func (b *balancerImpl) watchPrimaryResourceGroupChanges() {
 	})
 	b.primaryRGChangeHandler = handler
 	paramtable.Get().Watch(key, handler)
-}
-
-func (b *balancerImpl) SetFileResourceChecker(checker FileResourceChecker) {
-	b.checkerMu.Lock()
-	defer b.checkerMu.Unlock()
-	b.fileResourceChecker = checker
-}
-
-func (b *balancerImpl) GetFileResourceChecker() FileResourceChecker {
-	b.checkerMu.RLock()
-	defer b.checkerMu.RUnlock()
-	return b.fileResourceChecker
 }
 
 // RegisterStreamingEnabledNotifier registers a notifier into the balancer.
@@ -316,7 +300,10 @@ func (b *balancerImpl) sendRequestAndWaitFinish(ctx context.Context, newReq *req
 		return nil, ctx.Err()
 	case b.reqCh <- newReq:
 	}
-	resp := newReq.future.Get()
+	resp, err := newReq.future.GetWithContext(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return resp.resp, resp.err
 }
 
@@ -652,14 +639,8 @@ func (b *balancerImpl) fetchStreamingNodeStatus(ctx context.Context, rgName stri
 		}
 	}
 
-	// check if the node sync the file resource successfully.
-	if checker := b.GetFileResourceChecker(); checker != nil {
-		for _, node := range nodeStatus {
-			if ok := checker.CheckNodeSynced(node.ServerID); !ok {
-				node.Err = types.ErrFileResource
-			}
-		}
-	}
+	// File resources are prepared by each SN consumer through the pull path.
+	// QN push acknowledgments do not describe whether an SN can own a WAL.
 	return nodeStatus, nil
 }
 
@@ -674,15 +655,30 @@ func (b *balancerImpl) applyBalanceResultToStreamingNode(ctx context.Context, mo
 	for _, channel := range modifiedChannels {
 		channel := channel
 		g.Go(func() error {
+			// ownerLost is true if the streaming node of any read-write assignment history has left the session view.
+			ownerLost := false
 			// all history channels should be remove from related nodes.
 			for _, assignment := range channel.AssignHistories() {
 				opCtx, cancel := context.WithTimeout(ctx, opTimeout)
 				defer cancel()
-				if err := resource.Resource().StreamingNodeManagerClient().Remove(opCtx, assignment); err != nil {
+				err := resource.Resource().StreamingNodeManagerClient().Remove(opCtx, assignment)
+				if errors.Is(err, types.ErrNotAlive) {
+					if assignment.Channel.AccessMode == types.AccessModeRW {
+						ownerLost = true
+					}
+					b.Logger().Warn(ctx, "streaming node of channel is not alive, wal close not confirmed", mlog.String("assignment", assignment.String()))
+					continue
+				}
+				if err != nil {
 					b.Logger().Warn(ctx, "fail to remove channel", mlog.String("assignment", assignment.String()), mlog.Err(err))
 					return err
 				}
 				b.Logger().Info(ctx, "remove channel success", mlog.String("assignment", assignment.String()))
+			}
+			if ownerLost {
+				if err := b.waitNodeLostGracePeriod(ctx, channel); err != nil {
+					return err
+				}
 			}
 
 			// assign the channel to the target node.
@@ -706,6 +702,25 @@ func (b *balancerImpl) applyBalanceResultToStreamingNode(ctx context.Context, mo
 	// huge unavaiable time may be caused by this,
 	// should be fixed in future.
 	return g.Wait()
+}
+
+// waitNodeLostGracePeriod blocks for streaming.walBalancer.nodeLostGracePeriod or until ctx is done.
+func (b *balancerImpl) waitNodeLostGracePeriod(ctx context.Context, meta *channel.PChannelMeta) error {
+	grace := paramtable.Get().StreamingCfg.WALBalancerNodeLostGracePeriod.GetAsDurationByParse()
+	if grace <= 0 {
+		return nil
+	}
+	b.Logger().Info(ctx, "wait grace period before assigning channel whose streaming node is lost",
+		mlog.String("target", meta.CurrentAssignment().String()),
+		mlog.Duration("gracePeriod", grace))
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // generateCurrentLayout generate layout from all nodes info and meta.

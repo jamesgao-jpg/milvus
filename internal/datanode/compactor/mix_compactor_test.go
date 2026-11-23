@@ -30,6 +30,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
@@ -59,7 +60,12 @@ func TestMixCompactionTaskSuite(t *testing.T) {
 func TestMixInitLOBCompactionContextKeepsReuseAllDecisionWithoutLobFiles(t *testing.T) {
 	paramtable.Get().Init(paramtable.NewBaseTable())
 	textFieldIDs := []int64{101, 102}
+	params := compaction.GenParams()
+	collectionID, partitionID := int64(10), int64(20)
+	partitionBase := storage.SegmentPartitionBasePath(params.StorageConfig.GetRootPath(), collectionID, partitionID)
 	task := &mixCompactionTask{
+		collectionID: collectionID,
+		partitionID:  partitionID,
 		plan: &datapb.CompactionPlan{
 			Type: datapb.CompactionType_MixCompaction,
 			Schema: &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{
@@ -67,11 +73,11 @@ func TestMixInitLOBCompactionContextKeepsReuseAllDecisionWithoutLobFiles(t *test
 				{FieldID: textFieldIDs[1], Name: "text_2", DataType: schemapb.DataType_Text},
 			}},
 			SegmentBinlogs: []*datapb.CompactionSegmentBinlogs{
-				{SegmentID: 1, Manifest: "manifest-1"},
-				{SegmentID: 2, Manifest: "manifest-2"},
+				{SegmentID: 1, Manifest: packed.MarshalManifestPath(partitionBase+"/1", 1)},
+				{SegmentID: 2, Manifest: packed.MarshalManifestPath(partitionBase+"/2", 1)},
 			},
 		},
-		compactionParams:            compaction.GenParams(),
+		compactionParams:            params,
 		estimatedOutputSegmentCount: 1,
 	}
 	collectPatch := mockey.Mock(compaction.CollectLobFilesFromManifests).Return(map[int64][]packed.LobFileInfo{
@@ -89,6 +95,41 @@ func TestMixInitLOBCompactionContextKeepsReuseAllDecisionWithoutLobFiles(t *test
 		for _, fieldID := range textFieldIDs {
 			assert.Equal(t, compaction.LOBStrategyReuseAll, task.lobContext.Decisions[fieldID].Strategy)
 		}
+	}
+}
+
+func TestMixInitLOBCompactionContextRewritesAcrossPartitionBases(t *testing.T) {
+	paramtable.Get().Init(paramtable.NewBaseTable())
+	params := compaction.GenParams()
+	collectionID, partitionID := int64(10), int64(20)
+	task := &mixCompactionTask{
+		collectionID: collectionID,
+		partitionID:  partitionID,
+		plan: &datapb.CompactionPlan{
+			Type: datapb.CompactionType_MixCompaction,
+			Schema: &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{
+				{FieldID: 101, Name: "text", DataType: schemapb.DataType_Text},
+			}},
+			SegmentBinlogs: []*datapb.CompactionSegmentBinlogs{{
+				SegmentID: 1,
+				Manifest: packed.MarshalManifestPath(
+					params.StorageConfig.GetRootPath()+"/files/insert_log/10/20/1", 1),
+			}},
+		},
+		compactionParams:            params,
+		estimatedOutputSegmentCount: 1,
+	}
+	collectPatch := mockey.Mock(compaction.CollectLobFilesFromManifests).Return(
+		map[int64][]packed.LobFileInfo{1: {{FieldID: 101, TotalRows: 1, ValidRows: 1}}}, nil,
+	).Build()
+	defer collectPatch.UnPatch()
+
+	err := task.initLOBCompactionContext(context.Background())
+	assert.NoError(t, err)
+	if assert.NotNil(t, task.lobContext) {
+		assert.False(t, task.lobContext.HasReuseAllFields())
+		assert.True(t, task.lobContext.ShouldRewriteAnyField())
+		assert.Equal(t, compaction.LOBStrategyRewriteAll, task.lobContext.GetStrategy(101))
 	}
 }
 
@@ -279,10 +320,9 @@ func (s *MixCompactionTaskStorageV1Suite) setupTestWithTextField() {
 	s.task = NewMixCompactionTask(context.Background(), s.mockBinlogIO, nil, plan, compaction.GenParams(), []int64{pk.FieldID})
 }
 
-// V1 binlogs deserialize TEXT as arrow String while the retained-row rebuilder
-// allocates a Binary builder for TEXT, so with any filtered row rb.Append fails
-// deterministically: the task must fail instead of silently dropping the
-// retained rows of that batch.
+// Feed an Int64 column where the plan declares TEXT so rb.Append fails on a
+// real type mismatch. UTF8 TEXT is valid input for RecordBuilder. The task must
+// propagate the append error instead of silently dropping retained rows.
 func TestMixCompactionPropagatesRecordBuilderAppendError(t *testing.T) {
 	cases := []struct {
 		name           string
@@ -301,11 +341,13 @@ func TestMixCompactionPropagatesRecordBuilderAppendError(t *testing.T) {
 
 			segmentID := int64(700)
 			alloc := allocator.NewLocalAllocator(888888, math.MaxInt64)
-			segWriter, err := NewSegmentWriter(s.meta.GetSchema(), 65535, compactionBatchSize, segmentID, PartitionID, CollectionID, []int64{})
+			sourceSchema := proto.Clone(s.meta.GetSchema()).(*schemapb.CollectionSchema)
+			typeutil.GetField(sourceSchema, textFieldForAppendErrorTest).DataType = schemapb.DataType_Int64
+			segWriter, err := NewSegmentWriter(sourceSchema, 65535, compactionBatchSize, segmentID, PartitionID, CollectionID, []int64{})
 			s.Require().NoError(err)
 			for i := int64(0); i < 2; i++ {
 				row := getRow(segmentID+i, 0)
-				row[textFieldForAppendErrorTest] = "text-payload"
+				row[textFieldForAppendErrorTest] = int64(42)
 				err = segWriter.Write(&storage.Value{
 					PK:        storage.NewInt64PrimaryKey(segmentID + i),
 					Timestamp: int64(tsoutil.ComposeTSByTime(getMilvusBirthday())),
@@ -1572,57 +1614,6 @@ func genTestCollectionMeta() *etcdpb.CollectionMeta {
 	}
 }
 
-func BenchmarkMixCompactor(b *testing.B) {
-	// Setup
-	s := new(MixCompactionTaskStorageV1Suite)
-
-	s.SetT(&testing.T{})
-	s.SetupSuite()
-	s.SetupTest()
-
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		b.StopTimer()
-		seq := int64(i * 100000)
-		segments := []int64{seq, seq + 1, seq + 2}
-		alloc := allocator.NewLocalAllocator(seq+3, math.MaxInt64)
-		s.mockBinlogIO.EXPECT().Upload(mock.Anything, mock.Anything).Return(nil)
-		s.task.plan.SegmentBinlogs = make([]*datapb.CompactionSegmentBinlogs, 0)
-		for _, segID := range segments {
-			s.initSegBuffer(100000, segID)
-			kvs, fBinlogs, err := serializeWrite(context.TODO(), alloc, s.segWriter)
-			s.Require().NoError(err)
-			s.mockBinlogIO.EXPECT().Download(mock.Anything, mock.MatchedBy(func(keys []string) bool {
-				left, right := lo.Difference(keys, lo.Keys(kvs))
-				return len(left) == 0 && len(right) == 0
-			})).Return(lo.Values(kvs), nil).Once()
-
-			s.task.plan.SegmentBinlogs = append(s.task.plan.SegmentBinlogs, &datapb.CompactionSegmentBinlogs{
-				CollectionID: 1,
-				SegmentID:    segID,
-				FieldBinlogs: lo.Values(fBinlogs),
-			})
-		}
-
-		b.StartTimer()
-
-		result, err := s.task.Compact()
-		s.NoError(err)
-		s.NotNil(result)
-		s.Equal(s.task.plan.GetPlanID(), result.GetPlanID())
-		s.Equal(1, len(result.GetSegments()))
-		segment := result.GetSegments()[0]
-		s.EqualValues(19531, segment.GetSegmentID())
-		s.EqualValues(3, segment.GetNumOfRows())
-		s.NotEmpty(segment.InsertLogs)
-		s.NotEmpty(segment.Field2StatslogPaths)
-		s.Empty(segment.Deltalogs)
-	}
-
-	s.TearDownTest()
-}
-
 func TestCanMergeSort(t *testing.T) {
 	params := compaction.Params{UseMergeSort: true, MaxSegmentMergeSort: 30}
 	// EnableNamespace is false here, so the merge key is [pk] and IsSorted is
@@ -1727,4 +1718,76 @@ func TestCanMergeSortMatchesMergeKey(t *testing.T) {
 		}
 		assert.False(t, canMergeSort(plan, params))
 	})
+}
+
+func TestMixCompactionDeferredBloomFilterSelection(t *testing.T) {
+	paramtable.Get().Init(paramtable.NewBaseTable(paramtable.SkipRemote(true)))
+	const key = "dataNode.compaction.enableDeferredBloomFilter"
+	defer paramtable.Get().Reset(key)
+	for _, tc := range []struct {
+		name      string
+		enabled   string
+		inputSize int64
+		outputs   int64
+		want      bool
+	}{
+		{name: "default multi output", inputSize: 1001, outputs: 2},
+		{name: "disabled multi output", enabled: "false", inputSize: 1001, outputs: 2},
+		{name: "enabled unknown output", enabled: "true"},
+		{name: "below segment boundary", enabled: "true", inputSize: 999, outputs: 1},
+		{name: "at segment boundary", enabled: "true", inputSize: 1000, outputs: 1},
+		{name: "above segment boundary", enabled: "true", inputSize: 1001, outputs: 2, want: true},
+		{name: "at second boundary", enabled: "true", inputSize: 2000, outputs: 2, want: true},
+		{name: "above second boundary", enabled: "true", inputSize: 2001, outputs: 3, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.enabled == "" {
+				paramtable.Get().Reset(key)
+			} else {
+				assert.NoError(t, paramtable.Get().Save(key, tc.enabled))
+			}
+			params := compaction.GenParams()
+			assert.NoError(t, paramtable.Get().Save(key, fmt.Sprint(!params.EnableDeferredBloomFilter)))
+			config := storage.DefaultPkStatsConfig(1000)
+			var configReads, optionCalls int
+			configPatch := mockey.Mock(storage.DefaultPkStatsConfig).To(func(rows int64) storage.PkStatsConfig {
+				configReads++
+				assert.EqualValues(t, 1000, rows)
+				return config
+			}).Build()
+			defer configPatch.UnPatch()
+			var got storage.PkStatsConfig
+			patch := mockey.Mock(storage.WithPkStatsConfig).To(func(config storage.PkStatsConfig) storage.RwOption {
+				optionCalls++
+				got = config
+				return nil
+			}).Build()
+			defer patch.UnPatch()
+			task := &mixCompactionTask{
+				ctx:              context.Background(),
+				compactionParams: params,
+				plan: &datapb.CompactionPlan{
+					MaxSize: 1000,
+					Schema:  &schemapb.CollectionSchema{},
+					SegmentBinlogs: []*datapb.CompactionSegmentBinlogs{{
+						FieldBinlogs: []*datapb.FieldBinlog{{
+							Binlogs: []*datapb.Binlog{{MemorySize: tc.inputSize, EntriesNum: 1000}},
+						}},
+					}},
+				},
+			}
+			assert.NoError(t, task.preCompact())
+			assert.Equal(t, tc.outputs, task.estimatedOutputSegmentCount)
+			task.buildWriterOptions(context.Background())
+			if tc.want {
+				assert.Equal(t, 1, configReads)
+				assert.Equal(t, 1, optionCalls)
+				config.UseDeferredBloomFilter = true
+				assert.Equal(t, config, got)
+			} else {
+				assert.Zero(t, configReads, "eager path must not read PK configuration while building options")
+				assert.Zero(t, optionCalls, "eager path must use the writer's default PK configuration")
+			}
+		})
+	}
 }
