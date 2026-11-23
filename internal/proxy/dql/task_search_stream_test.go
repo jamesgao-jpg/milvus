@@ -34,6 +34,18 @@ type testLeaderSearchStream struct {
 	err    error
 }
 
+func TestSearchReduceStreamPartialResultUsesBatch(t *testing.T) {
+	paramtable.Init()
+	tables := paramtable.Get()
+	key := tables.QueryNodeCfg.PartialResultRequiredDataRatio.Key
+	t.Cleanup(func() { tables.Reset(key) })
+	task := &SearchTask{SearchRequest: &internalpb.SearchRequest{SearchType: internalpb.SearchType_PURE_ANN_SEARCH_NO_FILTER}}
+	tables.Save(key, "1")
+	require.True(t, task.supportsStreamingReduce())
+	tables.Save(key, "0.9")
+	require.False(t, task.supportsStreamingReduce())
+}
+
 func (s *testLeaderSearchStream) Send(request *querypb.SearchStreamRequest) error {
 	if s.send != nil {
 		s.send(request)
@@ -59,6 +71,11 @@ func (s *testLeaderSearchStream) Recv() (*internalpb.SearchResults, error) {
 }
 
 func TestSearchTaskReduceStreamBatchParity(t *testing.T) {
+	t.Run("without offset", func(t *testing.T) { testSearchTaskReduceStreamBatchParity(t, 0) })
+	t.Run("with offset", func(t *testing.T) { testSearchTaskReduceStreamBatchParity(t, 1) })
+}
+
+func testSearchTaskReduceStreamBatchParity(t *testing.T, offset int64) {
 	paramtable.Init()
 	cfg := &paramtable.Get().ProxyCfg
 	paramtable.Get().Save(cfg.EnableReduceStream.Key, "true")
@@ -69,7 +86,7 @@ func TestSearchTaskReduceStreamBatchParity(t *testing.T) {
 	})
 	ctx := context.Background()
 	req := &internalpb.SearchRequest{
-		Base: &commonpb.MsgBase{}, Nq: 2, Topk: 2,
+		Base: &commonpb.MsgBase{}, Nq: 2, Topk: 2, Offset: offset,
 		SearchType: internalpb.SearchType_PURE_ANN_SEARCH_NO_FILTER,
 	}
 
@@ -89,7 +106,7 @@ func TestSearchTaskReduceStreamBatchParity(t *testing.T) {
 	for i, result := range batch {
 		result.ChannelsMvcc = map[string]uint64{[]string{"a", "b"}[i]: uint64(i + 1)}
 	}
-	batchResult, err := reduceResults(ctx, batch, 2, 2, 0, "L2", schemapb.DataType_Int64, &planpb.QueryInfo{}, false, false, 0, nil, false)
+	batchResult, err := reduceResults(ctx, batch, 2, 2, offset, "L2", schemapb.DataType_Int64, &planpb.QueryInfo{}, false, false, 0, nil, false)
 	require.NoError(t, err)
 
 	a, b := mocks.NewMockQueryNodeClient(t), mocks.NewMockQueryNodeClient(t)
@@ -125,7 +142,7 @@ func TestSearchTaskReduceStreamBatchParity(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, chunks, 1, "ordinary post-processing sees one already-merged result")
 	require.Equal(t, map[string]uint64{"a": 1, "b": 2}, chunks[0].GetChannelsMvcc())
-	streamResult, err := reduceResults(ctx, chunks, 2, 2, 0, "L2", schemapb.DataType_Int64, &planpb.QueryInfo{}, false, false, 0, nil, false)
+	streamResult, err := reduceResults(ctx, chunks, 2, 2, offset, "L2", schemapb.DataType_Int64, &planpb.QueryInfo{}, false, false, 0, nil, false)
 	require.NoError(t, err)
 	require.True(t, proto.Equal(batchResult, streamResult), "batch: %v; stream: %v", batchResult, streamResult)
 	for _, stream := range opened {
@@ -177,4 +194,62 @@ func TestSearchStreamFallsBackToUnaryBeforeFirstChunk(t *testing.T) {
 	require.Same(t, batch, result)
 	_, err = stream.Recv()
 	require.ErrorIs(t, err, io.EOF)
+}
+
+func TestHybridGroupReduceStreamBatchParity(t *testing.T) {
+	paramtable.Init()
+	ctx := t.Context()
+	const groupFieldID = 101
+	op := hybridSearchReduceOperator{
+		traceCtx: ctx, primaryFieldSchema: &schemapb.FieldSchema{DataType: schemapb.DataType_Int64},
+		subReqs: []*internalpb.SubSearchRequest{
+			{Nq: 2, Topk: 2, Offset: 1}, {Nq: 2, Topk: 2, Offset: 1},
+		},
+		queryInfos: []*planpb.QueryInfo{{GroupByFieldId: groupFieldID, GroupSize: 2}, {}},
+	}
+	batch := make([]*internalpb.SearchResults, 2)
+	streams := make([]searchreducestream.ReduceStream, 2)
+	for i := range batch {
+		offset := int64(i * 10)
+		grouped := genSearchResultData(2, 2, []int64{1 + offset, 2 + offset, 3 + offset, 4 + offset}, []float32{-1, -1, -3, -2})
+		grouped.Topks = []int64{3, 1}
+		grouped.GroupByFieldValue = &schemapb.FieldData{
+			Type: schemapb.DataType_Int64, ValidData: []bool{true, false, true, true},
+			Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{
+				Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: []int64{7, 7, 8}}},
+			}},
+		}
+		plain := genSearchResultData(2, 2, []int64{1 + offset, 2 + offset, 3 + offset, 4 + offset}, []float32{1, 0.5, 1, 0.5})
+		plain.Topks = []int64{2, 2}
+		batch[i] = &internalpb.SearchResults{
+			Status: merr.Success(), IsAdvanced: true, NumQueries: 2,
+			ChannelsMvcc: map[string]uint64{"a": 1},
+			SubResults: []*internalpb.SubSearchResults{
+				{ReqIndex: 0, NumQueries: 2, TopK: 2, MetricType: "L2", ResultData: grouped},
+				{ReqIndex: 1, NumQueries: 2, TopK: 2, MetricType: "IP", ResultData: plain},
+			},
+		}
+		cancelCtx, cancel := context.WithCancel(ctx)
+		rpc := &testLeaderSearchStream{ctx: cancelCtx}
+		require.NoError(t, searchreducestream.SplitHybridSearchResult(proto.CloneOf(batch[i]), 1, func(chunk *internalpb.SearchResults) error {
+			rpc.chunks = append(rpc.chunks, chunk)
+			return nil
+		}))
+		require.Len(t, rpc.chunks, 8)
+		streams[i] = &grpcSearchStream{rpc: rpc, cancel: cancel}
+	}
+	drained, err := searchreducestream.DrainSearchStreams(ctx, streams)
+	require.NoError(t, err)
+	require.Len(t, drained, 2)
+	require.Equal(t, map[string]uint64{"a": 1}, drained[0].GetChannelsMvcc())
+	want, err := op.run(ctx, nil, batch)
+	require.NoError(t, err)
+	got, err := op.run(ctx, nil, drained)
+	require.NoError(t, err)
+	wantResults, gotResults := want[0].([]*milvuspb.SearchResults), got[0].([]*milvuspb.SearchResults)
+	require.Len(t, gotResults, len(wantResults))
+	for i, expected := range wantResults {
+		require.True(t, proto.Equal(expected, gotResults[i]), "sub-search %d: Batch %v; stream %v", i, expected, gotResults[i])
+	}
+	require.Equal(t, []int64{6, 2}, gotResults[0].GetResults().GetTopks(), "grouped candidates must not be clipped before fusion")
 }

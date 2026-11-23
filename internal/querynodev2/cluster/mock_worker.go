@@ -6,6 +6,7 @@ import (
 	context "context"
 
 	commonpb "github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	reduce "github.com/milvus-io/milvus/internal/util/reduce"
 	streamrpc "github.com/milvus-io/milvus/internal/util/streamrpc"
 	internalpb "github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	querypb "github.com/milvus-io/milvus/pkg/v3/proto/querypb"
@@ -341,6 +342,66 @@ func (_c *MockWorker_QuerySegments_Call) RunAndReturn(run func(context.Context, 
 	return _c
 }
 
+// QuerySegmentsReduceStream provides a mock function with given fields: ctx, req, chunkBytes
+func (_m *MockWorker) QuerySegmentsReduceStream(ctx context.Context, req *querypb.QueryRequest, chunkBytes int32) (reduce.ReduceStream[*internalpb.RetrieveResults], error) {
+	ret := _m.Called(ctx, req, chunkBytes)
+
+	if len(ret) == 0 {
+		panic("no return value specified for QuerySegmentsReduceStream")
+	}
+
+	var r0 reduce.ReduceStream[*internalpb.RetrieveResults]
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, *querypb.QueryRequest, int32) (reduce.ReduceStream[*internalpb.RetrieveResults], error)); ok {
+		return rf(ctx, req, chunkBytes)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, *querypb.QueryRequest, int32) reduce.ReduceStream[*internalpb.RetrieveResults]); ok {
+		r0 = rf(ctx, req, chunkBytes)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(reduce.ReduceStream[*internalpb.RetrieveResults])
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, *querypb.QueryRequest, int32) error); ok {
+		r1 = rf(ctx, req, chunkBytes)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockWorker_QuerySegmentsReduceStream_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'QuerySegmentsReduceStream'
+type MockWorker_QuerySegmentsReduceStream_Call struct {
+	*mock.Call
+}
+
+// QuerySegmentsReduceStream is a helper method to define mock.On call
+//   - ctx context.Context
+//   - req *querypb.QueryRequest
+//   - chunkBytes int32
+func (_e *MockWorker_Expecter) QuerySegmentsReduceStream(ctx interface{}, req interface{}, chunkBytes interface{}) *MockWorker_QuerySegmentsReduceStream_Call {
+	return &MockWorker_QuerySegmentsReduceStream_Call{Call: _e.mock.On("QuerySegmentsReduceStream", ctx, req, chunkBytes)}
+}
+
+func (_c *MockWorker_QuerySegmentsReduceStream_Call) Run(run func(ctx context.Context, req *querypb.QueryRequest, chunkBytes int32)) *MockWorker_QuerySegmentsReduceStream_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(*querypb.QueryRequest), args[2].(int32))
+	})
+	return _c
+}
+
+func (_c *MockWorker_QuerySegmentsReduceStream_Call) Return(_a0 reduce.ReduceStream[*internalpb.RetrieveResults], _a1 error) *MockWorker_QuerySegmentsReduceStream_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockWorker_QuerySegmentsReduceStream_Call) RunAndReturn(run func(context.Context, *querypb.QueryRequest, int32) (reduce.ReduceStream[*internalpb.RetrieveResults], error)) *MockWorker_QuerySegmentsReduceStream_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // QueryStreamSegments provides a mock function with given fields: ctx, req, srv
 func (_m *MockWorker) QueryStreamSegments(ctx context.Context, req *querypb.QueryRequest, srv streamrpc.QueryStreamServer) error {
 	ret := _m.Called(ctx, req, srv)
@@ -491,6 +552,66 @@ func (_c *MockWorker_SearchSegments_Call) Return(_a0 *internalpb.SearchResults, 
 }
 
 func (_c *MockWorker_SearchSegments_Call) RunAndReturn(run func(context.Context, *querypb.SearchRequest) (*internalpb.SearchResults, error)) *MockWorker_SearchSegments_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// SearchSegmentsStream provides a mock function with given fields: ctx, req, chunkBytes
+func (_m *MockWorker) SearchSegmentsStream(ctx context.Context, req *querypb.SearchRequest, chunkBytes int32) (reduce.ReduceStream[*internalpb.SearchResults], error) {
+	ret := _m.Called(ctx, req, chunkBytes)
+
+	if len(ret) == 0 {
+		panic("no return value specified for SearchSegmentsStream")
+	}
+
+	var r0 reduce.ReduceStream[*internalpb.SearchResults]
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, *querypb.SearchRequest, int32) (reduce.ReduceStream[*internalpb.SearchResults], error)); ok {
+		return rf(ctx, req, chunkBytes)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, *querypb.SearchRequest, int32) reduce.ReduceStream[*internalpb.SearchResults]); ok {
+		r0 = rf(ctx, req, chunkBytes)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(reduce.ReduceStream[*internalpb.SearchResults])
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, *querypb.SearchRequest, int32) error); ok {
+		r1 = rf(ctx, req, chunkBytes)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockWorker_SearchSegmentsStream_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'SearchSegmentsStream'
+type MockWorker_SearchSegmentsStream_Call struct {
+	*mock.Call
+}
+
+// SearchSegmentsStream is a helper method to define mock.On call
+//   - ctx context.Context
+//   - req *querypb.SearchRequest
+//   - chunkBytes int32
+func (_e *MockWorker_Expecter) SearchSegmentsStream(ctx interface{}, req interface{}, chunkBytes interface{}) *MockWorker_SearchSegmentsStream_Call {
+	return &MockWorker_SearchSegmentsStream_Call{Call: _e.mock.On("SearchSegmentsStream", ctx, req, chunkBytes)}
+}
+
+func (_c *MockWorker_SearchSegmentsStream_Call) Run(run func(ctx context.Context, req *querypb.SearchRequest, chunkBytes int32)) *MockWorker_SearchSegmentsStream_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(*querypb.SearchRequest), args[2].(int32))
+	})
+	return _c
+}
+
+func (_c *MockWorker_SearchSegmentsStream_Call) Return(_a0 reduce.ReduceStream[*internalpb.SearchResults], _a1 error) *MockWorker_SearchSegmentsStream_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockWorker_SearchSegmentsStream_Call) RunAndReturn(run func(context.Context, *querypb.SearchRequest, int32) (reduce.ReduceStream[*internalpb.SearchResults], error)) *MockWorker_SearchSegmentsStream_Call {
 	_c.Call.Return(run)
 	return _c
 }

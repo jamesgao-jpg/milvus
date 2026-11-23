@@ -53,7 +53,7 @@ func (sd *shardDelegator) executeFilterStage(
 	// SegmentIDs) are owned by the proto and may share backing arrays across
 	// merged worker responses. Treat all slices on these results as read-only;
 	// copy before any mutation (append/sort/dedup).
-	filterResults, err := sd.executeSearchSubTasks(ctx, req, sealed, []SegmentEntry{}, sealedRowCount)
+	filterResults, err := sd.executeSearchSubTasks(ctx, req, sealed, []SegmentEntry{}, sealedRowCount, nil)
 	if err != nil {
 		log := sd.getLogger(ctx)
 		log.Warn(ctx, "Two-stage search: filter stage failed", mlog.Err(err))
@@ -93,6 +93,7 @@ func (sd *shardDelegator) twoStageSearch(
 	sealed []SnapshotItem,
 	growing []SegmentEntry,
 	sealedRowCount map[int64]int64,
+	send func(*internalpb.SearchResults) error,
 ) ([]*internalpb.SearchResults, bool, error) {
 	log := sd.getLogger(ctx)
 
@@ -146,7 +147,7 @@ func (sd *shardDelegator) twoStageSearch(
 	optimizedReq.EnableExprCache = true
 	// vector search stage need to search both sealed and growing segments
 	stage2Start := time.Now()
-	results, err := sd.executeSearchSubTasks(ctx, optimizedReq, sealed, growing, sealedRowCount)
+	results, err := sd.executeSearchSubTasks(ctx, optimizedReq, sealed, growing, sealedRowCount, send)
 	stage2Dur := float64(time.Since(stage2Start).Milliseconds())
 	metrics.QueryNodeTwoStageSearchLatency.WithLabelValues(nodeID, collectionID).Observe(stage2Dur)
 	if err != nil {

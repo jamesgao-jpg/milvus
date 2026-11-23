@@ -27,6 +27,8 @@ import (
 	"github.com/samber/lo"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
@@ -42,6 +44,7 @@ import (
 	"github.com/milvus-io/milvus/internal/streamingnode/client/handler/registry"
 	"github.com/milvus-io/milvus/internal/util/analyzer"
 	"github.com/milvus-io/milvus/internal/util/fileresource"
+	"github.com/milvus-io/milvus/internal/util/queryutil"
 	searchreducestream "github.com/milvus-io/milvus/internal/util/searchutil/reduce_stream"
 	"github.com/milvus-io/milvus/internal/util/searchutil/scheduler"
 	streamingstatus "github.com/milvus-io/milvus/internal/util/streamingutil/status"
@@ -61,6 +64,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/metricsinfo"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/resource"
 	"github.com/milvus-io/milvus/pkg/v3/util/timerecord"
 	"github.com/milvus-io/milvus/pkg/v3/util/tsoutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
@@ -933,6 +937,10 @@ func (node *QueryNode) SearchSegments(ctx context.Context, req *querypb.SearchRe
 
 // Search performs replica search tasks.
 func (node *QueryNode) Search(ctx context.Context, req *querypb.SearchRequest) (*internalpb.SearchResults, error) {
+	return node.searchRequest(ctx, req, nil)
+}
+
+func (node *QueryNode) searchRequest(ctx context.Context, req *querypb.SearchRequest, send func(*internalpb.SearchResults) error) (*internalpb.SearchResults, error) {
 	log := mlog.With(
 		mlog.Int64("collectionID", req.GetReq().GetCollectionID()),
 		mlog.Strings("channels", req.GetDmlChannels()),
@@ -973,22 +981,34 @@ func (node *QueryNode) Search(ctx context.Context, req *querypb.SearchRequest) (
 
 	ch := req.GetDmlChannels()[0]
 	channelReq := &querypb.SearchRequest{
-		Req:             req.Req,
-		DmlChannels:     []string{ch},
-		SegmentIDs:      req.SegmentIDs,
-		Scope:           req.Scope,
-		TotalChannelNum: req.TotalChannelNum,
+		Req:              req.Req,
+		DmlChannels:      []string{ch},
+		SegmentIDs:       req.SegmentIDs,
+		Scope:            req.Scope,
+		TotalChannelNum:  req.TotalChannelNum,
+		StreamChunkBytes: req.GetStreamChunkBytes(),
 	}
-	ret, err := node.searchChannel(ctx, channelReq, ch)
+	if send != nil {
+		sendChunk := send
+		send = func(chunk *internalpb.SearchResults) error {
+			if cost := chunk.GetCostAggregation(); cost != nil {
+				cost.ResponseTime = tr.ElapseSpan().Milliseconds()
+			}
+			return sendChunk(chunk)
+		}
+	}
+	ret, err := node.searchChannel(ctx, channelReq, ch, send)
 	if err != nil {
 		resp.Status = merr.Status(err)
 		return resp, nil
 	}
 
+	metrics.QueryNodeExecuteCounter.WithLabelValues(strconv.FormatInt(node.GetNodeID(), 10), metrics.SearchLabel).Add(float64(proto.Size(req)))
+	if ret == nil {
+		// The ordered reducer already sent the result.
+		return nil, nil
+	}
 	ret.Status = merr.Success()
-
-	metrics.QueryNodeExecuteCounter.WithLabelValues(strconv.FormatInt(node.GetNodeID(), 10), metrics.SearchLabel).
-		Add(float64(proto.Size(req)))
 
 	if ret.GetCostAggregation() != nil {
 		ret.GetCostAggregation().ResponseTime = tr.ElapseSpan().Milliseconds()
@@ -996,25 +1016,54 @@ func (node *QueryNode) Search(ctx context.Context, req *querypb.SearchRequest) (
 	return ret, nil
 }
 
-// SearchStream runs the same delegator and worker reduction as Search, then
-// sends the completed vchannel result in query-major Chunks.
 func (node *QueryNode) SearchStream(stream querypb.QueryNode_SearchStreamServer) error {
+	return node.searchStream(stream, false)
+}
+
+func (node *QueryNode) SearchSegmentsStream(stream querypb.QueryNode_SearchSegmentsStreamServer) error {
+	return node.searchStream(stream, true)
+}
+
+func (node *QueryNode) searchStream(stream querypb.QueryNode_SearchStreamServer, worker bool) error {
 	request, err := stream.Recv()
 	if err != nil {
 		return err
 	}
 	req := request.GetRequest()
-	if req.GetReq() == nil || request.GetChunkBytes() <= 0 || req.GetReq().GetIsAdvanced() || req.GetFilterOnly() {
-		return stream.Send(&internalpb.SearchResults{Status: merr.Status(merr.WrapErrServiceInternalMsg("invalid leader SearchStream request"))})
+	if req.GetReq() == nil || len(req.GetDmlChannels()) != 1 || request.GetChunkBytes() <= 0 || (worker && req.GetReq().GetIsAdvanced()) || req.GetFilterOnly() {
+		return stream.Send(&internalpb.SearchResults{Status: merr.Status(merr.WrapErrServiceInternalMsg("invalid SearchStream request"))})
 	}
-	result, err := node.Search(stream.Context(), req)
+	var result *internalpb.SearchResults
+	if worker {
+		result, err = node.SearchSegments(stream.Context(), req)
+	} else {
+		if paramtable.Get().QueryNodeCfg.PartialResultRequiredDataRatio.GetAsFloat() < 1 {
+			return status.Error(codes.Unimplemented, "partial-result Search requires Batch")
+		}
+		req.StreamChunkBytes = request.GetChunkBytes()
+		if !req.GetReq().GetIsAdvanced() && req.GetReq().GetGroupByFieldId() <= 0 && len(req.GetReq().GetGroupByFieldIds()) == 0 {
+			result, err = node.searchRequest(stream.Context(), req, stream.Send)
+			if err == nil && result == nil {
+				return nil
+			}
+		} else {
+			result, err = node.Search(stream.Context(), req)
+		}
+	}
 	if err != nil {
 		return stream.Send(&internalpb.SearchResults{Status: merr.Status(err)})
 	}
 	if !merr.Ok(result.GetStatus()) {
 		return stream.Send(result)
 	}
-	err = searchreducestream.SplitSearchResult(result, req.GetReq().GetNq(), req.GetReq().GetTopk(), int(request.GetChunkBytes()), stream.Send)
+	// Worker SearchSegments can return a pinned native blob. Splitting
+	// decodes it into owned Go data without invoking the unary codec.
+	defer resource.MsgPins.Release(result)
+	if req.GetReq().GetIsAdvanced() {
+		err = searchreducestream.SplitHybridSearchResult(result, int(request.GetChunkBytes()), stream.Send)
+	} else {
+		err = searchreducestream.SplitSearchResult(result, req.GetReq().GetNq(), req.GetReq().GetTopk(), int(request.GetChunkBytes()), stream.Send)
+	}
 	if merr.IsMilvusError(err) {
 		return stream.Send(&internalpb.SearchResults{Status: merr.Status(err)})
 	}
@@ -1110,6 +1159,10 @@ func (node *QueryNode) QuerySegments(ctx context.Context, req *querypb.QueryRequ
 
 // Query performs replica query tasks.
 func (node *QueryNode) Query(ctx context.Context, req *querypb.QueryRequest) (*internalpb.RetrieveResults, error) {
+	return node.queryRequest(ctx, req, nil)
+}
+
+func (node *QueryNode) queryRequest(ctx context.Context, req *querypb.QueryRequest, send func(*internalpb.RetrieveResults) error) (*internalpb.RetrieveResults, error) {
 	log := mlog.With(
 		mlog.Int64("collectionID", req.GetReq().GetCollectionID()),
 		mlog.Strings("shards", req.GetDmlChannels()),
@@ -1155,13 +1208,47 @@ func (node *QueryNode) Query(ctx context.Context, req *querypb.QueryRequest) (*i
 		req.GetDmlChannels()[0],
 		req.GetSegmentIDs(),
 	))
-	res, err := node.queryChannel(ctx, req, req.GetDmlChannels()[0])
+	res, err := node.queryChannel(ctx, req, req.GetDmlChannels()[0], send)
 	if err != nil {
 		return &internalpb.RetrieveResults{
 			Status: merr.Status(err),
 		}, nil
 	}
 	return res, nil
+}
+
+func (node *QueryNode) QueryReduceStream(stream querypb.QueryNode_QueryReduceStreamServer) error {
+	request, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	req := request.GetRequest()
+	if !queryutil.SupportsQueryReduceStream(req.GetReq()) || len(req.GetDmlChannels()) != 1 || request.GetChunkBytes() <= 0 {
+		return status.Error(codes.Unimplemented, "unsupported QueryReduceStream request")
+	}
+
+	var result *internalpb.RetrieveResults
+	if request.GetWorker() {
+		result, err = node.QuerySegments(stream.Context(), req)
+	} else {
+		req.StreamChunkBytes = request.GetChunkBytes()
+		if queryutil.IsPKOrderedQuery(req.GetReq()) && !req.GetReq().GetIsCount() {
+			result, err = node.queryRequest(stream.Context(), req, stream.Send)
+			if err == nil && result == nil {
+				return nil
+			}
+		} else {
+			result, err = node.Query(stream.Context(), req)
+		}
+	}
+	if err != nil {
+		return stream.Send(&internalpb.RetrieveResults{Status: merr.Status(err)})
+	}
+	err = queryutil.SplitRetrieveResult(result, int(request.GetChunkBytes()), stream.Send)
+	if merr.IsMilvusError(err) {
+		return stream.Send(&internalpb.RetrieveResults{Status: merr.Status(err)})
+	}
+	return err
 }
 
 func (node *QueryNode) QueryStream(req *querypb.QueryRequest, srv querypb.QueryNode_QueryStreamServer) error {

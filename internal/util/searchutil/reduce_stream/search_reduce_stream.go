@@ -25,8 +25,8 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/util/reduce"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
-	"github.com/milvus-io/milvus/pkg/v3/util/fastpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/resource"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
@@ -69,7 +69,7 @@ func decodeChunk(chunk *internalpb.SearchResults, nq, topK int64) (*schemapb.Sea
 	data := chunk.GetResultData()
 	if data == nil && len(chunk.GetSlicedBlob()) > 0 {
 		data = &schemapb.SearchResultData{}
-		if err := fastpb.UnmarshalSearchResultData(chunk.GetSlicedBlob(), data); err != nil {
+		if err := resource.UnmarshalSearchResultData(chunk.GetSlicedBlob(), data); err != nil {
 			return nil, merr.Wrap(err, "decode Search Chunk")
 		}
 	}
@@ -162,7 +162,39 @@ func SplitSearchResult(result *internalpb.SearchResults, nq, topK int64, chunkBy
 	first := true
 	chunk := newSearchData(nq, topK)
 	size := 0
+	groupFields := append([]*schemapb.FieldData{}, data.GetGroupByFieldValues()...)
+	singular := data.GetGroupByFieldValue() != nil
+	if singular {
+		groupFields = append(groupFields, data.GetGroupByFieldValue())
+	}
+	groupValues := make([]func(int) any, len(groupFields))
+	for i, field := range groupFields {
+		groupValues[i] = typeutil.GetDataIterator(field)
+	}
+	start, end := 0, 0
 	emit := func() error {
+		for i, field := range groupFields {
+			builder, err := typeutil.NewFieldDataBuilder(field.GetType(), true, end-start)
+			if err != nil {
+				return err
+			}
+			for row := start; row < end; row++ {
+				builder.Add(groupValues[i](row))
+			}
+			group := builder.Build()
+			group.FieldId, group.FieldName = field.GetFieldId(), field.GetFieldName()
+			// Retain a validity entry even for an all-valid slice of a
+			// nullable column so neighboring chunks append consistently.
+			if valid := typeutil.GetFieldDataValidData(field); len(valid) != 0 {
+				typeutil.SetFieldDataValidData(group, valid[start:end:end])
+			}
+			if singular && i == len(groupFields)-1 {
+				chunk.GroupByFieldValue = group
+			} else {
+				chunk.GroupByFieldValues = append(chunk.GroupByFieldValues, group)
+			}
+		}
+		start = end
 		out := &internalpb.SearchResults{Status: result.Status, MetricType: result.MetricType, NumQueries: nq, TopK: topK}
 		if first {
 			first = false
@@ -171,6 +203,7 @@ func SplitSearchResult(result *internalpb.SearchResults, nq, topK int64, chunkBy
 			chunk.AllSearchCount = data.AllSearchCount
 		}
 		out.ResultData = chunk
+		out.NumQueries, out.TopK = nq, topK
 		return send(out)
 	}
 
@@ -182,6 +215,15 @@ func SplitSearchResult(result *internalpb.SearchResults, nq, topK int64, chunkBy
 		if err != nil {
 			return err
 		}
+		for _, valueAt := range groupValues {
+			// Group keys only support scalar data. Count their payload without
+			// walking a nullable compact vector or rescanning the bitmap.
+			if value, ok := valueAt(end).(string); ok {
+				bytes += len(value) + 1
+			} else {
+				bytes += 10
+			}
+		}
 		if bytes > chunkBytes && size > 0 {
 			if err := emit(); err != nil {
 				return err
@@ -189,6 +231,7 @@ func SplitSearchResult(result *internalpb.SearchResults, nq, topK int64, chunkBy
 			chunk, size = newSearchData(nq, topK), 0
 		}
 		appendSearchHit(chunk, data, buffer.query, buffer.row, indexes)
+		end++
 		buffer.row++
 		buffer.advanceQuery()
 		size += bytes
@@ -205,25 +248,46 @@ func SplitSearchResult(result *internalpb.SearchResults, nq, topK int64, chunkBy
 	return nil
 }
 
-// OrderedReduceStream merges query-major leader results using 3.0's Batch
-// score/PK order. Its single caller is the ordinary Search pipeline, which
-// already needs the complete final window, so Recv returns that window once.
+// OrderedReduceStream merges query-major Search results using 3.0's Batch
+// score/PK order. Each Recv resumes the merge and returns one output Chunk.
 type OrderedReduceStream struct {
-	recvMu         sync.Mutex                                      // Serializes Recv and Close cleanup.
-	childStreams   *reduce.ChildStreams[*internalpb.SearchResults] // Receives and closes leaders.
-	childBuffers   []orderedChildBuffer                            // One current Chunk per leader.
-	nq             int64                                           // Number of query vectors.
-	topK           int64                                           // Maximum hits emitted per query vector.
-	pkType         schemapb.DataType                               // Preserves typed IDs for empty Batch results.
-	maxOutputBytes int64                                           // Batch quota for a multi-leader merge.
-	finished       bool                                            // Whether final output has already been read.
+	recvMu                sync.Mutex                                      // Serializes Recv and Close cleanup.
+	childStreams          *reduce.ChildStreams[*internalpb.SearchResults] // Receives and closes children.
+	childBuffers          []orderedChildBuffer                            // One current Chunk per child.
+	nq                    int64                                           // Number of query vectors.
+	topK                  int64                                           // Maximum hits emitted per query vector.
+	offset                int64                                           // Proxy pagination; leading hits do not count against the response quota.
+	pkType                schemapb.DataType                               // Preserves typed IDs for empty Batch results.
+	maxOutputBytes        int64                                           // Batch quota for a multi-leader merge.
+	dedupByPK             bool                                            // Vchannel merge only: deduplicate PKs or (PK, element index).
+	chunkBytes            int                                             // Output Chunk payload threshold.
+	query                 int                                             // Vector currently being merged.
+	emitted               int64                                           // Selected hits for this vector, including offset.
+	seen                  map[hitKey]struct{}                             // Vchannel PK deduplication for this vector.
+	numResults            int                                             // Number of data-bearing children, for Batch quota semantics.
+	outputBytes           int64                                           // Cumulative returned field bytes across Chunks.
+	elementLevel, haveHit bool                                            // Prevent mixing element and document hits.
+	metadataSent          bool                                            // Even an empty stream reports metadata once.
+	finished              bool                                            // Whether final output has already been read.
 }
 
-func NewReduceStream(request *internalpb.SearchRequest, streams []ReduceStream, pkType schemapb.DataType, maxOutputBytes int64) *OrderedReduceStream {
+type hitKey struct {
+	pk      any
+	element int64
+}
+
+func NewReduceStream(request *internalpb.SearchRequest, streams []ReduceStream, pkType schemapb.DataType, maxOutputBytes int64, chunkBytes int) *OrderedReduceStream {
 	return &OrderedReduceStream{
 		childStreams: reduce.NewChildStreams(streams), childBuffers: make([]orderedChildBuffer, len(streams)),
-		nq: request.GetNq(), topK: request.GetTopk(), pkType: pkType, maxOutputBytes: maxOutputBytes,
+		nq: request.GetNq(), topK: request.GetTopk(), offset: request.GetOffset(), chunkBytes: chunkBytes, pkType: pkType, maxOutputBytes: maxOutputBytes,
 	}
+}
+
+func NewShardReduceStream(request *internalpb.SearchRequest, streams []ReduceStream, pkType schemapb.DataType, maxOutputBytes int64, chunkBytes int) *OrderedReduceStream {
+	s := NewReduceStream(request, streams, pkType, maxOutputBytes, chunkBytes)
+	s.dedupByPK = true
+	s.offset = 0
+	return s
 }
 
 func (s *OrderedReduceStream) Recv() (*internalpb.SearchResults, error) {
@@ -232,7 +296,6 @@ func (s *OrderedReduceStream) Recv() (*internalpb.SearchResults, error) {
 	if s.finished {
 		return nil, io.EOF
 	}
-	s.finished = true
 
 	out := &internalpb.SearchResults{Status: merr.Success(), NumQueries: s.nq, TopK: s.topK}
 	data := newSearchData(s.nq, s.topK)
@@ -242,9 +305,8 @@ func (s *OrderedReduceStream) Recv() (*internalpb.SearchResults, error) {
 	case schemapb.DataType_VarChar:
 		data.Ids.IdField = &schemapb.IDs_StrId{StrId: &schemapb.StringArray{}}
 	}
-	var outputBytes int64
+	var chunkSize int
 	var emptyResult *schemapb.SearchResultData
-	numResults := 0
 	accept := func(i int, chunk *internalpb.SearchResults) error {
 		if !merr.Ok(chunk.GetStatus()) {
 			return merr.Error(chunk.GetStatus())
@@ -253,12 +315,23 @@ func (s *OrderedReduceStream) Recv() (*internalpb.SearchResults, error) {
 		if err != nil {
 			return err
 		}
+		if len(decoded.GetScores()) > 0 {
+			isElement := decoded.GetElementIndices() != nil
+			if s.haveHit && s.elementLevel != isElement {
+				return merr.WrapErrServiceInternalMsg("Search streams mix row and element hits")
+			}
+			s.elementLevel, s.haveHit = isElement, true
+		}
 		b := &s.childBuffers[i]
 		if !b.first {
 			b.first = true
-			mergeSearchMetadata(out, chunk)
+			// The delegator's Batch reducer discards worker responses without
+			// a data payload; the Proxy reducer still needs leader metadata.
+			if !s.dedupByPK || decoded != nil {
+				mergeSearchMetadata(out, chunk)
+			}
 			if decoded != nil {
-				numResults++
+				s.numResults++
 				if len(decoded.GetScores()) == 0 {
 					emptyResult = decoded
 				}
@@ -271,7 +344,9 @@ func (s *OrderedReduceStream) Recv() (*internalpb.SearchResults, error) {
 		b.accept(decoded)
 		return nil
 	}
-	for q := 0; q < int(s.nq); q++ {
+merge:
+	for ; s.query < int(s.nq); s.query++ {
+		q := s.query
 		hasUnit := func(i int) bool {
 			b := &s.childBuffers[i]
 			// Skip surplus hits for earlier query vectors before looking for
@@ -282,7 +357,10 @@ func (s *OrderedReduceStream) Recv() (*internalpb.SearchResults, error) {
 			}
 			return b.data != nil
 		}
-		for data.Topks[q] < s.topK {
+		// Skip surplus hits to reach the next vector. For the final vector,
+		// Proxy owns the stop decision; shard streams still bound their candidates.
+		finalVector := !s.dedupByPK && q == int(s.nq)-1
+		for s.emitted < s.topK || finalVector {
 			if err := s.childStreams.ReceiveUntilReady(hasUnit, accept); err != nil {
 				return nil, err
 			}
@@ -297,19 +375,58 @@ func (s *OrderedReduceStream) Recv() (*internalpb.SearchResults, error) {
 				break
 			}
 			b := &s.childBuffers[best]
-			outputBytes += appendSearchHit(data, b.data, q, b.row, b.fields.Compute(b.row))
+			var key hitKey
+			duplicate := false
+			if s.dedupByPK && s.numResults > 1 {
+				key = hitKey{pk: typeutil.GetPK(b.data.GetIds(), b.row)}
+				if s.elementLevel {
+					key.element = b.data.GetElementIndices().GetData()[b.row]
+				}
+				if s.seen == nil {
+					s.seen = make(map[hitKey]struct{})
+				}
+				_, duplicate = s.seen[key]
+			}
+			if !duplicate {
+				indexes := b.fields.Compute(b.row)
+				bytes, err := searchUnitBytes(b.data, b.row, indexes)
+				if err != nil {
+					return nil, err
+				}
+				if chunkSize > 0 && bytes > s.chunkBytes {
+					break merge
+				}
+				if s.seen != nil {
+					s.seen[key] = struct{}{}
+				}
+				size := appendSearchHit(data, b.data, q, b.row, indexes)
+				chunkSize += bytes
+				s.emitted++
+				// Keep the candidate window intact for the existing Proxy
+				// pipeline, which applies the offset once.
+				if s.emitted > s.offset {
+					s.outputBytes += size
+				}
+			}
 			b.row++
 			b.advanceQuery()
+			if (s.numResults > 1 || s.offset > 0) && s.outputBytes > s.maxOutputBytes {
+				return nil, merr.WrapErrParameterInvalidMsg("search results exceed the maxOutputSize Limit %d", s.maxOutputBytes)
+			}
+			if chunkSize >= s.chunkBytes || (finalVector && s.emitted == s.topK) {
+				break merge
+			}
 		}
-		// Batch skips the quota check for a single data-bearing leader with
-		// no offset. Metadata-only responses do not count as data-bearing.
-		if numResults > 1 && outputBytes > s.maxOutputBytes {
-			return nil, merr.WrapErrParameterInvalidMsg("search results exceed the maxOutputSize Limit %d", s.maxOutputBytes)
-		}
+		s.emitted, s.seen = 0, nil
 	}
-	if numResults != 0 {
+	s.finished = s.query == int(s.nq)
+	if s.metadataSent && len(data.Scores) == 0 {
+		return nil, io.EOF
+	}
+	s.metadataSent = true
+	if s.numResults != 0 {
 		out.ResultData = data
-		if numResults == 1 && emptyResult != nil {
+		if s.numResults == 1 && emptyResult != nil {
 			// Batch passes a single data-bearing leader result through, even
 			// if it contains no hits and no typed ID list.
 			out.ResultData = emptyResult
@@ -336,9 +453,18 @@ func mergeSearchMetadata(out, chunk *internalpb.SearchResults) {
 	out.ScannedTotalBytes += chunk.GetScannedTotalBytes()
 	if cost := chunk.GetCostAggregation(); cost != nil {
 		if out.CostAggregation == nil {
-			out.CostAggregation = &internalpb.CostAggregation{}
+			out.CostAggregation = &internalpb.CostAggregation{
+				ResponseTime: cost.GetResponseTime(),
+				ServiceTime:  cost.GetServiceTime(),
+				TotalNQ:      cost.GetTotalNQ(),
+			}
 		}
 		out.CostAggregation.TotalRelatedDataSize += cost.GetTotalRelatedDataSize()
+		if out.CostAggregation.GetResponseTime() < cost.GetResponseTime() {
+			out.CostAggregation.ResponseTime = cost.GetResponseTime()
+			out.CostAggregation.ServiceTime = cost.GetServiceTime()
+			out.CostAggregation.TotalNQ = cost.GetTotalNQ()
+		}
 	}
 	if len(chunk.GetChannelsMvcc()) > 0 && out.ChannelsMvcc == nil {
 		out.ChannelsMvcc = make(map[string]uint64)

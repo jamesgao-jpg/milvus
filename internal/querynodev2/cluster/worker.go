@@ -26,6 +26,8 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/internal/util/queryutil"
+	searchreducestream "github.com/milvus-io/milvus/internal/util/searchutil/reduce_stream"
 	"github.com/milvus-io/milvus/internal/util/streamrpc"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
@@ -41,7 +43,9 @@ type Worker interface {
 	Delete(ctx context.Context, req *querypb.DeleteRequest) error
 	DeleteBatch(ctx context.Context, req *querypb.DeleteBatchRequest) (*querypb.DeleteBatchResponse, error)
 	SearchSegments(ctx context.Context, req *querypb.SearchRequest) (*internalpb.SearchResults, error)
+	SearchSegmentsStream(ctx context.Context, req *querypb.SearchRequest, chunkBytes int32) (searchreducestream.ReduceStream, error)
 	QuerySegments(ctx context.Context, req *querypb.QueryRequest) (*internalpb.RetrieveResults, error)
+	QuerySegmentsReduceStream(ctx context.Context, req *querypb.QueryRequest, chunkBytes int32) (queryutil.ReduceStream, error)
 	QueryStreamSegments(ctx context.Context, req *querypb.QueryRequest, srv streamrpc.QueryStreamServer) error
 	GetStatistics(ctx context.Context, req *querypb.GetStatisticsRequest) (*internalpb.GetStatisticsResponse, error)
 	UpdateSchema(ctx context.Context, req *querypb.UpdateSchemaRequest) (*commonpb.Status, error)
@@ -197,6 +201,15 @@ func (w *remoteWorker) SearchSegments(ctx context.Context, req *querypb.SearchRe
 	}
 
 	return ret, err
+}
+
+func (w *remoteWorker) SearchSegmentsStream(ctx context.Context, req *querypb.SearchRequest, chunkBytes int32) (searchreducestream.ReduceStream, error) {
+	return searchreducestream.OpenWorkerSearchStream(ctx, w.getClient(), req, chunkBytes)
+}
+
+func (w *remoteWorker) QuerySegmentsReduceStream(ctx context.Context, req *querypb.QueryRequest, chunkBytes int32) (queryutil.ReduceStream, error) {
+	first, stream, err := queryutil.OpenQueryReduceStream(ctx, w.getClient(), req, chunkBytes, true)
+	return stream, merr.CheckRPCCall(first, err)
 }
 
 func (w *remoteWorker) QuerySegments(ctx context.Context, req *querypb.QueryRequest) (*internalpb.RetrieveResults, error) {

@@ -23,16 +23,15 @@ import (
 )
 
 func (t *SearchTask) supportsStreamingReduce() bool {
-	switch t.GetSearchType() {
-	case internalpb.SearchType_PURE_ANN_SEARCH_NO_FILTER, internalpb.SearchType_PURE_ANN_SEARCH_WITH_FILTER:
-	default:
-		// Range Search, Group By, iterators, and iterative filtering are not
-		// part of the first port.
+	if paramtable.Get().QueryNodeCfg.PartialResultRequiredDataRatio.GetAsFloat() < 1 {
 		return false
 	}
-	// Keep Hybrid, reranking, ORDER BY and offset on Batch in this slice.
-	return !t.GetIsAdvanced() && t.aggCtx == nil && t.rerankMeta == nil &&
-		len(t.orderByFields) == 0 && t.GetOffset() == 0
+	if t.SearchRequest == nil {
+		return false
+	}
+	// Request validation and the selected fusion/rerank pipeline are the
+	// same as Batch. The stream only changes how candidates reach them.
+	return true
 }
 
 func (t *SearchTask) executeSearchStream(ctx context.Context, workload shardclient.CollectionWorkLoad, chunkBytes int64) error {
@@ -66,8 +65,37 @@ func (t *SearchTask) executeSearchStream(ctx context.Context, workload shardclie
 		return err
 	}
 
-	reducer := searchreducestream.NewReduceStream(t.SearchRequest, streams, pk.GetDataType(), paramtable.Get().QuotaConfig.MaxOutputSize.GetAsInt64())
-	result, err := reducer.Recv()
+	if t.GetIsAdvanced() || t.GetGroupByFieldId() > 0 || len(t.GetGroupByFieldIds()) > 0 {
+		results, err := searchreducestream.DrainSearchStreams(ctx, streams)
+		if err != nil {
+			return err
+		}
+		for _, result := range results {
+			t.resultBuf.Insert(result)
+		}
+		return nil
+	}
+	reducer := searchreducestream.NewReduceStream(t.SearchRequest, streams, pk.GetDataType(), paramtable.Get().QuotaConfig.MaxOutputSize.GetAsInt64(), int(chunkBytes))
+	var result *internalpb.SearchResults
+	for {
+		chunk, recvErr := reducer.Recv()
+		if errors.Is(recvErr, io.EOF) {
+			break
+		}
+		if recvErr != nil {
+			err = recvErr
+			break
+		}
+		if result == nil {
+			result = chunk
+		} else {
+			result.ResultData = searchreducestream.AppendSearchData(result.GetResultData(), chunk.GetResultData())
+		}
+		counts := result.GetResultData().GetTopks()
+		if len(counts) > 0 && counts[len(counts)-1] >= t.GetTopk() {
+			break
+		}
+	}
 	closeErr := reducer.Close()
 	if err != nil {
 		if closeErr != nil {

@@ -31,15 +31,17 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/internal/util/queryutil"
+	searchreducestream "github.com/milvus-io/milvus/internal/util/searchutil/reduce_stream"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
-func TestLeaderSearchStreamRPC(t *testing.T) {
+func TestReduceStreamRPC(t *testing.T) {
 	node := &QueryNode{}
-	patch := mockey.Mock((*QueryNode).Search).To(func(_ *QueryNode, _ context.Context, req *querypb.SearchRequest) (*internalpb.SearchResults, error) {
+	patch := mockey.Mock((*QueryNode).searchRequest).To(func(_ *QueryNode, _ context.Context, req *querypb.SearchRequest, send func(*internalpb.SearchResults) error) (*internalpb.SearchResults, error) {
 		assert.Equal(t, []string{"a"}, req.GetDmlChannels())
 		assert.EqualValues(t, 1, req.GetTotalChannelNum())
 		if req.GetReq().GetCollectionID() == 42 {
@@ -107,4 +109,74 @@ func TestLeaderSearchStreamRPC(t *testing.T) {
 	require.ErrorIs(t, merr.Error(chunk.GetStatus()), merr.ErrCollectionNotLoaded)
 	_, err = failed.Recv()
 	require.ErrorIs(t, err, io.EOF)
+
+	workerPatch := mockey.Mock((*QueryNode).SearchSegments).To(func(_ *QueryNode, _ context.Context, req *querypb.SearchRequest) (*internalpb.SearchResults, error) {
+		assert.Equal(t, querypb.DataScope_Historical, req.GetScope())
+		assert.Equal(t, []int64{7, 8}, req.GetSegmentIDs())
+		ids := &schemapb.IDs{}
+		typeutil.AppendPKs(ids, int64(4))
+		typeutil.AppendPKs(ids, int64(5))
+		return &internalpb.SearchResults{
+			Status: merr.Success(), NumQueries: 1, TopK: 2,
+			ResultData: &schemapb.SearchResultData{NumQueries: 1, TopK: 2, Topks: []int64{2}, Scores: []float32{1, 0.5}, Ids: ids},
+		}, nil
+	}).Build()
+	defer workerPatch.UnPatch()
+
+	worker, err := searchreducestream.OpenWorkerSearchStream(ctx, client, &querypb.SearchRequest{
+		Req:         &internalpb.SearchRequest{Nq: 1, Topk: 2},
+		DmlChannels: []string{"a"}, Scope: querypb.DataScope_Historical, SegmentIDs: []int64{7, 8},
+	}, 1)
+	require.NoError(t, err)
+	defer worker.Close()
+	for _, id := range []int64{4, 5} {
+		chunk, err := worker.Recv()
+		require.NoError(t, err)
+		require.Equal(t, []int64{id}, chunk.GetResultData().GetIds().GetIntId().GetData())
+	}
+	_, err = worker.Recv()
+	require.ErrorIs(t, err, io.EOF)
+
+	queryResult := &internalpb.RetrieveResults{Ids: &schemapb.IDs{}, MvccTimestamp: 23, AllRetrieveCount: 7}
+	for _, id := range []int64{10, 20} {
+		typeutil.AppendPKs(queryResult.Ids, id)
+	}
+	queryResult.FieldsData = []*schemapb.FieldData{{
+		FieldId: 101, Type: schemapb.DataType_Int64,
+		Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{
+			Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: []int64{10, 20}}},
+		}},
+	}}
+	queryPatch := mockey.Mock((*QueryNode).queryRequest).To(func(_ *QueryNode, _ context.Context, req *querypb.QueryRequest, send func(*internalpb.RetrieveResults) error) (*internalpb.RetrieveResults, error) {
+		assert.EqualValues(t, 1, req.GetStreamChunkBytes())
+		return queryResult, nil
+	}).Build()
+	defer queryPatch.UnPatch()
+	queryWorkerPatch := mockey.Mock((*QueryNode).QuerySegments).To(func(_ *QueryNode, _ context.Context, req *querypb.QueryRequest) (*internalpb.RetrieveResults, error) {
+		assert.Equal(t, []int64{7, 8}, req.GetSegmentIDs())
+		return queryResult, nil
+	}).Build()
+	defer queryWorkerPatch.UnPatch()
+
+	for _, asWorker := range []bool{false, true} {
+		first, stream, err := queryutil.OpenQueryReduceStream(ctx, client, &querypb.QueryRequest{
+			Req: &internalpb.RetrieveRequest{}, DmlChannels: []string{"a"}, SegmentIDs: []int64{7, 8},
+		}, 1, asWorker)
+		require.NoError(t, err)
+		require.EqualValues(t, 23, first.GetMvccTimestamp())
+		for i, id := range []int64{10, 20} {
+			chunk, err := stream.Recv()
+			require.NoError(t, err)
+			require.Equal(t, []int64{id}, chunk.GetIds().GetIntId().GetData())
+			require.Equal(t, []int64{id}, chunk.GetFieldsData()[0].GetScalars().GetLongData().GetData())
+			if i == 0 {
+				require.EqualValues(t, 7, chunk.GetAllRetrieveCount())
+			} else {
+				require.Zero(t, chunk.GetAllRetrieveCount())
+			}
+		}
+		_, err = stream.Recv()
+		require.ErrorIs(t, err, io.EOF)
+		require.NoError(t, stream.Close())
+	}
 }

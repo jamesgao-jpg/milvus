@@ -404,6 +404,14 @@ func (s *Server) SearchSegments(ctx context.Context, req *querypb.SearchRequest)
 	return s.querynode.SearchSegments(ctx, req)
 }
 
+func (s *Server) SearchSegmentsStream(stream querypb.QueryNode_SearchSegmentsStreamServer) error {
+	return s.querynode.SearchSegmentsStream(stream)
+}
+
+func (s *Server) QueryReduceStream(stream querypb.QueryNode_QueryReduceStreamServer) error {
+	return s.querynode.QueryReduceStream(stream)
+}
+
 // Query performs query of streaming/historical replica on QueryNode.
 func (s *Server) Query(ctx context.Context, req *querypb.QueryRequest) (*internalpb.RetrieveResults, error) {
 	return s.querynode.Query(ctx, req)

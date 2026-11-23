@@ -23,6 +23,7 @@ import (
 	"github.com/milvus-io/milvus/internal/proxy/taskmodel"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/exprutil"
+	"github.com/milvus-io/milvus/internal/util/queryutil"
 	"github.com/milvus-io/milvus/internal/util/reduce"
 	"github.com/milvus-io/milvus/internal/util/reduce/orderby"
 	"github.com/milvus-io/milvus/internal/util/segcore"
@@ -1006,9 +1007,6 @@ func (t *QueryTask) PreExecute(ctx context.Context) error {
 func (t *QueryTask) Execute(ctx context.Context) error {
 	tr := timerecord.NewTimeRecorder(fmt.Sprintf("proxy execute query %d", t.ID()))
 	defer tr.CtxElapse(ctx, "done")
-	log := mlog.With(mlog.Int64("collection", t.GetCollectionID()),
-		mlog.Int64s("partitionIDs", t.GetPartitionIDs()),
-		mlog.String("requestType", t.getQueryLabel()))
 
 	t.resultBuf = typeutil.NewConcurrentSet[*internalpb.RetrieveResults]()
 	// Built once, ahead of the namespace fast path below, so that the fast
@@ -1023,6 +1021,17 @@ func (t *QueryTask) Execute(ctx context.Context) error {
 		Exec:           t.queryShard,
 		PreferredNodes: t.preferredNodes,
 	}
+	cfg := &paramtable.Get().ProxyCfg
+	if cfg.EnableReduceStream.GetAsBool() && !t.reQuery && queryutil.SupportsQueryReduceStream(t.RetrieveRequest) {
+		return t.executeQueryStream(ctx, workload, cfg.ReduceStreamChunkBytes.GetAsInt64())
+	}
+	return t.executeQuery(ctx, workload)
+}
+
+func (t *QueryTask) executeQuery(ctx context.Context, workload shardclient.CollectionWorkLoad) error {
+	log := mlog.With(mlog.Int64("collection", t.GetCollectionID()),
+		mlog.Int64s("partitionIDs", t.GetPartitionIDs()),
+		mlog.String("requestType", t.getQueryLabel()))
 	if NamespacePartitionKeyModeEnabled(t.schema.CollectionSchema) && t.request.Namespace != nil {
 		channelNames, err := t.chMgr.GetVChannels(t.CollectionID)
 		if err != nil {
@@ -1182,8 +1191,7 @@ func (t *QueryTask) IsSubTask() bool {
 	return t.reQuery
 }
 
-func (t *QueryTask) queryShard(ctx context.Context, nodeID int64, qn types.QueryNodeClient, channel string) error {
-	ctx = retry.WithMaxAttemptsContext(ctx, 1)
+func (t *QueryTask) shardQueryRequest(nodeID int64, channel string) *querypb.QueryRequest {
 	needOverrideMvcc := false
 	mvccTs := t.MvccTimestamp
 	if len(t.channelsMvcc) > 0 {
@@ -1200,10 +1208,18 @@ func (t *QueryTask) queryShard(ctx context.Context, nodeID int64, qn types.Query
 		retrieveReq.GuaranteeTimestamp = mvccTs
 	}
 	retrieveReq.ConsistencyLevel = t.ConsistencyLevel
-	req := &querypb.QueryRequest{
+	return &querypb.QueryRequest{
 		Req:         retrieveReq,
 		DmlChannels: []string{channel},
 		Scope:       querypb.DataScope_All,
+	}
+}
+
+func (t *QueryTask) queryShard(ctx context.Context, nodeID int64, qn types.QueryNodeClient, channel string) error {
+	ctx = retry.WithMaxAttemptsContext(ctx, 1)
+	req := t.shardQueryRequest(nodeID, channel)
+	if req == nil {
+		return nil
 	}
 
 	log := mlog.With(mlog.Int64("collection", t.GetCollectionID()),

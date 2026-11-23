@@ -1181,6 +1181,79 @@ func (_c *MockQueryNodeClient_Query_Call) RunAndReturn(run func(context.Context,
 	return _c
 }
 
+// QueryReduceStream provides a mock function with given fields: ctx, opts
+func (_m *MockQueryNodeClient) QueryReduceStream(ctx context.Context, opts ...grpc.CallOption) (querypb.QueryNode_QueryReduceStreamClient, error) {
+	_va := make([]interface{}, len(opts))
+	for _i := range opts {
+		_va[_i] = opts[_i]
+	}
+	var _ca []interface{}
+	_ca = append(_ca, ctx)
+	_ca = append(_ca, _va...)
+	ret := _m.Called(_ca...)
+
+	if len(ret) == 0 {
+		panic("no return value specified for QueryReduceStream")
+	}
+
+	var r0 querypb.QueryNode_QueryReduceStreamClient
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, ...grpc.CallOption) (querypb.QueryNode_QueryReduceStreamClient, error)); ok {
+		return rf(ctx, opts...)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, ...grpc.CallOption) querypb.QueryNode_QueryReduceStreamClient); ok {
+		r0 = rf(ctx, opts...)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(querypb.QueryNode_QueryReduceStreamClient)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, ...grpc.CallOption) error); ok {
+		r1 = rf(ctx, opts...)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockQueryNodeClient_QueryReduceStream_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'QueryReduceStream'
+type MockQueryNodeClient_QueryReduceStream_Call struct {
+	*mock.Call
+}
+
+// QueryReduceStream is a helper method to define mock.On call
+//   - ctx context.Context
+//   - opts ...grpc.CallOption
+func (_e *MockQueryNodeClient_Expecter) QueryReduceStream(ctx interface{}, opts ...interface{}) *MockQueryNodeClient_QueryReduceStream_Call {
+	return &MockQueryNodeClient_QueryReduceStream_Call{Call: _e.mock.On("QueryReduceStream",
+		append([]interface{}{ctx}, opts...)...)}
+}
+
+func (_c *MockQueryNodeClient_QueryReduceStream_Call) Run(run func(ctx context.Context, opts ...grpc.CallOption)) *MockQueryNodeClient_QueryReduceStream_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		variadicArgs := make([]grpc.CallOption, len(args)-1)
+		for i, a := range args[1:] {
+			if a != nil {
+				variadicArgs[i] = a.(grpc.CallOption)
+			}
+		}
+		run(args[0].(context.Context), variadicArgs...)
+	})
+	return _c
+}
+
+func (_c *MockQueryNodeClient_QueryReduceStream_Call) Return(_a0 querypb.QueryNode_QueryReduceStreamClient, _a1 error) *MockQueryNodeClient_QueryReduceStream_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockQueryNodeClient_QueryReduceStream_Call) RunAndReturn(run func(context.Context, ...grpc.CallOption) (querypb.QueryNode_QueryReduceStreamClient, error)) *MockQueryNodeClient_QueryReduceStream_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // QuerySegments provides a mock function with given fields: ctx, in, opts
 func (_m *MockQueryNodeClient) QuerySegments(ctx context.Context, in *querypb.QueryRequest, opts ...grpc.CallOption) (*internalpb.RetrieveResults, error) {
 	_va := make([]interface{}, len(opts))
@@ -1843,6 +1916,79 @@ func (_c *MockQueryNodeClient_SearchSegments_Call) Return(_a0 *internalpb.Search
 }
 
 func (_c *MockQueryNodeClient_SearchSegments_Call) RunAndReturn(run func(context.Context, *querypb.SearchRequest, ...grpc.CallOption) (*internalpb.SearchResults, error)) *MockQueryNodeClient_SearchSegments_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// SearchSegmentsStream provides a mock function with given fields: ctx, opts
+func (_m *MockQueryNodeClient) SearchSegmentsStream(ctx context.Context, opts ...grpc.CallOption) (querypb.QueryNode_SearchSegmentsStreamClient, error) {
+	_va := make([]interface{}, len(opts))
+	for _i := range opts {
+		_va[_i] = opts[_i]
+	}
+	var _ca []interface{}
+	_ca = append(_ca, ctx)
+	_ca = append(_ca, _va...)
+	ret := _m.Called(_ca...)
+
+	if len(ret) == 0 {
+		panic("no return value specified for SearchSegmentsStream")
+	}
+
+	var r0 querypb.QueryNode_SearchSegmentsStreamClient
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, ...grpc.CallOption) (querypb.QueryNode_SearchSegmentsStreamClient, error)); ok {
+		return rf(ctx, opts...)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, ...grpc.CallOption) querypb.QueryNode_SearchSegmentsStreamClient); ok {
+		r0 = rf(ctx, opts...)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(querypb.QueryNode_SearchSegmentsStreamClient)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, ...grpc.CallOption) error); ok {
+		r1 = rf(ctx, opts...)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockQueryNodeClient_SearchSegmentsStream_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'SearchSegmentsStream'
+type MockQueryNodeClient_SearchSegmentsStream_Call struct {
+	*mock.Call
+}
+
+// SearchSegmentsStream is a helper method to define mock.On call
+//   - ctx context.Context
+//   - opts ...grpc.CallOption
+func (_e *MockQueryNodeClient_Expecter) SearchSegmentsStream(ctx interface{}, opts ...interface{}) *MockQueryNodeClient_SearchSegmentsStream_Call {
+	return &MockQueryNodeClient_SearchSegmentsStream_Call{Call: _e.mock.On("SearchSegmentsStream",
+		append([]interface{}{ctx}, opts...)...)}
+}
+
+func (_c *MockQueryNodeClient_SearchSegmentsStream_Call) Run(run func(ctx context.Context, opts ...grpc.CallOption)) *MockQueryNodeClient_SearchSegmentsStream_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		variadicArgs := make([]grpc.CallOption, len(args)-1)
+		for i, a := range args[1:] {
+			if a != nil {
+				variadicArgs[i] = a.(grpc.CallOption)
+			}
+		}
+		run(args[0].(context.Context), variadicArgs...)
+	})
+	return _c
+}
+
+func (_c *MockQueryNodeClient_SearchSegmentsStream_Call) Return(_a0 querypb.QueryNode_SearchSegmentsStreamClient, _a1 error) *MockQueryNodeClient_SearchSegmentsStream_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockQueryNodeClient_SearchSegmentsStream_Call) RunAndReturn(run func(context.Context, ...grpc.CallOption) (querypb.QueryNode_SearchSegmentsStreamClient, error)) *MockQueryNodeClient_SearchSegmentsStream_Call {
 	_c.Call.Return(run)
 	return _c
 }

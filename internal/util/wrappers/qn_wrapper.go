@@ -95,35 +95,53 @@ func (qn *qnServerWrapper) Search(ctx context.Context, in *querypb.SearchRequest
 }
 
 func (qn *qnServerWrapper) SearchStream(ctx context.Context, _ ...grpc.CallOption) (querypb.QueryNode_SearchStreamClient, error) {
-	client := &searchStreamClient{
-		InMemoryStreamer: streamrpc.NewInMemoryStreamer[*internalpb.SearchResults](ctx, 0),
-		requests:         streamrpc.NewInMemoryStreamer[*querypb.SearchStreamRequest](ctx, 1),
+	return openReduceStream(ctx, func(s *reduceStreamServer[querypb.SearchStreamRequest, internalpb.SearchResults]) error {
+		return qn.QueryNode.SearchStream(s)
+	}), nil
+}
+
+func (qn *qnServerWrapper) SearchSegmentsStream(ctx context.Context, _ ...grpc.CallOption) (querypb.QueryNode_SearchSegmentsStreamClient, error) {
+	return openReduceStream(ctx, func(s *reduceStreamServer[querypb.SearchStreamRequest, internalpb.SearchResults]) error {
+		return qn.QueryNode.SearchSegmentsStream(s)
+	}), nil
+}
+
+func (qn *qnServerWrapper) QueryReduceStream(ctx context.Context, _ ...grpc.CallOption) (querypb.QueryNode_QueryReduceStreamClient, error) {
+	return openReduceStream(ctx, func(s *reduceStreamServer[querypb.QueryReduceStreamRequest, internalpb.RetrieveResults]) error {
+		return qn.QueryNode.QueryReduceStream(s)
+	}), nil
+}
+
+func openReduceStream[Req, Res any](ctx context.Context, serve func(*reduceStreamServer[Req, Res]) error) *reduceStreamClient[Req, Res] {
+	client := &reduceStreamClient[Req, Res]{
+		InMemoryStreamer: streamrpc.NewInMemoryStreamer[*Res](ctx, 0),
+		requests:         streamrpc.NewInMemoryStreamer[*Req](ctx, 1),
 	}
 	go func() {
-		client.serverErr = qn.QueryNode.SearchStream(&searchStreamServer{
+		client.serverErr = serve(&reduceStreamServer[Req, Res]{
 			InMemoryStreamer: client.InMemoryStreamer, requests: client.requests,
 		})
 		client.Close()
 	}()
-	return client, nil
+	return client
 }
 
-type searchStreamClient struct {
-	*streamrpc.InMemoryStreamer[*internalpb.SearchResults]
-	requests  *streamrpc.InMemoryStreamer[*querypb.SearchStreamRequest]
+type reduceStreamClient[Req, Res any] struct {
+	*streamrpc.InMemoryStreamer[*Res]
+	requests  *streamrpc.InMemoryStreamer[*Req]
 	serverErr error // Written before the response buffer closes.
 }
 
-func (s *searchStreamClient) Send(request *querypb.SearchStreamRequest) error {
+func (s *reduceStreamClient[Req, Res]) Send(request *Req) error {
 	return s.requests.Send(request)
 }
 
-func (s *searchStreamClient) CloseSend() error {
+func (s *reduceStreamClient[Req, Res]) CloseSend() error {
 	s.requests.Close()
 	return nil
 }
 
-func (s *searchStreamClient) Recv() (*internalpb.SearchResults, error) {
+func (s *reduceStreamClient[Req, Res]) Recv() (*Res, error) {
 	result, err := s.InMemoryStreamer.Recv()
 	if err == io.EOF {
 		// The underlying streamer also reports EOF on cancellation. Distinguish
@@ -138,12 +156,12 @@ func (s *searchStreamClient) Recv() (*internalpb.SearchResults, error) {
 	return result, err
 }
 
-type searchStreamServer struct {
-	*streamrpc.InMemoryStreamer[*internalpb.SearchResults]
-	requests *streamrpc.InMemoryStreamer[*querypb.SearchStreamRequest]
+type reduceStreamServer[Req, Res any] struct {
+	*streamrpc.InMemoryStreamer[*Res]
+	requests *streamrpc.InMemoryStreamer[*Req]
 }
 
-func (s *searchStreamServer) Recv() (*querypb.SearchStreamRequest, error) {
+func (s *reduceStreamServer[Req, Res]) Recv() (*Req, error) {
 	return s.requests.Recv()
 }
 

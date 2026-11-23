@@ -28,6 +28,7 @@ import (
 	"github.com/milvus-io/milvus/internal/querynodev2/delegator"
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
 	"github.com/milvus-io/milvus/internal/querynodev2/tasks"
+	"github.com/milvus-io/milvus/internal/util/queryutil"
 	"github.com/milvus-io/milvus/internal/util/reduce"
 	"github.com/milvus-io/milvus/internal/util/segmentutil"
 	"github.com/milvus-io/milvus/internal/util/streamrpc"
@@ -159,7 +160,7 @@ func (node *QueryNode) reopenSegments(ctx context.Context, req *querypb.LoadSegm
 	return merr.Success()
 }
 
-func (node *QueryNode) queryChannel(ctx context.Context, req *querypb.QueryRequest, channel string) (*internalpb.RetrieveResults, error) {
+func (node *QueryNode) queryChannel(ctx context.Context, req *querypb.QueryRequest, channel string, send func(*internalpb.RetrieveResults) error) (*internalpb.RetrieveResults, error) {
 	queryLabel := req.GetReq().GetQueryLabel()
 	if queryLabel == "" {
 		queryLabel = metrics.QueryLabel
@@ -202,6 +203,18 @@ func (node *QueryNode) queryChannel(ctx context.Context, req *querypb.QueryReque
 	}
 
 	// do query
+	recordSuccess := func() {
+		latency := tr.ElapseSpan()
+		metrics.QueryNodeSQReqLatency.WithLabelValues(fmt.Sprint(node.GetNodeID()), queryLabel, metrics.Leader).Observe(float64(latency.Milliseconds()))
+		metrics.QueryNodeSQCount.WithLabelValues(fmt.Sprint(node.GetNodeID()), queryLabel, metrics.SuccessLabel, metrics.Leader, fmt.Sprint(req.GetReq().GetCollectionID())).Inc()
+	}
+	if send != nil {
+		err = sd.QueryReduceStream(queryCtx, req, send)
+		if err == nil {
+			recordSuccess()
+		}
+		return nil, err
+	}
 	results, err := sd.Query(queryCtx, req)
 	if err != nil {
 		log.Warn(ctx, "failed to query on delegator", mlog.Err(err))
@@ -225,9 +238,16 @@ func (node *QueryNode) queryChannel(ctx context.Context, req *querypb.QueryReque
 		node.manager.Collection.Unref(req.GetReq().GetCollectionID(), 1)
 	}()
 
-	resp, err := segments.RunDelegatorQueryPipeline(ctx, req, collection.Schema(), results)
-	if err != nil {
-		return nil, err
+	var resp *internalpb.RetrieveResults
+	if req.GetStreamChunkBytes() > 0 && queryutil.IsPKOrderedQuery(req.GetReq()) &&
+		len(results) == 1 && len(results[0].GetFieldsData()) != 0 {
+		// The delegator has already merged the worker streams by PK.
+		resp = results[0]
+	} else {
+		resp, err = segments.RunDelegatorQueryPipeline(ctx, req, collection.Schema(), results)
+		if err != nil {
+			return nil, err
+		}
 	}
 	// The delegator fixed this snapshot before querying any segments. Reading
 	// tSafe again here could report a newer snapshot than the returned data.
@@ -261,9 +281,7 @@ func (node *QueryNode) queryChannel(ctx context.Context, req *querypb.QueryReque
 		req.GetSegmentIDs(),
 	))
 
-	latency := tr.ElapseSpan()
-	metrics.QueryNodeSQReqLatency.WithLabelValues(fmt.Sprint(node.GetNodeID()), queryLabel, metrics.Leader).Observe(float64(latency.Milliseconds()))
-	metrics.QueryNodeSQCount.WithLabelValues(fmt.Sprint(node.GetNodeID()), queryLabel, metrics.SuccessLabel, metrics.Leader, fmt.Sprint(req.GetReq().GetCollectionID())).Inc()
+	recordSuccess()
 	resp.Status = merr.Success()
 	return resp, nil
 }
@@ -365,7 +383,7 @@ func (node *QueryNode) queryStreamSegments(ctx context.Context, req *querypb.Que
 	return nil
 }
 
-func (node *QueryNode) searchChannel(ctx context.Context, req *querypb.SearchRequest, channel string) (*internalpb.SearchResults, error) {
+func (node *QueryNode) searchChannel(ctx context.Context, req *querypb.SearchRequest, channel string, send func(*internalpb.SearchResults) error) (*internalpb.SearchResults, error) {
 	log := mlog.With(
 		mlog.Int64("msgID", req.GetReq().GetBase().GetMsgID()),
 		mlog.FieldCollectionID(req.Req.GetCollectionID()),
@@ -404,6 +422,20 @@ func (node *QueryNode) searchChannel(ctx context.Context, req *querypb.SearchReq
 		return nil, err
 	}
 	// do search
+	recordSuccess := func() {
+		latency := tr.ElapseSpan()
+		metrics.QueryNodeSQReqLatency.WithLabelValues(nodeIDStr, metrics.SearchLabel, metrics.Leader).Observe(float64(latency.Milliseconds()))
+		metrics.QueryNodeSQCount.WithLabelValues(nodeIDStr, metrics.SearchLabel, metrics.SuccessLabel, metrics.Leader, collIDStr).Inc()
+		metrics.QueryNodeSearchNQ.WithLabelValues(nodeIDStr).Observe(float64(req.Req.GetNq()))
+		metrics.QueryNodeSearchTopK.WithLabelValues(nodeIDStr).Observe(float64(req.Req.GetTopk()))
+	}
+	if send != nil {
+		err = sd.SearchReduceStream(ctx, req, send)
+		if err == nil {
+			recordSuccess()
+		}
+		return nil, err
+	}
 	results, err := sd.Search(ctx, req)
 	if err != nil {
 		log.Warn(ctx, "failed to search on delegator", mlog.Err(err))
@@ -431,11 +463,7 @@ func (node *QueryNode) searchChannel(ctx context.Context, req *querypb.SearchReq
 	tr.CtxElapse(ctx, "search with channel done, ch="+channel)
 
 	// update metric to prometheus
-	latency := tr.ElapseSpan()
-	metrics.QueryNodeSQReqLatency.WithLabelValues(nodeIDStr, metrics.SearchLabel, metrics.Leader).Observe(float64(latency.Milliseconds()))
-	metrics.QueryNodeSQCount.WithLabelValues(nodeIDStr, metrics.SearchLabel, metrics.SuccessLabel, metrics.Leader, collIDStr).Inc()
-	metrics.QueryNodeSearchNQ.WithLabelValues(nodeIDStr).Observe(float64(req.Req.GetNq()))
-	metrics.QueryNodeSearchTopK.WithLabelValues(nodeIDStr).Observe(float64(req.Req.GetTopk()))
+	recordSuccess()
 	return resp, nil
 }
 

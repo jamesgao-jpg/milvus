@@ -146,7 +146,11 @@ service QueryNode {
     }
     rpc SearchSegments(SearchRequest) returns (internal.SearchResults) {
     }
+    rpc SearchSegmentsStream(stream SearchStreamRequest) returns (stream internal.SearchResults) {
+    }
     rpc Query(QueryRequest) returns (internal.RetrieveResults) {
+    }
+    rpc QueryReduceStream(stream QueryReduceStreamRequest) returns (stream internal.RetrieveResults) {
     }
     rpc QueryStream(QueryRequest) returns (stream internal.RetrieveResults) {
     }
@@ -540,6 +544,8 @@ message SearchRequest {
     // If true, enable expression filter cache for two-stage search.
     // Stage 1 caches filter bitset, Stage 2 reuses it to skip re-execution.
     bool enable_expr_cache = 8;
+    // Set by the leader's SearchStream handler for candidate-producing worker calls.
+    int32 stream_chunk_bytes = 9;
 }
 
 message SearchStreamRequest {
@@ -553,6 +559,14 @@ message QueryRequest {
     repeated int64 segmentIDs = 3;
     bool from_shard_leader = 4;
     DataScope scope = 5;  // All, Streaming, Historical
+    int32 stream_chunk_bytes = 6;
+}
+
+// Separate from QueryStream, which delivers unordered delete-scan results.
+message QueryReduceStreamRequest {
+    QueryRequest request = 1;
+    int32 chunk_bytes = 2;
+    bool worker = 3;
 }
 
 message SyncReplicaSegmentsRequest {

@@ -231,6 +231,26 @@ func (c *Client) SearchSegments(ctx context.Context, req *querypb.SearchRequest,
 	})
 }
 
+func (c *Client) SearchSegmentsStream(ctx context.Context, opts ...grpc.CallOption) (querypb.QueryNode_SearchSegmentsStreamClient, error) {
+	ret, err := c.grpcClient.ReCall(ctx, func(client querypb.QueryNodeClient) (any, error) {
+		return client.SearchSegmentsStream(ctx, opts...)
+	})
+	if err != nil || ret == nil {
+		return nil, err
+	}
+	return ret.(querypb.QueryNode_SearchSegmentsStreamClient), nil
+}
+
+func (c *Client) QueryReduceStream(ctx context.Context, opts ...grpc.CallOption) (querypb.QueryNode_QueryReduceStreamClient, error) {
+	ret, err := c.grpcClient.ReCall(ctx, func(client querypb.QueryNodeClient) (any, error) {
+		return client.QueryReduceStream(ctx, opts...)
+	})
+	if err != nil || ret == nil {
+		return nil, err
+	}
+	return ret.(querypb.QueryNode_QueryReduceStreamClient), nil
+}
+
 // Query performs replica query tasks in QueryNode.
 func (c *Client) Query(ctx context.Context, req *querypb.QueryRequest, _ ...grpc.CallOption) (*internalpb.RetrieveResults, error) {
 	return wrapGrpcCall(ctx, c, func(client querypb.QueryNodeClient) (*internalpb.RetrieveResults, error) {

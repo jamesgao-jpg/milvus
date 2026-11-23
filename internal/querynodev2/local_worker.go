@@ -22,7 +22,10 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/querynodev2/cluster"
+	"github.com/milvus-io/milvus/internal/util/queryutil"
+	searchreducestream "github.com/milvus-io/milvus/internal/util/searchutil/reduce_stream"
 	"github.com/milvus-io/milvus/internal/util/streamrpc"
+	"github.com/milvus-io/milvus/internal/util/wrappers"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
@@ -82,6 +85,15 @@ func (w *LocalWorker) SearchSegments(ctx context.Context, req *querypb.SearchReq
 		resource.MsgPins.Release(resp) // no-op if not pinned
 	}
 	return resp, nil
+}
+
+func (w *LocalWorker) SearchSegmentsStream(ctx context.Context, req *querypb.SearchRequest, chunkBytes int32) (searchreducestream.ReduceStream, error) {
+	return searchreducestream.OpenWorkerSearchStream(ctx, wrappers.WrapQueryNodeServerAsClient(w.node), req, chunkBytes)
+}
+
+func (w *LocalWorker) QuerySegmentsReduceStream(ctx context.Context, req *querypb.QueryRequest, chunkBytes int32) (queryutil.ReduceStream, error) {
+	first, stream, err := queryutil.OpenQueryReduceStream(ctx, wrappers.WrapQueryNodeServerAsClient(w.node), req, chunkBytes, true)
+	return stream, merr.CheckRPCCall(first, err)
 }
 
 func (w *LocalWorker) QueryStreamSegments(ctx context.Context, req *querypb.QueryRequest, srv streamrpc.QueryStreamServer) error {

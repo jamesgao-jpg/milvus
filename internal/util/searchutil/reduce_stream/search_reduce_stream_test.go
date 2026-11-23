@@ -19,6 +19,7 @@ package reducestream
 import (
 	"context"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -94,10 +95,18 @@ func TestSearchReduceStream(t *testing.T) {
 	b := build("b", []int64{1, 2, 5, 7, 8}, []float32{-1, -2, -4, -1, -2},
 		[]bool{false, true, false, true, true}, []float32{20, 70, 80}, []int64{3, 2})
 	empty := &testSearchStream{chunks: []*internalpb.SearchResults{{ChannelsMvcc: map[string]uint64{"empty": 80}}}}
-	reducer := NewReduceStream(req, []ReduceStream{a, b, empty}, schemapb.DataType_Int64, 1024)
+	reducer := NewReduceStream(req, []ReduceStream{a, b, empty}, schemapb.DataType_Int64, 1024, 1)
 	defer reducer.Close()
 	result, err := reducer.Recv()
 	require.NoError(t, err)
+	require.Len(t, result.GetResultData().GetScores(), 1)
+	for range 5 {
+		chunk, err := reducer.Recv()
+		require.NoError(t, err)
+		require.Len(t, chunk.GetResultData().GetScores(), 1)
+		require.Nil(t, chunk.GetCostAggregation())
+		result.ResultData = AppendSearchData(result.GetResultData(), chunk.GetResultData())
+	}
 	// Batch retains the duplicate ID and breaks score ties on the smaller PK.
 	require.Equal(t, []int64{1, 1, 2, 4, 7, 8}, result.GetResultData().GetIds().GetIntId().GetData())
 	require.Equal(t, []int64{3, 3}, result.GetResultData().GetTopks())
@@ -109,8 +118,10 @@ func TestSearchReduceStream(t *testing.T) {
 	require.EqualValues(t, 1000, result.GetScannedTotalBytes())
 	require.Equal(t, map[string]uint64{"a": 80, "b": 80, "empty": 80}, result.GetChannelsMvcc())
 	require.Len(t, a.chunks, 1, "stop before reading another Chunk once the final vector's window is full")
-	_, err = reducer.Recv()
-	require.ErrorIs(t, err, io.EOF)
+	// A caller that explicitly keeps pulling can still read surplus final-vector hits.
+	more, err := reducer.Recv()
+	require.NoError(t, err)
+	require.Equal(t, []int64{9}, more.GetResultData().GetIds().GetIntId().GetData())
 	require.NoError(t, reducer.Close())
 	require.True(t, a.closed && b.closed && empty.closed)
 }
@@ -124,7 +135,7 @@ func TestSearchReduceStreamRecvErrorDiscardsPartialOutput(t *testing.T) {
 		chunks: []*internalpb.SearchResults{{ResultData: data}},
 		err:    merr.WrapErrServiceUnavailable("leader disconnected"),
 	}
-	reducer := NewReduceStream(req, []ReduceStream{stream}, schemapb.DataType_Int64, 1024)
+	reducer := NewReduceStream(req, []ReduceStream{stream}, schemapb.DataType_Int64, 1024, 1024)
 	result, err := reducer.Recv()
 	require.Nil(t, result)
 	require.ErrorIs(t, err, merr.ErrServiceUnavailable)
@@ -144,4 +155,27 @@ func TestSplitSearchResultStopsOnSendError(t *testing.T) {
 	})
 	require.ErrorIs(t, err, context.Canceled)
 	require.Equal(t, 1, calls)
+}
+
+func TestOrderedSearchOversizedHitIsEmittedAlone(t *testing.T) {
+	req := &internalpb.SearchRequest{Nq: 1, Topk: 2}
+	ids := []string{"a", strings.Repeat("z", 256)}
+	data := newSearchData(1, 2)
+	data.Topks, data.Scores = []int64{2}, []float32{2, 1}
+	for _, id := range ids {
+		typeutil.AppendPKs(data.Ids, id)
+	}
+	children := []ReduceStream{
+		&testSearchStream{chunks: []*internalpb.SearchResults{{ResultData: data}}},
+		&testSearchStream{chunks: []*internalpb.SearchResults{{ResultData: data}}},
+	}
+	stream := NewShardReduceStream(req, children, schemapb.DataType_VarChar, 4096, 96)
+	defer stream.Close()
+	for _, id := range ids {
+		chunk, err := stream.Recv()
+		require.NoError(t, err)
+		require.Equal(t, []string{id}, chunk.GetResultData().GetIds().GetStrId().GetData())
+	}
+	_, err := stream.Recv()
+	require.ErrorIs(t, err, io.EOF)
 }

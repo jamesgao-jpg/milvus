@@ -85,7 +85,9 @@ type ShardDelegator interface {
 	SyncPartitionStats(ctx context.Context, partVersions map[int64]int64)
 	GetPartitionStatsVersions(ctx context.Context) map[int64]int64
 	Search(ctx context.Context, req *querypb.SearchRequest) ([]*internalpb.SearchResults, error)
+	SearchReduceStream(ctx context.Context, req *querypb.SearchRequest, send func(*internalpb.SearchResults) error) error
 	Query(ctx context.Context, req *querypb.QueryRequest) ([]*internalpb.RetrieveResults, error)
+	QueryReduceStream(ctx context.Context, req *querypb.QueryRequest, send func(*internalpb.RetrieveResults) error) error
 	QueryStream(ctx context.Context, req *querypb.QueryRequest, srv streamrpc.QueryStreamServer) error
 	GetStatistics(ctx context.Context, req *querypb.GetStatisticsRequest) ([]*internalpb.GetStatisticsResponse, error)
 	UpdateSchema(ctx context.Context, sch *schemapb.CollectionSchema, schemaBarrierTs uint64) error
@@ -465,12 +467,17 @@ func (sd *shardDelegator) executeSearchSubTasks(
 	sealed []SnapshotItem,
 	growing []SegmentEntry,
 	sealedRowCount map[int64]int64,
+	send func(*internalpb.SearchResults) error,
 ) ([]*internalpb.SearchResults, error) {
 	log := sd.getLogger(ctx)
 	tasks, err := organizeSubTask(ctx, req, sealed, growing, sd, true, sd.modifySearchRequest)
 	if err != nil {
 		mlog.Warn(ctx, "Search organizeSubTask failed", mlog.Err(err))
 		return nil, err
+	}
+	if req.GetStreamChunkBytes() > 0 && !req.GetFilterOnly() &&
+		paramtable.Get().QueryNodeCfg.PartialResultRequiredDataRatio.GetAsFloat() >= 1 {
+		return sd.reduceSearchStreams(ctx, req, tasks, send)
 	}
 
 	results, err := executeSubTasks(ctx, tasks, NewRowCountBasedEvaluator(sealedRowCount),
@@ -492,7 +499,7 @@ func (sd *shardDelegator) executeSearchSubTasks(
 }
 
 // Search preforms search operation on shard.
-func (sd *shardDelegator) search(ctx context.Context, req *querypb.SearchRequest, sealed []SnapshotItem, growing []SegmentEntry, sealedRowCount map[int64]int64) ([]*internalpb.SearchResults, error) {
+func (sd *shardDelegator) search(ctx context.Context, req *querypb.SearchRequest, sealed []SnapshotItem, growing []SegmentEntry, sealedRowCount map[int64]int64, send func(*internalpb.SearchResults) error) ([]*internalpb.SearchResults, error) {
 	log := sd.getLogger(ctx)
 	if req.Req.IgnoreGrowing {
 		growing = []SegmentEntry{}
@@ -544,7 +551,7 @@ func (sd *shardDelegator) search(ctx context.Context, req *querypb.SearchRequest
 	)
 
 	if optimizers.ShouldUseTwoStageSearch(req, effectiveSegmentNum) {
-		results, fallback, err := sd.twoStageSearch(ctx, req, sealed, growing, sealedRowCount)
+		results, fallback, err := sd.twoStageSearch(ctx, req, sealed, growing, sealedRowCount, send)
 		if err != nil {
 			return nil, err
 		}
@@ -562,7 +569,7 @@ func (sd *shardDelegator) search(ctx context.Context, req *querypb.SearchRequest
 		mlog.Warn(ctx, "failed to optimize search params", mlog.Err(err))
 		return nil, err
 	}
-	return sd.executeSearchSubTasks(ctx, req, sealed, growing, sealedRowCount)
+	return sd.executeSearchSubTasks(ctx, req, sealed, growing, sealedRowCount, send)
 }
 
 // getVectorFieldDim returns the dimension of the vector field with the given field ID.
@@ -581,6 +588,10 @@ func (sd *shardDelegator) getVectorFieldDim(fieldID int64) int64 {
 
 // Search preforms search operation on shard.
 func (sd *shardDelegator) Search(ctx context.Context, req *querypb.SearchRequest) ([]*internalpb.SearchResults, error) {
+	return sd.searchWithSnapshot(ctx, req, nil)
+}
+
+func (sd *shardDelegator) searchWithSnapshot(ctx context.Context, req *querypb.SearchRequest, send func(*internalpb.SearchResults) error) ([]*internalpb.SearchResults, error) {
 	log := sd.getLogger(ctx)
 	if err := sd.lifetime.Add(sd.IsWorking); err != nil {
 		return nil, err
@@ -603,6 +614,9 @@ func (sd *shardDelegator) Search(ctx context.Context, req *querypb.SearchRequest
 	)
 
 	partialResultRequiredDataRatio := paramtable.Get().QueryNodeCfg.PartialResultRequiredDataRatio.GetAsFloat()
+	if partialResultRequiredDataRatio < 1 {
+		req.StreamChunkBytes = 0
+	}
 	// Resolve the MVCC timestamp used by this search.
 	waitTr := timerecord.NewTimeRecorder("wait tSafe")
 	var tSafe uint64
@@ -642,6 +656,13 @@ func (sd *shardDelegator) Search(ctx context.Context, req *querypb.SearchRequest
 	defer sd.distribution.Unpin(version)
 
 	if req.GetReq().GetIsAdvanced() {
+		var cancel context.CancelCauseFunc
+		if req.GetStreamChunkBytes() > 0 {
+			// The vchannel fails as a unit. Join sibling sub-searches before
+			// releasing their shared pinned snapshot.
+			ctx, cancel = context.WithCancelCause(ctx)
+			defer cancel(nil)
+		}
 		futures := make([]*conc.Future[*internalpb.SearchResults], len(req.GetReq().GetSubReqs()))
 		for index, subReq := range req.GetReq().GetSubReqs() {
 			newRequest := &internalpb.SearchRequest{
@@ -676,11 +697,19 @@ func (sd *shardDelegator) Search(ctx context.Context, req *querypb.SearchRequest
 				PkFilter:                common.PkFilterNoPkFilter, // hybrid search sub-requests rarely have PK predicates, skip unmarshal
 				SearchType:              subReq.GetSearchType(),
 			}
-			future := conc.Go(func() (*internalpb.SearchResults, error) {
+			future := conc.Go(func() (_ *internalpb.SearchResults, err error) {
+				if cancel != nil {
+					defer func() {
+						if err != nil {
+							cancel(err)
+						}
+					}()
+				}
 				searchReq := &querypb.SearchRequest{
-					Req:             newRequest,
-					DmlChannels:     req.GetDmlChannels(),
-					TotalChannelNum: req.GetTotalChannelNum(),
+					Req:              newRequest,
+					DmlChannels:      req.GetDmlChannels(),
+					TotalChannelNum:  req.GetTotalChannelNum(),
+					StreamChunkBytes: req.GetStreamChunkBytes(),
 				}
 				searchReq.Req.GuaranteeTimestamp = req.GetReq().GetGuaranteeTimestamp()
 				searchReq.Req.TimeoutTimestamp = req.GetReq().GetTimeoutTimestamp()
@@ -688,7 +717,7 @@ func (sd *shardDelegator) Search(ctx context.Context, req *querypb.SearchRequest
 					searchReq.GetReq().MvccTimestamp = tSafe
 				}
 				searchReq.Req.CollectionTtlTimestamps = req.GetReq().GetCollectionTtlTimestamps()
-				results, err := sd.search(ctx, searchReq, sealed, growing, sealedRowCount)
+				results, err := sd.search(ctx, searchReq, sealed, growing, sealedRowCount, nil)
 				if err != nil {
 					return nil, err
 				}
@@ -704,6 +733,9 @@ func (sd *shardDelegator) Search(ctx context.Context, req *querypb.SearchRequest
 
 		err = conc.AwaitAll(futures...)
 		if err != nil {
+			if cancel != nil {
+				return nil, context.Cause(ctx)
+			}
 			return nil, err
 		}
 		results := make([]*internalpb.SearchResults, len(futures))
@@ -719,7 +751,7 @@ func (sd *shardDelegator) Search(ctx context.Context, req *querypb.SearchRequest
 		return results, nil
 	}
 
-	results, err := sd.search(ctx, req, sealed, growing, sealedRowCount)
+	results, err := sd.search(ctx, req, sealed, growing, sealedRowCount, send)
 	if err != nil {
 		mlog.Warn(ctx, "delegator common search failed", mlog.Err(err))
 		return nil, err
@@ -817,6 +849,10 @@ func (sd *shardDelegator) QueryStream(ctx context.Context, req *querypb.QueryReq
 
 // Query performs query operation on shard.
 func (sd *shardDelegator) Query(ctx context.Context, req *querypb.QueryRequest) ([]*internalpb.RetrieveResults, error) {
+	return sd.queryWithSnapshot(ctx, req, nil)
+}
+
+func (sd *shardDelegator) queryWithSnapshot(ctx context.Context, req *querypb.QueryRequest, send func(*internalpb.RetrieveResults) error) ([]*internalpb.RetrieveResults, error) {
 	log := sd.getLogger(ctx)
 	if err := sd.lifetime.Add(sd.IsWorking); err != nil {
 		return nil, err
@@ -896,6 +932,10 @@ func (sd *shardDelegator) Query(ctx context.Context, req *querypb.QueryRequest) 
 	if err != nil {
 		mlog.Warn(ctx, "query organizeSubTask failed", mlog.Err(err))
 		return nil, err
+	}
+
+	if req.GetStreamChunkBytes() > 0 {
+		return sd.reduceQueryStreams(ctx, req, tasks, send)
 	}
 
 	results, err := executeSubTasks(ctx, tasks, NewRowCountBasedEvaluator(sealedRowCount), func(ctx context.Context, req *querypb.QueryRequest, worker cluster.Worker) (*internalpb.RetrieveResults, error) {
