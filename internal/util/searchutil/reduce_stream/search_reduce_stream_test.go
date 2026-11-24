@@ -179,3 +179,97 @@ func TestOrderedSearchOversizedHitIsEmittedAlone(t *testing.T) {
 	_, err := stream.Recv()
 	require.ErrorIs(t, err, io.EOF)
 }
+
+func TestSearchChunkPayloadBoundaries(t *testing.T) {
+	column := func(id int64, dt schemapb.DataType, fillZero bool, values ...any) *schemapb.FieldData {
+		builder, err := typeutil.NewFieldDataBuilder(dt, fillZero, len(values))
+		require.NoError(t, err)
+		for _, v := range values {
+			builder.Add(v)
+		}
+		fd := builder.Build()
+		fd.FieldId, fd.FieldName = id, "descriptor is not part of the hit"
+		return fd
+	}
+	cases := []struct {
+		name   string
+		bytes  int
+		groups []*schemapb.FieldData
+		fields []*schemapb.FieldData
+		want   []int // Expected hits per Chunk, computed from the payload widths.
+	}{
+		// Int64 PK + float32 score = 12 bytes, regardless of PK magnitude.
+		{"plain_exact", 24, nil, nil, []int{2, 2, 2}},
+		{"plain_crossing", 25, nil, nil, []int{3, 3}},
+		// String PK length + 4-byte score + 8-byte element index per hit.
+		{"varchar_elements", 42, nil, nil, []int{4, 2}},
+		// The Int32 key always adds 4 bytes. The compact string key adds
+		// 1, 0, 8, 0, 0, 1 bytes; NULL has no string payload.
+		{"nullable_composite", 33, []*schemapb.FieldData{
+			column(101, schemapb.DataType_Int32, true, nil, int32(2), int32(3), nil, int32(5), int32(6)),
+			column(102, schemapb.DataType_VarChar, false, "a", nil, "bbbbbbbb", "", nil, "z"),
+		}, nil, []int{2, 2, 2}},
+		{"oversized_middle", 36, nil, []*schemapb.FieldData{
+			column(103, schemapb.DataType_VarChar, true, "x", "", strings.Repeat("z", 80), "", "x", ""),
+		}, []int{2, 1, 3}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := &internalpb.SearchRequest{Nq: 1, Topk: 6}
+			data := newSearchData(1, 6)
+			data.Topks, data.Scores = []int64{6}, []float32{6, 5, 4, 3, 2, 1}
+			pkType := schemapb.DataType_Int64
+			if tc.name == "varchar_elements" {
+				pkType = schemapb.DataType_VarChar
+				for _, pk := range []string{"a", "bbb", "x", "z", "yyyy", "kk"} {
+					typeutil.AppendPKs(data.Ids, pk)
+				}
+				data.ElementIndices = &schemapb.LongArray{Data: []int64{5, 4, 3, 2, 1, 0}}
+			} else {
+				for i := range data.Scores {
+					typeutil.AppendPKs(data.Ids, int64(-1-i))
+				}
+			}
+			data.FieldsData, data.GroupByFieldValues = tc.fields, tc.groups
+			for _, group := range tc.groups {
+				req.GroupByFieldIds = append(req.GroupByFieldIds, group.FieldId)
+			}
+			for _, stage := range []string{"worker", "delegator", "proxy"} {
+				t.Run(stage, func(t *testing.T) {
+					input := &internalpb.SearchResults{ResultData: data, Status: merr.Success()}
+					var got []int
+					var pos int64
+					collect := func(chunk *internalpb.SearchResults) error {
+						ids := chunk.GetResultData().GetIds()
+						n := typeutil.GetSizeOfIDs(ids)
+						got = append(got, n)
+						for i := range n {
+							require.Equal(t, typeutil.GetPK(data.Ids, pos), typeutil.GetPK(ids, int64(i)))
+							pos++
+						}
+						return nil
+					}
+					if stage == "worker" {
+						require.NoError(t, SplitSearchResult(input, 1, 6, tc.bytes, collect))
+					} else {
+						newReducer := NewReduceStream
+						if stage == "delegator" {
+							newReducer = NewShardReduceStream
+						}
+						s := newReducer(req, []ReduceStream{&testSearchStream{chunks: []*internalpb.SearchResults{input}}}, pkType, 4096, tc.bytes)
+						defer s.Close()
+						for {
+							chunk, err := s.Recv()
+							if err == io.EOF {
+								break
+							}
+							require.NoError(t, err)
+							require.NoError(t, collect(chunk))
+						}
+					}
+					require.Equal(t, tc.want, got)
+				})
+			}
+		})
+	}
+}

@@ -3586,7 +3586,7 @@ func GetPK(data *schemapb.IDs, idx int64) interface{} {
 }
 
 func GetDataIterator(field *schemapb.FieldData) func(int) any {
-	if validData := GetFieldDataValidData(field); validData != nil {
+	if validData := GetFieldDataValidData(field); len(validData) > 0 {
 		if IsCompactNullableVectorFieldData(field) {
 			idxs, _ := BuildNullableVectorDataIndices(validData)
 			return func(idx int) any {
@@ -3596,8 +3596,8 @@ func GetDataIterator(field *schemapb.FieldData) func(int) any {
 				return getData(field, idxs[idx])
 			}
 		}
-		dataLen := getScalarDataLen(field)
-		if dataLen == len(validData) {
+		idxs := CompactScalarDataIndices(field)
+		if idxs == nil {
 			// Full-size format: data array has the same length as ValidData,
 			// values at invalid positions are zero-filled. Use direct indexing.
 			return func(idx int) any {
@@ -3608,16 +3608,6 @@ func GetDataIterator(field *schemapb.FieldData) func(int) any {
 			}
 		}
 
-		idxs := make([]int, len(validData))
-		cnt := 0
-		for i, valid := range validData {
-			if valid {
-				idxs[i] = cnt
-				cnt++
-			} else {
-				idxs[i] = -1
-			}
-		}
 		return func(idx int) any {
 			if idxs[idx] == -1 {
 				return nil
@@ -3628,6 +3618,17 @@ func GetDataIterator(field *schemapb.FieldData) func(int) any {
 	return func(idx int) any {
 		return getData(field, idx)
 	}
+}
+
+// CompactScalarDataIndices maps logical group rows to compact payload slots.
+// A dense field needs no table; a NULL in a compact field maps to -1.
+func CompactScalarDataIndices(field *schemapb.FieldData) []int {
+	valid := GetFieldDataValidData(field)
+	if len(valid) == 0 || getScalarDataLen(field) == len(valid) {
+		return nil
+	}
+	slots, _ := BuildNullableVectorDataIndices(valid)
+	return slots
 }
 
 // getScalarDataLen returns the length of the scalar data array in a FieldData.

@@ -21,8 +21,6 @@ import (
 	"slices"
 	"sync"
 
-	"google.golang.org/protobuf/encoding/protowire"
-
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/util/reduce"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
@@ -43,6 +41,8 @@ type orderedChildBuffer struct {
 	queryEnd    int64                          // Exclusive end of the current query in data.
 	first       bool                           // Whether the leader's metadata was received.
 	groupValues []func(int) any                // Group columns in request order for the current Chunk.
+	groupFields []*schemapb.FieldData          // Physical group columns for payload sizing, including the legacy singular form.
+	groupSlots  [][]int                        // Logical-to-physical rows for compact group columns; nil for dense columns.
 }
 
 func (b *orderedChildBuffer) advanceQuery() {
@@ -54,6 +54,7 @@ func (b *orderedChildBuffer) advanceQuery() {
 	}
 	if b.query == len(b.data.GetTopks()) {
 		b.data, b.fields, b.groupValues = nil, nil, nil
+		b.groupFields, b.groupSlots = nil, nil
 	}
 }
 
@@ -65,6 +66,16 @@ func (b *orderedChildBuffer) accept(data *schemapb.SearchResultData) {
 		b.queryEnd = data.Topks[0]
 	}
 	b.advanceQuery()
+	if b.data != nil {
+		b.groupFields = data.GetGroupByFieldValues()
+		if len(b.groupFields) == 0 && data.GetGroupByFieldValue() != nil {
+			b.groupFields = []*schemapb.FieldData{data.GetGroupByFieldValue()}
+		}
+		b.groupSlots = make([][]int, len(b.groupFields))
+		for i, field := range b.groupFields {
+			b.groupSlots[i] = typeutil.CompactScalarDataIndices(field)
+		}
+	}
 }
 
 func decodeChunk(chunk *internalpb.SearchResults, nq, topK int64) (*schemapb.SearchResultData, error) {
@@ -98,27 +109,36 @@ func decodeChunk(chunk *internalpb.SearchResults, nq, topK int64) (*schemapb.Sea
 	return data, nil
 }
 
-func searchUnitBytes(data *schemapb.SearchResultData, row int64, fieldIndexes []int64) (int, error) {
-	idsSize, err := reduce.IDsRowSize(data.GetIds(), row)
-	if err != nil {
-		return 0, err
+// reducibleByteSize counts the current hit's payload, not protobuf framing,
+// field descriptors, or request metadata. decodeChunk validated IDs and scores.
+func (b *orderedChildBuffer) reducibleByteSize(fieldIndexes []int64) (int, error) {
+	pkBytes := 8
+	if ids := b.data.GetIds().GetStrId(); ids != nil {
+		pkBytes = len(ids.GetData()[b.row])
 	}
-	size := protowire.SizeTag(reduce.SearchScoresFieldNumber) + protowire.SizeBytes(protowire.SizeFixed32()) +
-		protowire.SizeTag(reduce.SearchIDsFieldNumber) + protowire.SizeBytes(idsSize)
-	for i, field := range data.GetFieldsData() {
-		dataRow := row
-		if fieldIndexes != nil {
-			dataRow = fieldIndexes[i]
-		}
-		fieldSize, err := reduce.FieldDataRowSize(field, row, dataRow)
+	size := pkBytes + 4 // float32 score
+	for i, field := range b.data.GetFieldsData() {
+		fieldSize, err := reduce.FieldDataRowSize(field, b.row, fieldIndexes[i])
 		if err != nil {
 			return 0, err
 		}
-		size += protowire.SizeTag(reduce.SearchFieldsDataFieldNumber) + protowire.SizeBytes(fieldSize)
+		size += fieldSize
 	}
-	if indices := data.GetElementIndices(); indices != nil {
-		payload := protowire.SizeTag(reduce.LongArrayDataFieldNumber) + protowire.SizeBytes(protowire.SizeVarint(uint64(indices.Data[row])))
-		size += protowire.SizeTag(reduce.SearchElementIndicesFieldNumber) + protowire.SizeBytes(payload)
+	for i, field := range b.groupFields {
+		slot := b.row
+		if valid := typeutil.GetFieldDataValidData(field); b.row < int64(len(valid)) && !valid[b.row] {
+			slot = -1 // Ignore any string placeholder at a dense NULL slot.
+		} else if slots := b.groupSlots[i]; b.row < int64(len(slots)) {
+			slot = int64(slots[b.row])
+		}
+		fieldSize, err := reduce.FieldDataRowSize(field, b.row, slot)
+		if err != nil {
+			return 0, err
+		}
+		size += fieldSize
+	}
+	if b.data.GetElementIndices() != nil {
+		size += 8
 	}
 	return size, nil
 }
@@ -145,13 +165,6 @@ func appendSearchHit(dst, src *schemapb.SearchResultData, query int, row int64, 
 		dst.ElementIndices.Data = append(dst.ElementIndices.Data, indices.Data[row])
 	}
 	return size
-}
-
-func groupValueBytes(value any) int {
-	if v, ok := value.(string); ok {
-		return len(v) + 1
-	}
-	return 10
 }
 
 // SplitSearchResult emits one Chunk at a time from the completed leader result.
@@ -220,14 +233,9 @@ func SplitSearchResult(result *internalpb.SearchResults, nq, topK int64, chunkBy
 	buffer.accept(data)
 	for buffer.data != nil {
 		indexes := buffer.fields.Compute(buffer.row)
-		bytes, err := searchUnitBytes(data, buffer.row, indexes)
+		bytes, err := buffer.reducibleByteSize(indexes)
 		if err != nil {
 			return err
-		}
-		for _, valueAt := range groupValues {
-			// Group keys only support scalar data. Count their payload without
-			// walking a nullable compact vector or rescanning the bitmap.
-			bytes += groupValueBytes(valueAt(end))
 		}
 		if bytes > chunkBytes && size > 0 {
 			if err := emit(); err != nil {
@@ -292,26 +300,23 @@ type searchGroup struct {
 
 // Look up the group without changing its count. An oversized hit can belong
 // to the next output Chunk, so only count it after the sizing check.
-func (s *OrderedReduceStream) groupForHit(b *orderedChildBuffer, values []any) (*searchGroup, uint64, int) {
-	var size int
+func (s *OrderedReduceStream) groupForHit(b *orderedChildBuffer, values []any) (*searchGroup, uint64) {
 	for i, read := range b.groupValues {
-		value := read(int(b.row))
-		values[i] = reduce.NormalizeScalar(value)
-		size += groupValueBytes(value)
+		values[i] = reduce.NormalizeScalar(read(int(b.row)))
 	}
 	hash := reduce.HashGroupValues(values)
 	for _, g := range s.groups[hash] {
 		if reduce.EqualGroupValues(g.values, values) {
 			if g.count == s.groupSize {
-				return nil, hash, size
+				return nil, hash
 			}
-			return g, hash, size
+			return g, hash
 		}
 	}
 	if s.groupCount == s.topK {
-		return nil, hash, size
+		return nil, hash
 	}
-	return &searchGroup{values: slices.Clone(values)}, hash, size
+	return &searchGroup{values: slices.Clone(values)}, hash
 }
 
 // HitLimit includes the groups before the offset. The Proxy pipeline applies the offset once.
@@ -449,21 +454,19 @@ merge:
 			}
 			if !duplicate {
 				indexes := b.fields.Compute(b.row)
-				bytes, err := searchUnitBytes(b.data, b.row, indexes)
+				bytes, err := b.reducibleByteSize(indexes)
 				if err != nil {
 					return nil, err
 				}
 				var group *searchGroup
 				var hash uint64
 				if s.groups != nil {
-					var groupBytes int
-					group, hash, groupBytes = s.groupForHit(b, groupKey)
+					group, hash = s.groupForHit(b, groupKey)
 					if group == nil {
 						b.row++
 						b.advanceQuery()
 						continue
 					}
-					bytes += groupBytes
 				}
 				if chunkSize > 0 && bytes > s.chunkBytes {
 					break merge
