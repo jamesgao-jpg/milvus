@@ -23,14 +23,17 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/errors"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/proxy/shardclient"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/queryutil"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v3/util/retry"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
@@ -113,7 +116,9 @@ func consumeQueryResultStream(ctx context.Context, stream queryutil.ReduceStream
 		}
 	}()
 	var result *internalpb.RetrieveResults
-	var units int64
+	var units, outputBytes int64
+	maxOutputBytes := paramtable.Get().QuotaConfig.MaxOutputSize.GetAsInt64()
+	positional := len(req.GetGroupByFieldIds()) != 0 || len(req.GetAggregates()) != 0
 	limit := req.GetLimit()
 	// ORDER BY keys need not follow PK order. A later candidate can still
 	// reveal a cross-vchannel duplicate after the client window is full.
@@ -130,47 +135,50 @@ func consumeQueryResultStream(ctx context.Context, stream queryutil.ReduceStream
 			continue
 		}
 		rows := queryutil.GetRowCount(chunk)
+		ids, columns, elements := chunk.GetIds(), chunk.GetFieldsData(), chunk.GetElementIndices()
 		if result == nil {
-			if drain && limit > 0 && int64(rows) > limit {
-				window, err := queryutil.NewSliceOperator(limit, 0).Run(ctx, nil, chunk)
-				if err != nil {
-					return nil, err
-				}
-				trimmed := window[0].(*internalpb.RetrieveResults)
-				chunk.Ids, chunk.FieldsData = trimmed.Ids, trimmed.FieldsData
-				rows = int(limit)
-			}
+			// Keep the first Chunk's metadata, but charge its rows through the same append path.
 			result = chunk
-			if !chunk.GetElementLevel() {
-				units += int64(rows)
-			} else {
-				for _, indices := range chunk.GetElementIndices() {
-					units += int64(len(indices.GetIndices()))
-				}
+			if rows > 0 {
+				result.Ids, result.FieldsData, result.ElementIndices = nil, nil, nil
 			}
+		}
+		if rows == 0 {
 			continue
 		}
-		if len(req.GetGroupByFieldIds()) != 0 {
-			// Aggregate columns are positional and need not have distinct field IDs.
-			// The grouped reducer already bounds its output to the internal window.
-			for i := range chunk.FieldsData {
-				if err := typeutil.MergeFieldData(result.FieldsData[i:i+1], chunk.FieldsData[i:i+1]); err != nil {
-					return nil, err
-				}
-			}
-			units += int64(rows)
-			continue
+		if len(result.FieldsData) == 0 {
+			result.FieldsData = typeutil.PrepareResultFieldData(columns, 0)
 		}
-		fields := typeutil.NewFieldDataIdxComputer(chunk.GetFieldsData())
+		if len(result.FieldsData) != len(columns) {
+			return nil, merr.WrapErrServiceInternalMsg("final Query Chunks have different field counts")
+		}
+		if ids != nil && result.Ids == nil {
+			result.Ids = &schemapb.IDs{}
+		}
+		fields := typeutil.NewFieldDataIdxComputer(columns)
 		for row := 0; row < rows && (limit <= 0 || units < limit); row++ {
-			typeutil.AppendIDs(result.Ids, chunk.GetIds(), row)
-			typeutil.AppendFieldData(result.FieldsData, chunk.GetFieldsData(), int64(row), fields.Compute(int64(row))...)
+			if ids != nil {
+				typeutil.AppendIDs(result.Ids, ids, row)
+			}
+			idx := int64(row)
+			if positional {
+				// Aggregates on the same field can have the same ID but distinct columns.
+				for i := range columns {
+					outputBytes += typeutil.AppendFieldData(result.FieldsData[i:i+1], columns[i:i+1], idx)
+				}
+			} else {
+				outputBytes += typeutil.AppendFieldData(result.FieldsData, columns, idx, fields.Compute(idx)...)
+			}
 			if chunk.GetElementLevel() {
-				indices := chunk.GetElementIndices()[row]
+				indices := elements[row]
 				result.ElementIndices = append(result.ElementIndices, indices)
+				outputBytes += int64(proto.Size(indices))
 				units += int64(len(indices.GetIndices()))
 			} else {
 				units++
+			}
+			if outputBytes > maxOutputBytes {
+				return nil, merr.WrapErrParameterInvalidMsg("query results exceed the maxOutputSize Limit %d", maxOutputBytes)
 			}
 		}
 	}
