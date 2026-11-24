@@ -1232,7 +1232,7 @@ func (node *QueryNode) QueryReduceStream(stream querypb.QueryNode_QueryReduceStr
 		result, err = node.QuerySegments(stream.Context(), req)
 	} else {
 		req.StreamChunkBytes = request.GetChunkBytes()
-		if queryutil.IsPKOrderedQuery(req.GetReq()) && !req.GetReq().GetIsCount() {
+		if queryutil.CanMergeQueryStream(req.GetReq()) {
 			result, err = node.queryRequest(stream.Context(), req, stream.Send)
 			if err == nil && result == nil {
 				return nil

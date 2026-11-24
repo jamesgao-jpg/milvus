@@ -159,6 +159,8 @@ func (s *reduceStreamSuite) TestQueryAndSearch() {
 		{"unlimited", []string{integration.Int64Field, groupField}, nil},
 		{"iterator", []string{integration.Int64Field}, []*commonpb.KeyValuePair{window, kv("iterator", "true")}},
 		{"order_by", []string{integration.Int64Field, groupField}, []*commonpb.KeyValuePair{window, kv("offset", "2"), kv("order_by_fields", groupField+":desc,"+integration.Int64Field+":asc")}},
+		{"group_by_keys", []string{groupField}, []*commonpb.KeyValuePair{group, kv("offset", "2"), kv("limit", "3")}},
+		{"group_by_count", []string{groupField, "count(*)", "avg(" + integration.Int64Field + ")"}, []*commonpb.KeyValuePair{group, kv("offset", "1"), kv("limit", "3")}},
 		{"group_by_order_by", []string{groupField, "count(*)", "sum(" + integration.Int64Field + ")"}, []*commonpb.KeyValuePair{group, kv("order_by_fields", groupField+":desc"), kv("limit", "3")}},
 		{"global_aggregates", []string{"count(*)", "sum(" + groupField + ")", "avg(" + groupField + ")", "min(" + groupField + ")", "max(" + groupField + ")"}, nil},
 	} {
@@ -222,10 +224,14 @@ func (s *reduceStreamSuite) TestQueryAndSearch() {
 		{name: "iterative_filter", params: []*commonpb.KeyValuePair{kv("hints", "iterative_filter")}},
 		{name: "iterator", params: []*commonpb.KeyValuePair{iterator}},
 		{name: "iterator_v2", params: []*commonpb.KeyValuePair{iterator, kv("search_iter_v2", "true"), kv("search_iter_batch_size", "8"), kv("search_iter_id", "0c983c5c-214a-4473-9bad-7d07e7d5e5ac")}},
-		{name: "boost", score: &schemapb.FunctionScore{Functions: []*schemapb.FunctionSchema{{Type: schemapb.FunctionType_Rerank,
-			Params: []*commonpb.KeyValuePair{kv("reranker", "boost"), kv("filter", groupField+" == 2"), kv("weight", "1.5")}}}}},
-		{name: "rerank", score: &schemapb.FunctionScore{Functions: []*schemapb.FunctionSchema{{Type: schemapb.FunctionType_Rerank, InputFieldNames: []string{groupField},
-			Params: []*commonpb.KeyValuePair{kv("reranker", "decay"), kv("origin", "4"), kv("scale", "4"), kv("offset", "1"), kv("decay", "0.5"), kv("function", "gauss")}}}}},
+		{name: "boost", score: &schemapb.FunctionScore{Functions: []*schemapb.FunctionSchema{{
+			Type:   schemapb.FunctionType_Rerank,
+			Params: []*commonpb.KeyValuePair{kv("reranker", "boost"), kv("filter", groupField+" == 2"), kv("weight", "1.5")},
+		}}}},
+		{name: "rerank", score: &schemapb.FunctionScore{Functions: []*schemapb.FunctionSchema{{
+			Type: schemapb.FunctionType_Rerank, InputFieldNames: []string{groupField},
+			Params: []*commonpb.KeyValuePair{kv("reranker", "decay"), kv("origin", "4"), kv("scale", "4"), kv("offset", "1"), kv("decay", "0.5"), kv("function", "gauss")},
+		}}}},
 		{name: "l0_l1_l2", chains: []*schemapb.FunctionChain{l0, l1, l2}},
 	} {
 		s.Run("search_"+tc.name, func() {
@@ -258,8 +264,10 @@ func (s *reduceStreamSuite) TestQueryAndSearch() {
 			compare(false, func(ctx context.Context) proto.Message {
 				first, second := proto.CloneOf(baseSearch), proto.CloneOf(baseSearch)
 				second.Dsl = groupField + " <= 5"
-				req := &milvuspb.HybridSearchRequest{CollectionName: name, Requests: []*milvuspb.SearchRequest{first, second},
-					OutputFields: []string{groupField}, RankParams: []*commonpb.KeyValuePair{window}}
+				req := &milvuspb.HybridSearchRequest{
+					CollectionName: name, Requests: []*milvuspb.SearchRequest{first, second},
+					OutputFields: []string{groupField}, RankParams: []*commonpb.KeyValuePair{window},
+				}
 				if variant != "rrf" {
 					req.RankParams = append(req.RankParams, searchGroup...)
 				}

@@ -25,8 +25,6 @@ import (
 	"time"
 
 	"github.com/bytedance/mockey"
-	"github.com/milvus-io/milvus/internal/util/queryutil"
-	"github.com/milvus-io/milvus/pkg/v3/util/commonpbutil"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -37,10 +35,12 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/querynodev2/cluster"
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
+	"github.com/milvus-io/milvus/internal/util/queryutil"
 	"github.com/milvus-io/milvus/internal/util/reduce"
 	searchreducestream "github.com/milvus-io/milvus/internal/util/searchutil/reduce_stream"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v3/util/commonpbutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 )
@@ -194,6 +194,7 @@ func (s *pinnedStreamServer) SearchStream(stream querypb.QueryNode_SearchStreamS
 	req.StreamChunkBytes = open.GetChunkBytes()
 	return s.delegator.SearchReduceStream(stream.Context(), req, stream.Send)
 }
+
 func (s *pinnedStreamServer) QueryReduceStream(stream querypb.QueryNode_QueryReduceStreamServer) error {
 	defer close(s.done)
 	open, err := stream.Recv()

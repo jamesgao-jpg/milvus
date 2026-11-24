@@ -239,9 +239,9 @@ func (node *QueryNode) queryChannel(ctx context.Context, req *querypb.QueryReque
 	}()
 
 	var resp *internalpb.RetrieveResults
-	if req.GetStreamChunkBytes() > 0 && queryutil.IsPKOrderedQuery(req.GetReq()) &&
+	if req.GetStreamChunkBytes() > 0 && queryutil.CanMergeQueryStream(req.GetReq()) &&
 		len(results) == 1 && len(results[0].GetFieldsData()) != 0 {
-		// The delegator has already merged the worker streams by PK.
+		// The delegator has already reduced the worker streams.
 		resp = results[0]
 	} else {
 		resp, err = segments.RunDelegatorQueryPipeline(ctx, req, collection.Schema(), results)

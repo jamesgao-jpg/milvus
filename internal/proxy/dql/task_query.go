@@ -326,12 +326,12 @@ func translateOrderByFields(orderByFieldSpecs []string, groupByFieldIDs []int64,
 	if err != nil {
 		return nil, merr.WrapErrParameterInvalidMsg(err.Error())
 	}
-	parsed, err = orderby.AppendGroupByTieBreakers(parsed, groupByFieldIDs, schema)
-	if err != nil {
-		return nil, err
-	}
 	if len(parsed) == 0 {
 		return nil, nil
+	}
+	parsed, err = orderby.GroupKeyOrder(parsed, groupByFieldIDs, schema)
+	if err != nil {
+		return nil, err
 	}
 
 	result := make([]*planpb.OrderByField, len(parsed))

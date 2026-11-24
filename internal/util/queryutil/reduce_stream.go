@@ -24,12 +24,15 @@ import (
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/agg"
 	"github.com/milvus-io/milvus/internal/util/reduce"
+	"github.com/milvus-io/milvus/internal/util/reduce/orderby"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/planpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
@@ -43,8 +46,13 @@ func SupportsQueryReduceStream(req *internalpb.RetrieveRequest) bool {
 	return req != nil && (!req.GetIsCount() || len(req.GetAggregates()) != 0)
 }
 
-func IsPKOrderedQuery(req *internalpb.RetrieveRequest) bool {
-	return len(req.GetAggregates()) == 0 && len(req.GetGroupByFieldIds()) == 0 && len(req.GetOrderByFields()) == 0
+// CanMergeQueryStream also accepts group and aggregate partials, which have no PKs.
+func CanMergeQueryStream(req *internalpb.RetrieveRequest) bool {
+	if !SupportsQueryReduceStream(req) {
+		return false
+	}
+	return len(req.GetGroupByFieldIds()) > 0 || len(req.GetAggregates()) > 0 ||
+		len(req.GetOrderByFields()) == 0 || req.GetLimit() > 0
 }
 
 // SplitRetrieveResult sends a worker or delegator result in row-aligned chunks.
@@ -122,6 +130,14 @@ func OpenQueryReduceStream(ctx context.Context, client querypb.QueryNodeClient, 
 	if status.Code(err) == codes.Unimplemented {
 		cancel()
 		rpc = nil
+		// Older unary peers select arbitrary groups unless the internal request names
+		// the key order. Sorting a truncated response here cannot recover missing keys.
+		if len(req.GetReq().GetGroupByFieldIds()) > 0 && len(req.GetReq().GetOrderByFields()) == 0 {
+			req = proto.Clone(req).(*querypb.QueryRequest)
+			for _, id := range req.Req.GroupByFieldIds {
+				req.Req.OrderByFields = append(req.Req.OrderByFields, &planpb.OrderByField{FieldId: id, Ascending: true})
+			}
+		}
 		if worker {
 			first, err = client.QuerySegments(ctx, req)
 		} else {
@@ -163,10 +179,12 @@ func (s *queryRPCStream) Interrupt() (*internalpb.RetrieveResults, error) {
 
 type queryChildBuffer struct {
 	*timestampedResult
-	sizes   *rowSizeCalculator
-	pos     int64
-	hasMore bool // Worker pagination metadata, not the availability of another Chunk.
-	hadRows bool
+	sizes        *rowSizeCalculator
+	pos          int64
+	hasMore      bool // Worker pagination metadata, not the availability of another Chunk.
+	hadRows      bool
+	groupColumns []agg.FieldAccessor   // Positional group keys and aggregate partials in this Chunk.
+	orderColumns []*schemapb.FieldData // Proxy ORDER BY columns for the current vchannel Chunk.
 }
 
 type queryReduceUnit struct {
@@ -190,16 +208,29 @@ type OrderedReduceStream struct {
 	pending               queryReduceUnit                                   // A resolved oversized row must start its own Chunk.
 	lastPK                any                                               // Detect duplicate or regressing final input across Recv calls.
 	remaining             int64                                             // Positive shard candidate window, measured in rows or elements.
-	outputBytes           int64                                             // Shard output quota across all emitted Chunks.
+	outputBytes           int64                                             // Shard field bytes: selected rows, or current ORDER BY winners.
 	maxOutputBytes        int64                                             // Captured output quota.
+	orderBy               []*planpb.OrderByField                            // Plain ORDER BY keys, in request order.
+	orderByChunks         []*internalpb.RetrieveResults                     // Ranked shard window or a pending oversized group.
+	seenPKs               map[any]struct{}                                  // Proxy ORDER BY: duplicate PKs need not be adjacent.
+	groups                *orderedGroups                                    // GROUP BY merges ordered heads; globals fold into a single partial.
+	initErr               error                                             // Aggregate schema or ordering error, returned by the first Recv.
 	finished              bool                                              // No further rows can be selected.
 }
 
 func NewOrderedReduceStream(req *internalpb.RetrieveRequest, schema *schemapb.CollectionSchema, streams []ReduceStream, shard bool, chunkBytes int64) *OrderedReduceStream {
-	return &OrderedReduceStream{children: reduce.NewChildStreams(streams), buffers: make([]queryChildBuffer, len(streams)),
+	s := &OrderedReduceStream{
+		orderBy: req.GetOrderByFields(), children: reduce.NewChildStreams(streams), buffers: make([]queryChildBuffer, len(streams)),
 		schema: schema, shard: shard, remaining: req.GetLimit(), chunkBytes: chunkBytes, metadata: &internalpb.RetrieveResults{CostAggregation: &internalpb.CostAggregation{}},
 		stopWhenDrained: reduce.ShouldStopWhenDrained(reduce.ToReduceType(req.GetReduceType())),
-		maxOutputBytes:  paramtable.Get().QuotaConfig.MaxOutputSize.GetAsInt64()}
+		maxOutputBytes:  paramtable.Get().QuotaConfig.MaxOutputSize.GetAsInt64(),
+	}
+	if len(req.GetGroupByFieldIds()) > 0 || len(req.GetAggregates()) > 0 {
+		s.groups, s.initErr = newOrderedGroups(req, schema)
+	} else if !shard && len(s.orderBy) > 0 {
+		s.seenPKs = make(map[any]struct{})
+	}
+	return s
 }
 
 func (s *OrderedReduceStream) accept(i int, chunk *internalpb.RetrieveResults) error {
@@ -228,6 +259,9 @@ func (s *OrderedReduceStream) accept(i int, chunk *internalpb.RetrieveResults) e
 	meta.ScannedTotalBytes += chunk.GetScannedTotalBytes()
 	meta.HasMoreResult = meta.HasMoreResult || chunk.GetHasMoreResult()
 	buffer[i].hasMore = buffer[i].hasMore || chunk.GetHasMoreResult()
+	if s.groups != nil {
+		return s.groups.accept(&buffer[i], chunk)
+	}
 	rows := typeutil.GetSizeOfIDs(chunk.GetIds())
 	if chunk.GetElementLevel() && len(chunk.GetElementIndices()) != rows {
 		return merr.WrapErrServiceInternalMsg("Query chunk element indices do not match the PK count")
@@ -246,6 +280,15 @@ func (s *OrderedReduceStream) accept(i int, chunk *internalpb.RetrieveResults) e
 		}
 		buffer[i].timestampedResult, buffer[i].pos, buffer[i].hadRows = ts, 0, true
 		buffer[i].sizes = newRowSizeCalculator(chunk)
+		if s.seenPKs != nil {
+			for _, key := range s.orderBy {
+				col := reduce.FindFieldDataByID(chunk.GetFieldsData(), key.GetFieldId())
+				if col == nil {
+					return merr.WrapErrParameterInvalidMsg("ORDER BY field %d missing from vchannel Chunk", key.GetFieldId())
+				}
+				buffer[i].orderColumns = append(buffer[i].orderColumns, col)
+			}
+		}
 	}
 	return nil
 }
@@ -266,7 +309,18 @@ func (s *OrderedReduceStream) head() (int, error) {
 		}
 		key := typeutil.GetPK(b.result.GetIds(), b.pos)
 		stamp := b.getTimestamp(b.pos)
-		if best < 0 || typeutil.ComparePK(key, pk) || (s.shard && key == pk && stamp > ts) {
+		less := best < 0 || typeutil.ComparePK(key, pk) || (s.shard && key == pk && stamp > ts)
+		if best >= 0 && s.seenPKs != nil {
+			other := &s.buffers[best]
+			for j, field := range s.orderBy {
+				col := b.orderColumns[j]
+				if cmp := compareOrderByValues(col, int(b.pos), other.orderColumns[j], int(other.pos), col.GetType(), field.GetAscending(), field.GetNullsFirst()); cmp != 0 {
+					less = cmp < 0
+					break
+				}
+			}
+		}
+		if less {
 			best, pk, ts = i, key, stamp
 		}
 	}
@@ -278,6 +332,7 @@ func (b *queryChildBuffer) pop() {
 	if b.pos == int64(typeutil.GetSizeOfIDs(b.result.GetIds())) {
 		b.timestampedResult = nil
 		b.sizes = nil
+		b.orderColumns = nil
 	}
 }
 
@@ -294,7 +349,12 @@ func (s *OrderedReduceStream) produceNextUnit() (queryReduceUnit, error) {
 	b := &s.buffers[i]
 	src, row, ts := b.result, b.pos, b.getTimestamp(b.pos)
 	pk := typeutil.GetPK(src.GetIds(), row)
-	if s.lastPK != nil && !typeutil.ComparePK(s.lastPK, pk) {
+	if s.seenPKs != nil {
+		if _, exists := s.seenPKs[pk]; exists {
+			return queryReduceUnit{}, merr.WrapErrDataIntegrityMsg("duplicate PK %v found across shards", pk)
+		}
+		s.seenPKs[pk] = struct{}{}
+	} else if s.lastPK != nil && !typeutil.ComparePK(s.lastPK, pk) {
 		return queryReduceUnit{}, merr.WrapErrDataIntegrityMsg("duplicate or unordered PK %v in Query stream", pk)
 	}
 	fieldBytes := b.sizes.rowSize(row)
@@ -348,11 +408,111 @@ func (s *OrderedReduceStream) produceNextUnit() (queryReduceUnit, error) {
 	return queryReduceUnit{source: src, row: row, bytes: bytes}, nil
 }
 
+func (unit queryReduceUnit) rowRef(sources *[]*internalpb.RetrieveResults, indices map[*internalpb.RetrieveResults]int) rowRef {
+	i, ok := indices[unit.source]
+	if !ok {
+		i = len(*sources)
+		indices[unit.source] = i
+		*sources = append(*sources, unit.source)
+	}
+	return rowRef{resultIdx: i, rowIdx: unit.row}
+}
+
+// ORDER BY inputs are not PK-ordered. Keep only the current winner for each
+// PK, but do not rank or emit any row until every worker has reached EOF.
+func (s *OrderedReduceStream) prepareOrderBy() error {
+	type winner struct {
+		queryReduceUnit
+		ts    int64
+		child int
+	}
+	winners := make(map[any]winner)
+	err := s.children.ReceiveUntilReady(func(int) bool { return false }, func(i int, chunk *internalpb.RetrieveResults) error {
+		if err := s.accept(i, chunk); err != nil {
+			return err
+		}
+		b := &s.buffers[i]
+		for b.timestampedResult != nil {
+			row := b.pos
+			pk, ts := typeutil.GetPK(chunk.GetIds(), row), b.getTimestamp(row)
+			old, exists := winners[pk]
+			// Batch scans in child order; equal timestamps keep the first row
+			// even if the later child's Chunk happened to arrive first.
+			if !exists || ts > old.ts || (ts == old.ts && i < old.child) {
+				unit := queryReduceUnit{source: chunk, row: row, bytes: b.sizes.rowSize(row)}
+				winners[pk] = winner{unit, ts, i}
+				s.outputBytes += unit.bytes - old.bytes
+				if s.maxOutputBytes > 0 && s.outputBytes > s.maxOutputBytes {
+					return merr.WrapErrParameterInvalidMsg("query results exceed the maxOutputSize Limit %d", s.maxOutputBytes)
+				}
+			}
+			b.pop()
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	var sources []*internalpb.RetrieveResults
+	indices := make(map[*internalpb.RetrieveResults]int)
+	rows := make([]rowRef, 0, len(winners))
+	for _, w := range winners {
+		rows = append(rows, w.rowRef(&sources, indices))
+	}
+	result, err := buildMergedRetrieveResults(sources, rows, s.schema)
+	if err != nil {
+		return err
+	}
+	if len(rows) != 0 {
+		if s.schema == nil {
+			return merr.WrapErrServiceInternalMsg("ORDER BY shard reduction requires the collection schema")
+		}
+		fields, err := orderby.ConvertFromPlanOrderByFields(s.orderBy, s.schema)
+		if err != nil {
+			return err
+		}
+		ordered, err := NewOrderByLimitOperator(fields, s.remaining).Run(context.Background(), nil, result)
+		if err != nil {
+			return err
+		}
+		result = ordered[0].(*internalpb.RetrieveResults)
+	}
+	s.attachMetadata(result)
+	return SplitRetrieveResult(result, int(s.chunkBytes), func(chunk *internalpb.RetrieveResults) error {
+		s.orderByChunks = append(s.orderByChunks, chunk)
+		return nil
+	})
+}
+
 func (s *OrderedReduceStream) Recv() (*internalpb.RetrieveResults, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.finished && s.pending.source == nil {
 		return nil, io.EOF
+	}
+	if s.initErr != nil {
+		s.finished = true
+		return nil, s.initErr
+	}
+	if s.groups != nil {
+		chunk, err := s.recvGroups()
+		if err != nil {
+			s.finished = true
+		}
+		return chunk, err
+	}
+	if s.shard && len(s.orderBy) != 0 {
+		if s.orderByChunks == nil {
+			if err := s.prepareOrderBy(); err != nil {
+				s.finished = true
+				return nil, err
+			}
+		}
+		chunk := s.orderByChunks[0]
+		s.orderByChunks[0] = nil
+		s.orderByChunks = s.orderByChunks[1:]
+		s.finished = len(s.orderByChunks) == 0
+		return chunk, nil
 	}
 	var sources []*internalpb.RetrieveResults
 	indices := make(map[*internalpb.RetrieveResults]int)
@@ -379,14 +539,7 @@ func (s *OrderedReduceStream) Recv() (*internalpb.RetrieveResults, error) {
 		} else {
 			s.pending = queryReduceUnit{}
 		}
-		src, row := unit.source, unit.row
-		index, ok := indices[src]
-		if !ok {
-			index = len(sources)
-			sources = append(sources, src)
-			indices[src] = index
-		}
-		rows = append(rows, rowRef{resultIdx: index, rowIdx: row})
+		rows = append(rows, unit.rowRef(&sources, indices))
 		bytes += unit.bytes
 	}
 	if len(rows) == 0 && s.metadataSent {
@@ -396,6 +549,11 @@ func (s *OrderedReduceStream) Recv() (*internalpb.RetrieveResults, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.attachMetadata(result)
+	return result, nil
+}
+
+func (s *OrderedReduceStream) attachMetadata(result *internalpb.RetrieveResults) {
 	result.Status = merr.Success()
 	if !s.metadataSent {
 		result.CostAggregation = s.metadata.CostAggregation
@@ -405,7 +563,6 @@ func (s *OrderedReduceStream) Recv() (*internalpb.RetrieveResults, error) {
 		result.HasMoreResult = s.metadata.HasMoreResult
 		s.metadataSent = true
 	}
-	return result, nil
 }
 
 func (s *OrderedReduceStream) Close() error {
@@ -414,6 +571,8 @@ func (s *OrderedReduceStream) Close() error {
 	defer s.mu.Unlock()
 	s.finished = true
 	clear(s.buffers)
+	s.groups = nil
+	s.orderByChunks, s.seenPKs = nil, nil
 	s.pending = queryReduceUnit{}
 	return s.children.Close()
 }
@@ -422,8 +581,7 @@ func (s *OrderedReduceStream) Interrupt() (*internalpb.RetrieveResults, error) {
 	return nil, merr.ErrServiceUnimplemented
 }
 
-// DrainRetrieveStreams retains full inputs for the existing ORDER BY and
-// aggregate reducers. A result cannot be finalized before all children drain.
+// DrainRetrieveStreams collects input for request shapes without a streaming merge.
 func DrainRetrieveStreams(ctx context.Context, streams []ReduceStream) (_ []*internalpb.RetrieveResults, err error) {
 	children := reduce.NewChildStreams(streams)
 	defer func() {

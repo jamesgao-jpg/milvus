@@ -34,10 +34,10 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 )
 
-// QueryReduceStream sends PK-ordered Chunks while queryWithSnapshot owns the pin.
+// QueryReduceStream sends ordered row Chunks while queryWithSnapshot owns the pin.
 func (sd *shardDelegator) QueryReduceStream(ctx context.Context, req *querypb.QueryRequest, send func(*internalpb.RetrieveResults) error) error {
-	if req.GetStreamChunkBytes() <= 0 || !queryutil.IsPKOrderedQuery(req.GetReq()) {
-		return merr.WrapErrServiceInternalMsg("ordered Query stream requires a PK-ordered request and positive Chunk size")
+	if req.GetStreamChunkBytes() <= 0 || !queryutil.CanMergeQueryStream(req.GetReq()) {
+		return merr.WrapErrServiceInternalMsg("Query stream requires a supported request and positive Chunk size")
 	}
 	_, err := sd.queryWithSnapshot(ctx, req, send)
 	return err
@@ -76,7 +76,7 @@ func (sd *shardDelegator) reduceQueryStreams(ctx context.Context, req *querypb.Q
 		}
 		return nil, context.Cause(ctx)
 	}
-	if !queryutil.IsPKOrderedQuery(req.GetReq()) {
+	if !queryutil.CanMergeQueryStream(req.GetReq()) {
 		return queryutil.DrainRetrieveStreams(ctx, streams)
 	}
 	// The unary caller still consumes a single result.

@@ -80,7 +80,7 @@ func (t *QueryTask) executeQueryStream(ctx context.Context, workload shardclient
 		return err
 	}
 
-	if !queryutil.IsPKOrderedQuery(t.RetrieveRequest) {
+	if !queryutil.CanMergeQueryStream(t.RetrieveRequest) {
 		results, err := queryutil.DrainRetrieveStreams(ctx, streams)
 		if err != nil {
 			return err
@@ -91,7 +91,7 @@ func (t *QueryTask) executeQueryStream(ctx context.Context, workload shardclient
 		return nil
 	}
 	stream := queryutil.NewOrderedReduceStream(t.RetrieveRequest, t.schema.CollectionSchema, streams, false, chunkBytes)
-	result, err := consumeQueryResultStream(ctx, stream, t.GetLimit())
+	result, err := consumeQueryResultStream(ctx, stream, t.RetrieveRequest)
 	if err != nil {
 		return err
 	}
@@ -102,7 +102,7 @@ func (t *QueryTask) executeQueryStream(ctx context.Context, workload shardclient
 
 // The final SDK result is unary. Append selected rows immediately so consumed
 // source Chunks are not kept alive by the final merge.
-func consumeQueryResultStream(ctx context.Context, stream queryutil.ReduceStream, limit int64) (_ *internalpb.RetrieveResults, err error) {
+func consumeQueryResultStream(ctx context.Context, stream queryutil.ReduceStream, req *internalpb.RetrieveRequest) (_ *internalpb.RetrieveResults, err error) {
 	defer func() {
 		if closeErr := stream.Close(); closeErr != nil {
 			if err == nil {
@@ -114,7 +114,11 @@ func consumeQueryResultStream(ctx context.Context, stream queryutil.ReduceStream
 	}()
 	var result *internalpb.RetrieveResults
 	var units int64
-	for limit <= 0 || units < limit {
+	limit := req.GetLimit()
+	// ORDER BY keys need not follow PK order. A later candidate can still
+	// reveal a cross-vchannel duplicate after the client window is full.
+	drain := len(req.GetOrderByFields()) != 0 && len(req.GetGroupByFieldIds()) == 0
+	for drain || limit <= 0 || units < limit {
 		chunk, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
 			break
@@ -122,8 +126,20 @@ func consumeQueryResultStream(ctx context.Context, stream queryutil.ReduceStream
 		if err != nil {
 			return nil, err
 		}
-		rows := typeutil.GetSizeOfIDs(chunk.GetIds())
+		if limit > 0 && units >= limit {
+			continue
+		}
+		rows := queryutil.GetRowCount(chunk)
 		if result == nil {
+			if drain && limit > 0 && int64(rows) > limit {
+				window, err := queryutil.NewSliceOperator(limit, 0).Run(ctx, nil, chunk)
+				if err != nil {
+					return nil, err
+				}
+				trimmed := window[0].(*internalpb.RetrieveResults)
+				chunk.Ids, chunk.FieldsData = trimmed.Ids, trimmed.FieldsData
+				rows = int(limit)
+			}
 			result = chunk
 			if !chunk.GetElementLevel() {
 				units += int64(rows)
@@ -132,6 +148,17 @@ func consumeQueryResultStream(ctx context.Context, stream queryutil.ReduceStream
 					units += int64(len(indices.GetIndices()))
 				}
 			}
+			continue
+		}
+		if len(req.GetGroupByFieldIds()) != 0 {
+			// Aggregate columns are positional and need not have distinct field IDs.
+			// The grouped reducer already bounds its output to the internal window.
+			for i := range chunk.FieldsData {
+				if err := typeutil.MergeFieldData(result.FieldsData[i:i+1], chunk.FieldsData[i:i+1]); err != nil {
+					return nil, err
+				}
+			}
+			units += int64(rows)
 			continue
 		}
 		fields := typeutil.NewFieldDataIdxComputer(chunk.GetFieldsData())

@@ -18,6 +18,7 @@ package dql
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"sync"
 	"testing"
@@ -36,10 +37,12 @@ import (
 	"github.com/milvus-io/milvus/internal/proxy/metacache"
 	"github.com/milvus-io/milvus/internal/proxy/shardclient"
 	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/internal/util/queryutil"
 	"github.com/milvus-io/milvus/internal/util/reduce"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/planpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
@@ -2111,4 +2114,47 @@ func TestQueryTask_CanSkipAllocTimestamp(t *testing.T) {
 		skip = qt2.CanSkipAllocTimestamp()
 		assert.True(t, skip)
 	})
+}
+
+type orderByTestStream struct {
+	queryutil.ReduceStream
+	first           *internalpb.RetrieveResults
+	end             error
+	drained, closed bool
+}
+
+func (s *orderByTestStream) Recv() (*internalpb.RetrieveResults, error) {
+	if s.first != nil {
+		first := s.first
+		s.first = nil
+		return first, nil
+	}
+	s.drained = true
+	return nil, s.end
+}
+
+func (s *orderByTestStream) Close() error { s.closed = true; return nil }
+
+func TestConsumeOrderByStreamPastWindow(t *testing.T) {
+	req := &internalpb.RetrieveRequest{Limit: 1, OrderByFields: []*planpb.OrderByField{{FieldId: 100}}}
+	for _, end := range []error{io.EOF, merr.ErrDataIntegrity} {
+		s := &orderByTestStream{end: end, first: &internalpb.RetrieveResults{
+			AllRetrieveCount: 3,
+			Ids:              &schemapb.IDs{IdField: &schemapb.IDs_IntId{IntId: &schemapb.LongArray{Data: []int64{8, 2}}}},
+			FieldsData: []*schemapb.FieldData{{Type: schemapb.DataType_Int64, FieldId: 100, Field: &schemapb.FieldData_Scalars{
+				Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: []int64{10, 15}}}},
+			}}},
+		}}
+		result, err := consumeQueryResultStream(t.Context(), s, req)
+		require.True(t, s.drained)
+		require.True(t, s.closed)
+		if end != io.EOF {
+			require.ErrorIs(t, err, end)
+			require.Nil(t, result)
+		} else {
+			require.NoError(t, err)
+			require.Equal(t, []int64{8}, result.GetIds().GetIntId().GetData())
+			require.EqualValues(t, 3, result.GetAllRetrieveCount())
+		}
+	}
 }
