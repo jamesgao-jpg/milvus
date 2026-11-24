@@ -65,7 +65,7 @@ func (t *SearchTask) executeSearchStream(ctx context.Context, workload shardclie
 		return err
 	}
 
-	if t.GetIsAdvanced() || t.GetGroupByFieldId() > 0 || len(t.GetGroupByFieldIds()) > 0 {
+	if t.GetIsAdvanced() {
 		results, err := searchreducestream.DrainSearchStreams(ctx, streams)
 		if err != nil {
 			return err
@@ -92,7 +92,7 @@ func (t *SearchTask) executeSearchStream(ctx context.Context, workload shardclie
 			result.ResultData = searchreducestream.AppendSearchData(result.GetResultData(), chunk.GetResultData())
 		}
 		counts := result.GetResultData().GetTopks()
-		if len(counts) > 0 && counts[len(counts)-1] >= t.GetTopk() {
+		if len(counts) > 0 && counts[len(counts)-1] >= reducer.HitLimit() {
 			break
 		}
 	}
@@ -107,8 +107,8 @@ func (t *SearchTask) executeSearchStream(ctx context.Context, workload shardclie
 		return closeErr
 	}
 	if t.resultBuf != nil {
-		// The ordinary pipeline receives one already-merged result. Its
-		// single-result fast path still restores score signs and fills fields.
+		// The pipeline receives the bounded candidates in merge order. For
+		// grouped Search it applies the group offset, output order and aggregation.
 		t.resultBuf.Insert(result)
 	}
 	return nil

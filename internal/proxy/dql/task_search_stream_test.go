@@ -71,11 +71,12 @@ func (s *testLeaderSearchStream) Recv() (*internalpb.SearchResults, error) {
 }
 
 func TestSearchTaskReduceStreamBatchParity(t *testing.T) {
-	t.Run("without offset", func(t *testing.T) { testSearchTaskReduceStreamBatchParity(t, 0) })
-	t.Run("with offset", func(t *testing.T) { testSearchTaskReduceStreamBatchParity(t, 1) })
+	t.Run("without offset", func(t *testing.T) { testSearchTaskReduceStreamBatchParity(t, 0, false) })
+	t.Run("with offset", func(t *testing.T) { testSearchTaskReduceStreamBatchParity(t, 1, false) })
+	t.Run("grouped with offset", func(t *testing.T) { testSearchTaskReduceStreamBatchParity(t, 1, true) })
 }
 
-func testSearchTaskReduceStreamBatchParity(t *testing.T, offset int64) {
+func testSearchTaskReduceStreamBatchParity(t *testing.T, offset int64, grouped bool) {
 	paramtable.Init()
 	cfg := &paramtable.Get().ProxyCfg
 	paramtable.Get().Save(cfg.EnableReduceStream.Key, "true")
@@ -103,10 +104,25 @@ func testSearchTaskReduceStreamBatchParity(t *testing.T, offset int64) {
 	}
 	batch[0].ResultData.Topks = []int64{2, 2}
 	batch[1].ResultData.Topks = []int64{2, 1}
+	info := &planpb.QueryInfo{}
+	if grouped {
+		req.GroupByFieldId, req.GroupSize = 101, 2
+		info.GroupByFieldId, info.GroupSize = req.GroupByFieldId, req.GroupSize
+		// The first vector has three distinct groups, the second reuses NULL.
+		// Both vchannels contribute to the same group across Chunk boundaries.
+		for i, values := range [][]any{{int64(7), nil, nil, int64(8)}, {int64(7), int64(8), nil}} {
+			b, err := typeutil.NewFieldDataBuilder(schemapb.DataType_Int64, false, len(values))
+			require.NoError(t, err)
+			for _, v := range values {
+				b.Add(v)
+			}
+			batch[i].ResultData.GroupByFieldValue = b.Build()
+		}
+	}
 	for i, result := range batch {
 		result.ChannelsMvcc = map[string]uint64{[]string{"a", "b"}[i]: uint64(i + 1)}
 	}
-	batchResult, err := reduceResults(ctx, batch, 2, 2, offset, "L2", schemapb.DataType_Int64, &planpb.QueryInfo{}, false, false, 0, nil, false)
+	batchResult, err := reduceResults(ctx, batch, 2, 2, offset, "L2", schemapb.DataType_Int64, info, false, false, 0, nil, false)
 	require.NoError(t, err)
 
 	a, b := mocks.NewMockQueryNodeClient(t), mocks.NewMockQueryNodeClient(t)
@@ -142,7 +158,10 @@ func testSearchTaskReduceStreamBatchParity(t *testing.T, offset int64) {
 	require.NoError(t, err)
 	require.Len(t, chunks, 1, "ordinary post-processing sees one already-merged result")
 	require.Equal(t, map[string]uint64{"a": 1, "b": 2}, chunks[0].GetChannelsMvcc())
-	streamResult, err := reduceResults(ctx, chunks, 2, 2, offset, "L2", schemapb.DataType_Int64, &planpb.QueryInfo{}, false, false, 0, nil, false)
+	if grouped {
+		require.Equal(t, []int64{3, 3}, chunks[0].GetResultData().GetTopks(), "keep the offset group but discard the third group")
+	}
+	streamResult, err := reduceResults(ctx, chunks, 2, 2, offset, "L2", schemapb.DataType_Int64, info, false, false, 0, nil, false)
 	require.NoError(t, err)
 	require.True(t, proto.Equal(batchResult, streamResult), "batch: %v; stream: %v", batchResult, streamResult)
 	for _, stream := range opened {

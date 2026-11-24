@@ -219,6 +219,8 @@ func (s *reduceStreamSuite) TestQueryAndSearch() {
 		agg    *commonpb.SearchAggregationSpec
 	}{
 		{name: "group_by", params: searchGroup},
+		{name: "group_offset", params: []*commonpb.KeyValuePair{kv("group_by_field", groupField), kv("group_size", "3"), kv("topk", "2"), kv("offset", "1")}},
+		{name: "composite_groups", params: []*commonpb.KeyValuePair{kv("group_by_fields", groupField+","+integration.Int64Field), kv("group_size", "2")}},
 		{name: "aggregation", agg: &commonpb.SearchAggregationSpec{Fields: []string{groupField}, Size: 3, TopHits: &commonpb.TopHitsSpec{Size: 2}}},
 		{name: "range_filter", params: []*commonpb.KeyValuePair{kv("params", `{"ef":64,"radius":0.7,"range_filter":0.1}`)}},
 		{name: "iterative_filter", params: []*commonpb.KeyValuePair{kv("hints", "iterative_filter")}},

@@ -1041,7 +1041,7 @@ func (node *QueryNode) searchStream(stream querypb.QueryNode_SearchStreamServer,
 			return status.Error(codes.Unimplemented, "partial-result Search requires Batch")
 		}
 		req.StreamChunkBytes = request.GetChunkBytes()
-		if !req.GetReq().GetIsAdvanced() && req.GetReq().GetGroupByFieldId() <= 0 && len(req.GetReq().GetGroupByFieldIds()) == 0 {
+		if !req.GetReq().GetIsAdvanced() {
 			result, err = node.searchRequest(stream.Context(), req, stream.Send)
 			if err == nil && result == nil {
 				return nil

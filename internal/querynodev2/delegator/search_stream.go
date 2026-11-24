@@ -90,8 +90,8 @@ func (sd *shardDelegator) reduceSearchStreams(ctx context.Context, req *querypb.
 		return nil, context.Cause(ctx)
 	}
 
-	if req.GetReq().GetGroupByFieldId() > 0 || len(req.GetReq().GetGroupByFieldIds()) > 0 {
-		// The existing group reducer owns per-group admission and limits.
+	if send == nil && (req.GetReq().GetGroupByFieldId() > 0 || len(req.GetReq().GetGroupByFieldIds()) > 0) {
+		// Hybrid still needs the buffered sub-search result for fusion.
 		return searchreducestream.DrainSearchStreams(ctx, streams)
 	}
 	// Buffered callers (including Hybrid sub-searches) still consume a single result.

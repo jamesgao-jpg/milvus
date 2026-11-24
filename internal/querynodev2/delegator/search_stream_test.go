@@ -43,6 +43,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/commonpbutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 type testSearchChunks struct {
@@ -69,6 +70,11 @@ func (s *testSearchChunks) Interrupt() (*internalpb.SearchResults, error) {
 }
 
 func TestDelegatorSearchReduceStreamBatchParity(t *testing.T) {
+	t.Run("plain", func(t *testing.T) { testDelegatorSearchReduceStreamBatchParity(t, false) })
+	t.Run("grouped", func(t *testing.T) { testDelegatorSearchReduceStreamBatchParity(t, true) })
+}
+
+func testDelegatorSearchReduceStreamBatchParity(t *testing.T, grouped bool) {
 	paramtable.Init()
 	schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{{
 		FieldID: 100, DataType: schemapb.DataType_Int64, IsPrimaryKey: true,
@@ -96,6 +102,21 @@ func TestDelegatorSearchReduceStreamBatchParity(t *testing.T) {
 		makeResult([]int64{1, 2, 4}, []float32{0.99, 0.8, 0.7}, 20),
 		{Status: merr.Success(), CostAggregation: &internalpb.CostAggregation{ResponseTime: 30, TotalRelatedDataSize: 90}},
 	}
+	info := reduce.NewReduceSearchResultInfo(1, 3).WithMetricType("IP")
+	if grouped {
+		req.Req.GroupByFieldId, req.Req.GroupSize = 101, 2
+		info.WithGroupByFieldIds([]int64{101}).WithGroupSize(2)
+		// Two workers repeat PK 1. Group 7 fills before PKs 3 and 4,
+		// but the lower-scoring NULL group must still reach Proxy.
+		for i, values := range [][]any{{int64(7), int64(7), nil}, {int64(8), int64(7), int64(7)}} {
+			b, err := typeutil.NewFieldDataBuilder(schemapb.DataType_Int64, false, len(values))
+			require.NoError(t, err)
+			for _, v := range values {
+				b.Add(v)
+			}
+			batch[i].ResultData.GroupByFieldValue = b.Build()
+		}
+	}
 	tasks := make([]subTask[*querypb.SearchRequest], len(batch))
 	open := make([]*testSearchChunks, len(batch))
 	for i, r := range batch {
@@ -108,17 +129,29 @@ func TestDelegatorSearchReduceStreamBatchParity(t *testing.T) {
 		worker.EXPECT().SearchSegmentsStream(mock.Anything, req, int32(1)).Return(open[i], nil).Once()
 		tasks[i] = subTask[*querypb.SearchRequest]{worker: worker, targetID: int64(i), req: req}
 	}
-	result, err := (&shardDelegator{collection: &segments.Collection{}}).reduceSearchStreams(ctx, req, tasks, nil)
+	var merged *internalpb.SearchResults
+	_, err := (&shardDelegator{collection: &segments.Collection{}}).reduceSearchStreams(ctx, req, tasks, func(chunk *internalpb.SearchResults) error {
+		require.Len(t, chunk.GetResultData().GetScores(), 1)
+		if merged == nil {
+			merged = chunk
+		} else {
+			merged.ResultData = searchreducestream.AppendSearchData(merged.ResultData, chunk.ResultData)
+		}
+		return nil
+	})
 	require.NoError(t, err)
-	require.Len(t, result, 1)
-	want, err := segments.ReduceSearchResults(ctx, batch, reduce.NewReduceSearchResultInfo(1, 3).WithMetricType("IP"))
+	want, err := segments.ReduceSearchResults(ctx, batch, info)
 	require.NoError(t, err)
 	wantData, err := segments.DecodeSearchResults(ctx, []*internalpb.SearchResults{want})
 	require.NoError(t, err)
 	require.Len(t, wantData, 1)
-	require.True(t, proto.Equal(wantData[0], result[0].GetResultData()))
-	require.True(t, proto.Equal(want.GetCostAggregation(), result[0].GetCostAggregation()))
-	require.Equal(t, []int64{1, 2, 3}, result[0].GetResultData().GetIds().GetIntId().GetData())
+	require.True(t, proto.Equal(wantData[0], merged.GetResultData()), "Batch %v; stream %v", wantData[0], merged.GetResultData())
+	require.True(t, proto.Equal(want.GetCostAggregation(), merged.GetCostAggregation()))
+	if grouped {
+		require.Equal(t, []int64{1, 2, 5}, merged.GetResultData().GetIds().GetIntId().GetData())
+	} else {
+		require.Equal(t, []int64{1, 2, 3}, merged.GetResultData().GetIds().GetIntId().GetData())
+	}
 	for _, stream := range open {
 		require.True(t, stream.closed)
 	}
@@ -213,7 +246,7 @@ func (s *DelegatorSuite) TestOrderedReduceStreamFirstChunk() {
 	paramtable.SetNodeID(1)
 	s.initSegments()
 	sd := s.delegator.(*shardDelegator)
-	for _, op := range []string{"query", "search"} {
+	for _, op := range []string{"query", "search", "grouped_search"} {
 		s.Run(op, func() {
 			t := s.T()
 			s.workerManager.ExpectedCalls = nil
@@ -227,9 +260,15 @@ func (s *DelegatorSuite) TestOrderedReduceStreamFirstChunk() {
 				first := int64(opened.Add(1)) * 10
 				return &schemapb.IDs{IdField: &schemapb.IDs_IntId{IntId: &schemapb.LongArray{Data: []int64{first, first + 1}}}}
 			}
-			if op == "search" {
+			if op != "query" {
 				w.EXPECT().SearchSegmentsStream(mock.Anything, mock.Anything, int32(1)).RunAndReturn(func(ctx context.Context, _ *querypb.SearchRequest, _ int32) (searchreducestream.ReduceStream, error) {
-					return &firstChunkWorker[*internalpb.SearchResults]{ctx: ctx, blocked: blocked, closed: &closed, first: &internalpb.SearchResults{Status: merr.Success(), MetricType: "IP", ResultData: &schemapb.SearchResultData{NumQueries: 1, TopK: 10, Topks: []int64{2}, Scores: []float32{1, 0}, Ids: newIDs()}}}, nil
+					data := &schemapb.SearchResultData{NumQueries: 1, TopK: 10, Topks: []int64{2}, Scores: []float32{1, 0}, Ids: newIDs()}
+					if op == "grouped_search" {
+						data.GroupByFieldValue = &schemapb.FieldData{Type: schemapb.DataType_Int64, Field: &schemapb.FieldData_Scalars{
+							Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{LongData: data.Ids.GetIntId()}},
+						}}
+					}
+					return &firstChunkWorker[*internalpb.SearchResults]{ctx: ctx, blocked: blocked, closed: &closed, first: &internalpb.SearchResults{Status: merr.Success(), MetricType: "IP", ResultData: data}}, nil
 				})
 			} else {
 				w.EXPECT().QuerySegmentsReduceStream(mock.Anything, mock.Anything, int32(1)).RunAndReturn(func(ctx context.Context, _ *querypb.QueryRequest, _ int32) (queryutil.ReduceStream, error) {
@@ -250,14 +289,22 @@ func (s *DelegatorSuite) TestOrderedReduceStreamFirstChunk() {
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
 			channels := []string{s.vchannelName}
-			if op == "search" {
+			if op != "query" {
 				rpc, err := client.SearchStream(ctx)
 				require.NoError(t, err)
-				require.NoError(t, rpc.Send(&querypb.SearchStreamRequest{Request: &querypb.SearchRequest{Req: &internalpb.SearchRequest{Base: commonpbutil.NewMsgBase(), FieldId: 101, Nq: 1, Topk: 10}, DmlChannels: channels}, ChunkBytes: 1}))
+				req := &internalpb.SearchRequest{Base: commonpbutil.NewMsgBase(), FieldId: 101, Nq: 1, Topk: 10}
+				if op == "grouped_search" {
+					req.GroupByFieldId, req.GroupSize = 100, 2
+				}
+				require.NoError(t, rpc.Send(&querypb.SearchStreamRequest{Request: &querypb.SearchRequest{Req: req, DmlChannels: channels}, ChunkBytes: 1}))
 				require.NoError(t, rpc.CloseSend())
 				first, err := rpc.Recv()
 				require.NoError(t, err)
 				require.Len(t, first.GetResultData().GetScores(), 1)
+				if op == "grouped_search" {
+					require.Len(t, first.GetResultData().GetGroupByFieldValues(), 1)
+					require.Equal(t, first.GetResultData().GetIds().GetIntId().GetData(), first.GetResultData().GroupByFieldValues[0].GetScalars().GetLongData().GetData())
+				}
 			} else {
 				first, stream, err := queryutil.OpenQueryReduceStream(ctx, client, &querypb.QueryRequest{Req: &internalpb.RetrieveRequest{Base: commonpbutil.NewMsgBase(), Limit: -1}, DmlChannels: channels}, 1, false)
 				require.NoError(t, err)
