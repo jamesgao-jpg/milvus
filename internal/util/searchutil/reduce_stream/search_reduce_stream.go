@@ -275,7 +275,7 @@ type OrderedReduceStream struct {
 	groupCount            int64                                           // Number of distinct groups accepted for this vector.
 	offset                int64                                           // Proxy pagination; leading hits do not count against the response quota.
 	pkType                schemapb.DataType                               // Preserves typed IDs for empty Batch results.
-	maxOutputBytes        int64                                           // Batch quota for a multi-leader merge.
+	maxOutputBytes        int64                                           // Limit on cumulative output field bytes, independent of Chunk size.
 	dedupByPK             bool                                            // Vchannel merge only: deduplicate PKs or (PK, element index).
 	chunkBytes            int                                             // Output Chunk payload threshold.
 	query                 int                                             // Vector currently being merged.
@@ -506,8 +506,10 @@ merge:
 			}
 			b.row++
 			b.advanceQuery()
-			// For grouped Search the final Proxy pipeline charges only the groups after OFFSET.
-			if (s.groups == nil || s.dedupByPK) && (s.numResults > 1 || s.offset > 0) && s.outputBytes > s.maxOutputBytes {
+			// Proxy checks ungrouped output even for one vchannel. Grouped output is charged
+			// after group OFFSET in the pipeline. Shards keep Batch's multi-worker check.
+			if s.outputBytes > s.maxOutputBytes && ((!s.dedupByPK && len(s.groupByFieldIDs) == 0) ||
+				(s.dedupByPK && s.numResults > 1)) {
 				return nil, merr.WrapErrParameterInvalidMsg("search results exceed the maxOutputSize Limit %d", s.maxOutputBytes)
 			}
 			if chunkSize >= s.chunkBytes || (finalVector && s.emitted == s.HitLimit()) {

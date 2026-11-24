@@ -2,6 +2,7 @@ package dql
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"testing"
 
@@ -74,6 +75,37 @@ func TestSearchTaskReduceStreamBatchParity(t *testing.T) {
 	t.Run("without offset", func(t *testing.T) { testSearchTaskReduceStreamBatchParity(t, 0, false) })
 	t.Run("with offset", func(t *testing.T) { testSearchTaskReduceStreamBatchParity(t, 1, false) })
 	t.Run("grouped with offset", func(t *testing.T) { testSearchTaskReduceStreamBatchParity(t, 1, true) })
+}
+
+func TestConsumeSearchStreamSingleVChannelQuota(t *testing.T) {
+	quota := &paramtable.Get().QuotaConfig.MaxOutputSize
+	for _, limit := range []int64{16, 15} {
+		t.Run(fmt.Sprintf("quota%d", limit), func(t *testing.T) {
+			defer quota.SwapTempValue(quota.SwapTempValue(fmt.Sprint(limit)))
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			leader := &testLeaderSearchStream{ctx: ctx}
+			for _, id := range []int64{1, 2} {
+				data := genSearchResultData(1, 2, []int64{id}, []float32{-float32(id)})
+				data.Topks[0] = 1
+				data.FieldsData = []*schemapb.FieldData{getFieldData("value", 100, schemapb.DataType_Int64, []int64{id}, 1)}
+				leader.chunks = append(leader.chunks, &internalpb.SearchResults{Status: merr.Success(), MetricType: "L2", ResultData: data})
+			}
+			inputs := []searchreducestream.ReduceStream{&grpcSearchStream{rpc: leader, cancel: cancel}}
+			stream := searchreducestream.NewReduceStream(&internalpb.SearchRequest{Nq: 1, Topk: 2}, inputs, schemapb.DataType_Int64, quota.GetAsInt64(), 1)
+			result, err := consumeSearchResultStream(ctx, stream)
+			if err == nil {
+				final, reduceErr := reduceResults(t.Context(), []*internalpb.SearchResults{result}, 1, 2, 0, "L2", schemapb.DataType_Int64, &planpb.QueryInfo{}, false, false, 0, nil, false)
+				require.NoError(t, reduceErr)
+				require.Equal(t, []int64{1, 2}, final.GetResults().GetFieldsData()[0].GetScalars().GetLongData().GetData())
+			}
+			if limit < 16 {
+				require.ErrorIs(t, err, merr.ErrParameterInvalid)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }
 
 func testSearchTaskReduceStreamBatchParity(t *testing.T, offset int64, grouped bool) {
