@@ -21,6 +21,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
@@ -35,6 +36,149 @@ type testSearchStream struct {
 	chunks []*internalpb.SearchResults
 	err    error
 	closed bool
+}
+
+type gatedHybridStream struct {
+	testSearchStream
+	release <-chan struct{}
+	last    *internalpb.SearchResults
+	ctx     context.Context
+	cancel  context.CancelFunc
+}
+
+func (s *gatedHybridStream) Recv() (*internalpb.SearchResults, error) {
+	if len(s.chunks) == 0 {
+		select {
+		case <-s.release:
+			if s.last == nil {
+				return nil, io.EOF
+			}
+			last := s.last
+			s.last = nil
+			return last, nil
+		case <-s.ctx.Done():
+			return nil, s.ctx.Err()
+		}
+	}
+	return s.testSearchStream.Recv()
+}
+
+func (s *gatedHybridStream) Close() error {
+	s.cancel()
+	return s.testSearchStream.Close()
+}
+
+func TestUngroupedHybridSearchStream(t *testing.T) {
+	req := &internalpb.SearchRequest{
+		IsAdvanced: true, Nq: 1,
+		SubReqs: []*internalpb.SubSearchRequest{{Nq: 1, Topk: 3}, {Nq: 1, Topk: 3}},
+	}
+	frame := func(index int64, end bool, ids ...int64) *internalpb.SearchResults {
+		sub := &internalpb.SubSearchResults{ReqIndex: index, MetricType: "IP", NumQueries: 1, TopK: 3, StreamEnd: proto.Bool(end)}
+		if !end {
+			data := newSearchData(1, 3)
+			data.Topks[0] = int64(len(ids))
+			for _, id := range ids {
+				typeutil.AppendPKs(data.Ids, id)
+				data.Scores = append(data.Scores, -float32(id))
+			}
+			sub.ResultData = data
+		}
+		return &internalpb.SearchResults{IsAdvanced: true, SubResults: []*internalpb.SubSearchResults{sub}}
+	}
+	consume := func(i int, inputs []ReduceStream) (*internalpb.SubSearchResults, error) {
+		r := NewReduceStream(&internalpb.SearchRequest{Nq: 1, Topk: 3}, inputs, schemapb.DataType_Int64, 1024, 12)
+		defer r.Close()
+		out := &internalpb.SubSearchResults{ReqIndex: int64(i)}
+		for {
+			c, err := r.Recv()
+			if err == io.EOF {
+				return out, nil
+			}
+			if err != nil {
+				return nil, err
+			}
+			out.ResultData = AppendSearchData(out.ResultData, c.ResultData)
+			if len(out.ResultData.GetScores()) == 3 {
+				return out, nil
+			}
+		}
+	}
+	for _, cancelRequest := range []bool{false, true} {
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		release := make(chan struct{})
+		left := &testSearchStream{chunks: []*internalpb.SearchResults{frame(0, false, 1), frame(0, false, 2), frame(0, false, 3), frame(1, false, 9), frame(1, true), frame(0, true)}}
+		rightCtx, closeRight := context.WithCancel(ctx)
+		// B is empty on the right. Its EOF must be sufficient to finish B.
+		right := &gatedHybridStream{testSearchStream: testSearchStream{chunks: []*internalpb.SearchResults{frame(1, true)}}, release: release, ctx: rightCtx, cancel: closeRight}
+		bDone := make(chan *internalpb.SubSearchResults, 1)
+		right.last = frame(0, true)
+		done := make(chan error, 1)
+		go func() {
+			_, err := ReduceHybridSearchStreams(ctx, req, []ReduceStream{left, right}, func(i int, streams []ReduceStream) (*internalpb.SubSearchResults, error) {
+				out, err := consume(i, streams)
+				if i == 1 && err == nil {
+					bDone <- out
+				}
+				return out, err
+			})
+			done <- err
+		}()
+		select {
+		case b := <-bDone:
+			require.Equal(t, []int64{9}, b.ResultData.Ids.GetIntId().Data)
+		case err := <-done:
+			t.Fatalf("request ended before B: %v", err)
+		case <-ctx.Done():
+			t.Fatal("B waited for A")
+		}
+		select {
+		case <-done:
+			t.Fatal("fusion could start before A finished")
+		default:
+		}
+		if cancelRequest {
+			cancel()
+			require.ErrorIs(t, <-done, context.Canceled)
+		} else {
+			close(release)
+			require.NoError(t, <-done)
+		}
+		require.True(t, left.closed && right.closed)
+	}
+	t.Run("old leader unary blob and old streaming frame", func(t *testing.T) {
+		a, b := frame(0, false, 7), frame(1, false, 9)
+		a.SubResults[0].StreamEnd, b.SubResults[0].StreamEnd = nil, nil
+		var err error
+		b.SubResults[0].SlicedBlob, err = proto.Marshal(b.SubResults[0].ResultData)
+		require.NoError(t, err)
+		b.SubResults[0].ResultData = nil
+		a.SubResults = append(a.SubResults, b.SubResults...)
+		a.ScannedTotalBytes = 5
+		out, err := ReduceHybridSearchStreams(t.Context(), req, []ReduceStream{&testSearchStream{chunks: []*internalpb.SearchResults{a}}}, consume)
+		require.NoError(t, err)
+		require.Equal(t, []int64{7}, out.SubResults[0].ResultData.Ids.GetIntId().Data)
+		require.Equal(t, []int64{9}, out.SubResults[1].ResultData.Ids.GetIntId().Data)
+		require.EqualValues(t, 5, out.ScannedTotalBytes)
+	})
+	for _, tc := range []struct {
+		name   string
+		frames []*internalpb.SearchResults
+		want   string
+	}{
+		{"out of range", []*internalpb.SearchResults{frame(2, true)}, "invalid Hybrid Search ReqIndex"},
+		{"duplicate end", []*internalpb.SearchResults{frame(1, true), frame(1, true)}, "after ReqIndex"},
+		{"missing end", []*internalpb.SearchResults{frame(1, true)}, "missing Hybrid Search end"},
+		{"too many hits", []*internalpb.SearchResults{frame(0, false, 1, 2), frame(0, false, 3, 4)}, "exceeds topK"},
+		{"trailing error", []*internalpb.SearchResults{frame(0, true), frame(1, true), {Status: merr.Status(merr.ErrCollectionNotLoaded)}}, "not loaded"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := ReduceHybridSearchStreams(t.Context(), req, []ReduceStream{&testSearchStream{chunks: tc.frames}}, consume)
+			require.Nil(t, out)
+			require.ErrorContains(t, err, tc.want)
+		})
+	}
 }
 
 func (s *testSearchStream) Recv() (*internalpb.SearchResults, error) {

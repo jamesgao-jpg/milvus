@@ -184,6 +184,9 @@ message SubSearchResults {
   int64 req_index = 7;
   // pre-decoded SearchResultData, avoids re-marshal/unmarshal between delegator and proxy
   schema.SearchResultData result_data = 8;
+  // Hybrid SearchStream only: false for a candidate Chunk, true for EOF of
+  // this req_index on this vchannel. Older peers omit it and use RPC EOF.
+  optional bool stream_end = 9;
 }
 
 message SearchResults {

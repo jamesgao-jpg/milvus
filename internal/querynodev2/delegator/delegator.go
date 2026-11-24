@@ -664,6 +664,17 @@ func (sd *shardDelegator) searchWithSnapshot(ctx context.Context, req *querypb.S
 			defer cancel(nil)
 		}
 		futures := make([]*conc.Future[*internalpb.SearchResults], len(req.GetReq().GetSubReqs()))
+		// All sub-searches use this pin. Serialize only the shared gRPC Send,
+		// never worker Recv: a blocked A must not delay a ready B's EOF.
+		var sendMu sync.Mutex
+		sendHybrid := func(chunk *internalpb.SearchResults) error {
+			sendMu.Lock()
+			defer sendMu.Unlock()
+			if err := context.Cause(ctx); err != nil {
+				return err
+			}
+			return send(chunk)
+		}
 		for index, subReq := range req.GetReq().GetSubReqs() {
 			newRequest := &internalpb.SearchRequest{
 				Base:                    req.GetReq().GetBase(),
@@ -717,6 +728,9 @@ func (sd *shardDelegator) searchWithSnapshot(ctx context.Context, req *querypb.S
 					searchReq.GetReq().MvccTimestamp = tSafe
 				}
 				searchReq.Req.CollectionTtlTimestamps = req.GetReq().GetCollectionTtlTimestamps()
+				if send != nil {
+					return sd.streamHybridSubSearch(ctx, index, searchReq, sealed, growing, sealedRowCount, sendHybrid)
+				}
 				results, err := sd.search(ctx, searchReq, sealed, growing, sealedRowCount, nil)
 				if err != nil {
 					return nil, err
@@ -731,7 +745,12 @@ func (sd *shardDelegator) searchWithSnapshot(ctx context.Context, req *querypb.S
 			futures[index] = future
 		}
 
-		err = conc.AwaitAll(futures...)
+		if cancel != nil {
+			// Wait for canceled workers too, before the deferred Unpin.
+			err = conc.BlockOnAll(futures...)
+		} else {
+			err = conc.AwaitAll(futures...)
+		}
 		if err != nil {
 			if cancel != nil {
 				return nil, context.Cause(ctx)
@@ -747,6 +766,17 @@ func (sd *shardDelegator) searchWithSnapshot(ctx context.Context, req *querypb.S
 				return nil, merr.Error(result.GetStatus())
 			}
 			results[i] = result
+		}
+		if send != nil {
+			// Only metadata remains here. Send it once after every sub-search
+			// finishes; waiting for it before the first Chunk would couple A to B.
+			summary, err := segments.ReduceAdvancedSearchResults(ctx, results)
+			if err != nil {
+				return nil, err
+			}
+			summary.SubResults = nil
+			summary.Status = merr.Success()
+			return nil, send(summary)
 		}
 		return results, nil
 	}

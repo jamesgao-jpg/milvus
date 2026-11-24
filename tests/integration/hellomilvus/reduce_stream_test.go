@@ -261,7 +261,7 @@ func (s *reduceStreamSuite) TestQueryAndSearch() {
 	}
 	// Grouped Hybrid preserves the vchannel arrival order before fusion.
 	// Weighted fusion scores the candidates independently of that order.
-	for _, variant := range []string{"rrf", "group_by_weighted", "group_by_weighted_l0_l1_l2"} {
+	for _, variant := range []string{"rrf", "weighted_offset", "weighted_empty", "group_by_weighted", "group_by_weighted_l0_l1_l2"} {
 		s.Run("hybrid_"+variant, func() {
 			compare(false, func(ctx context.Context) proto.Message {
 				first, second := proto.CloneOf(baseSearch), proto.CloneOf(baseSearch)
@@ -270,7 +270,7 @@ func (s *reduceStreamSuite) TestQueryAndSearch() {
 					CollectionName: name, Requests: []*milvuspb.SearchRequest{first, second},
 					OutputFields: []string{groupField}, RankParams: []*commonpb.KeyValuePair{window},
 				}
-				if variant != "rrf" {
+				if strings.HasPrefix(variant, "group_by") {
 					req.RankParams = append(req.RankParams, searchGroup...)
 				}
 				switch variant {
@@ -285,8 +285,26 @@ func (s *reduceStreamSuite) TestQueryAndSearch() {
 						"strategy": stringParam("weighted"), "weights": {Value: weights},
 					}}}, fuse.Ops...)
 					req.FunctionChains = []*schemapb.FunctionChain{fuse}
-				case "group_by_weighted":
+				case "weighted_offset", "weighted_empty", "group_by_weighted":
 					req.RankParams = append(req.RankParams, kv("strategy", "weighted"), kv("params", `{"weights":[0.7,0.3]}`))
+					if variant == "weighted_empty" {
+						second.Dsl = groupField + " < 0"
+					}
+					if variant == "weighted_offset" {
+						req.RankParams = append(req.RankParams, kv("offset", "1"))
+						for _, p := range second.SearchParams {
+							if p.Key == "topk" {
+								p.Value = "3"
+							}
+						}
+						two := proto.CloneOf(placeholder)
+						two.Placeholders[0].Values = append(two.Placeholders[0].Values, two.Placeholders[0].Values[0])
+						input, err := proto.Marshal(two)
+						s.Require().NoError(err)
+						for _, sub := range req.Requests {
+							sub.Nq, sub.SearchInput = 2, &milvuspb.SearchRequest_PlaceholderGroup{PlaceholderGroup: input}
+						}
+					}
 				default:
 					req.RankParams = append(req.RankParams, kv("strategy", "rrf"), kv("params", `{"k":60}`))
 				}

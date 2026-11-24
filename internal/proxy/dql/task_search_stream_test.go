@@ -169,6 +169,29 @@ func testSearchTaskReduceStreamBatchParity(t *testing.T, offset int64, grouped b
 	}
 }
 
+func TestHybridSearchStreamReportsCostFromLeaderSummary(t *testing.T) {
+	qn := mocks.NewMockQueryNodeClient(t)
+	lb := shardclient.NewMockLBPolicy(t)
+	req := &internalpb.SearchRequest{Base: &commonpb.MsgBase{}, IsAdvanced: true, SubReqs: []*internalpb.SubSearchRequest{{Nq: 1, Topk: 2}}}
+	task := &SearchTask{SearchRequest: req, lb: lb, queryChannelsNode: typeutil.NewConcurrentMap[string, int64]()}
+	cost := &internalpb.CostAggregation{TotalRelatedDataSize: 37}
+	qn.EXPECT().SearchStream(mock.Anything).RunAndReturn(func(ctx context.Context, _ ...grpc.CallOption) (querypb.QueryNode_SearchStreamClient, error) {
+		return &testLeaderSearchStream{ctx: ctx, chunks: []*internalpb.SearchResults{
+			{IsAdvanced: true, SubResults: []*internalpb.SubSearchResults{{StreamEnd: proto.Bool(true)}}}, {IsAdvanced: true, CostAggregation: cost},
+		}, send: func(open *querypb.SearchStreamRequest) {
+			require.Equal(t, open.ChunkBytes, open.Request.StreamChunkBytes)
+		}}, nil
+	}).Once()
+	lb.EXPECT().UpdateCostMetrics(int64(1), cost).Once()
+	stream, err := task.openSearchStream(t.Context(), qn, 1, "a", 1)
+	require.NoError(t, err)
+	defer stream.Close()
+	for range 2 {
+		_, err = stream.Recv()
+		require.NoError(t, err)
+	}
+}
+
 func TestSearchStreamFirstStatusIsAvailableForLeaderRetry(t *testing.T) {
 	qn := mocks.NewMockQueryNodeClient(t)
 	mgr := shardclient.NewMockShardClientManager(t)

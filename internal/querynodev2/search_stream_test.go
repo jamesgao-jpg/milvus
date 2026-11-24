@@ -44,6 +44,12 @@ func TestReduceStreamRPC(t *testing.T) {
 	patch := mockey.Mock((*QueryNode).searchRequest).To(func(_ *QueryNode, _ context.Context, req *querypb.SearchRequest, send func(*internalpb.SearchResults) error) (*internalpb.SearchResults, error) {
 		assert.Equal(t, []string{"a"}, req.GetDmlChannels())
 		assert.EqualValues(t, 1, req.GetTotalChannelNum())
+		if req.GetReq().GetIsAdvanced() {
+			// This request came from an older Proxy. It cannot interpret an
+			// indexed EOF or a metadata-only trailer.
+			assert.Nil(t, send)
+			return &internalpb.SearchResults{IsAdvanced: true, ScannedTotalBytes: 7, SubResults: []*internalpb.SubSearchResults{{NumQueries: 1, TopK: 2}}}, nil
+		}
 		if req.GetReq().GetCollectionID() == 42 {
 			return &internalpb.SearchResults{Status: merr.Status(merr.WrapErrCollectionNotLoaded(42))}, nil
 		}
@@ -101,6 +107,20 @@ func TestReduceStreamRPC(t *testing.T) {
 		}
 	}
 	_, err = stream.Recv()
+	require.ErrorIs(t, err, io.EOF)
+
+	legacy, err := client.SearchStream(ctx)
+	require.NoError(t, err)
+	require.NoError(t, legacy.Send(&querypb.SearchStreamRequest{ChunkBytes: 1, Request: &querypb.SearchRequest{
+		DmlChannels: []string{"a"}, TotalChannelNum: 1, Req: &internalpb.SearchRequest{IsAdvanced: true, SubReqs: []*internalpb.SubSearchRequest{{Nq: 1, Topk: 2}}},
+	}}))
+	require.NoError(t, legacy.CloseSend())
+	first, err := legacy.Recv()
+	require.NoError(t, err)
+	require.Len(t, first.GetSubResults(), 1)
+	require.Nil(t, first.SubResults[0].StreamEnd)
+	require.EqualValues(t, 7, first.GetScannedTotalBytes())
+	_, err = legacy.Recv()
 	require.ErrorIs(t, err, io.EOF)
 
 	failed := open(42)

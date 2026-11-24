@@ -65,6 +65,27 @@ func (t *SearchTask) executeSearchStream(ctx context.Context, workload shardclie
 		return err
 	}
 
+	maxOutput := paramtable.Get().QuotaConfig.MaxOutputSize.GetAsInt64()
+	if searchreducestream.IsUngroupedHybrid(t.SearchRequest) {
+		result, err := searchreducestream.ReduceHybridSearchStreams(ctx, t.SearchRequest, streams, func(index int, inputs []searchreducestream.ReduceStream) (*internalpb.SubSearchResults, error) {
+			sub := t.GetSubReqs()[index]
+			req := &internalpb.SearchRequest{Nq: sub.GetNq(), Topk: sub.GetTopk(), Offset: sub.GetOffset()}
+			chunk, err := consumeSearchResultStream(ctx, searchreducestream.NewReduceStream(req, inputs, pk.GetDataType(), maxOutput, int(chunkBytes)))
+			if err != nil {
+				return nil, err
+			}
+			// Keep raw scores and the prefix before OFFSET. The existing
+			// Hybrid pipeline applies pagination and fusion once, after all indexes finish.
+			return &internalpb.SubSearchResults{
+				ReqIndex: int64(index), NumQueries: req.Nq, TopK: req.Topk,
+				MetricType: chunk.GetMetricType(), ResultData: chunk.GetResultData(),
+			}, nil
+		})
+		if err == nil {
+			t.resultBuf.Insert(result)
+		}
+		return err
+	}
 	if t.GetIsAdvanced() {
 		results, err := searchreducestream.DrainSearchStreams(ctx, streams)
 		if err != nil {
@@ -75,8 +96,16 @@ func (t *SearchTask) executeSearchStream(ctx context.Context, workload shardclie
 		}
 		return nil
 	}
-	reducer := searchreducestream.NewReduceStream(t.SearchRequest, streams, pk.GetDataType(), paramtable.Get().QuotaConfig.MaxOutputSize.GetAsInt64(), int(chunkBytes))
-	var result *internalpb.SearchResults
+	result, err := consumeSearchResultStream(ctx, searchreducestream.NewReduceStream(t.SearchRequest, streams, pk.GetDataType(), maxOutput, int(chunkBytes)))
+	if err == nil && t.resultBuf != nil {
+		// The pipeline receives the bounded candidates in merge order. For
+		// grouped Search it applies the group offset, output order and aggregation.
+		t.resultBuf.Insert(result)
+	}
+	return err
+}
+
+func consumeSearchResultStream(ctx context.Context, reducer *searchreducestream.OrderedReduceStream) (result *internalpb.SearchResults, err error) {
 	for {
 		chunk, recvErr := reducer.Recv()
 		if errors.Is(recvErr, io.EOF) {
@@ -101,21 +130,21 @@ func (t *SearchTask) executeSearchStream(ctx context.Context, workload shardclie
 		if closeErr != nil {
 			mlog.Warn(ctx, "failed to close Search ReduceStream", mlog.Err(closeErr))
 		}
-		return err
+		return nil, err
 	}
 	if closeErr != nil {
-		return closeErr
+		return nil, closeErr
 	}
-	if t.resultBuf != nil {
-		// The pipeline receives the bounded candidates in merge order. For
-		// grouped Search it applies the group offset, output order and aggregation.
-		t.resultBuf.Insert(result)
-	}
-	return nil
+	return result, nil
 }
 
 func (t *SearchTask) openSearchStream(ctx context.Context, qn types.QueryNodeClient, nodeID int64, channel string, chunkBytes int32) (*grpcSearchStream, error) {
 	req := t.shardSearchRequest(nodeID, channel)
+	// Opt in to per-index end markers. Older leaders ignore the inner
+	// threshold and return the legacy format; the reader accepts either.
+	if searchreducestream.IsUngroupedHybrid(req.GetReq()) {
+		req.StreamChunkBytes = chunkBytes
+	}
 	ctx = retry.WithMaxAttemptsContext(ctx, 1)
 	rpcCtx, cancel := context.WithCancel(ctx)
 	rpc, err := qn.SearchStream(rpcCtx)
@@ -135,6 +164,7 @@ func (t *SearchTask) openSearchStream(ctx context.Context, qn types.QueryNodeCli
 		// During a rolling upgrade, an older leader can serve its unary result.
 		cancel()
 		rpc = nil
+		req.StreamChunkBytes = 0 // Unary fallback must dispatch as Batch.
 		first, err = qn.Search(ctx, req)
 	}
 	if err != nil {
@@ -160,16 +190,24 @@ func (t *SearchTask) openSearchStream(ctx context.Context, qn types.QueryNodeCli
 		return nil, err
 	}
 	t.queryChannelsNode.Insert(channel, nodeID)
-	t.lb.UpdateCostMetrics(nodeID, first.GetCostAggregation())
-	return &grpcSearchStream{rpc: rpc, first: first, cancel: cancel}, nil
+	stream := &grpcSearchStream{rpc: rpc, first: first, cancel: cancel}
+	if subs := first.GetSubResults(); len(subs) > 0 && subs[0] != nil && subs[0].StreamEnd != nil {
+		// The live Hybrid leader can send B before A finishes. Its cost
+		// covers all sub-searches, so it arrives once, in the trailing summary.
+		stream.reportCost = func(cost *internalpb.CostAggregation) { t.lb.UpdateCostMetrics(nodeID, cost) }
+	} else {
+		t.lb.UpdateCostMetrics(nodeID, first.GetCostAggregation())
+	}
+	return stream, nil
 }
 
 // grpcSearchStream retains the first Chunk read inside the leader retry
 // callback. Once returned to the reducer, it never retries an individual RPC.
 type grpcSearchStream struct {
-	rpc    querypb.QueryNode_SearchStreamClient
-	first  *internalpb.SearchResults
-	cancel context.CancelFunc
+	rpc        querypb.QueryNode_SearchStreamClient
+	first      *internalpb.SearchResults
+	cancel     context.CancelFunc
+	reportCost func(*internalpb.CostAggregation) // Only set for a live Hybrid leader until its summary arrives.
 }
 
 func (s *grpcSearchStream) Recv() (*internalpb.SearchResults, error) {
@@ -181,7 +219,12 @@ func (s *grpcSearchStream) Recv() (*internalpb.SearchResults, error) {
 	if s.rpc == nil {
 		return nil, io.EOF
 	}
-	return s.rpc.Recv()
+	chunk, err := s.rpc.Recv()
+	if cost := chunk.GetCostAggregation(); err == nil && s.reportCost != nil && cost != nil {
+		s.reportCost(cost)
+		s.reportCost = nil
+	}
+	return chunk, err
 }
 
 func (s *grpcSearchStream) Close() error {

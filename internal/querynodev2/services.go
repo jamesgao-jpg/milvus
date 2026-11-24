@@ -1040,8 +1040,11 @@ func (node *QueryNode) searchStream(stream querypb.QueryNode_SearchStreamServer,
 		if paramtable.Get().QueryNodeCfg.PartialResultRequiredDataRatio.GetAsFloat() < 1 {
 			return status.Error(codes.Unimplemented, "partial-result Search requires Batch")
 		}
+		// An older Proxy sets only the outer transport threshold. Keep its
+		// buffered Hybrid response (including metadata on the first Chunk).
+		streamHybrid := req.GetStreamChunkBytes() > 0 && searchreducestream.IsUngroupedHybrid(req.GetReq())
 		req.StreamChunkBytes = request.GetChunkBytes()
-		if !req.GetReq().GetIsAdvanced() {
+		if !req.GetReq().GetIsAdvanced() || streamHybrid {
 			result, err = node.searchRequest(stream.Context(), req, stream.Send)
 			if err == nil && result == nil {
 				return nil

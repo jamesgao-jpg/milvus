@@ -22,6 +22,7 @@ import (
 	"math"
 
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus/internal/querynodev2/segments"
 	"github.com/milvus-io/milvus/internal/util/grpcclient"
@@ -38,6 +39,10 @@ import (
 // SearchReduceStream sends ordinary ANN Chunks inside the normal shard read.
 func (sd *shardDelegator) SearchReduceStream(ctx context.Context, req *querypb.SearchRequest, send func(*internalpb.SearchResults) error) error {
 	results, err := sd.searchWithSnapshot(ctx, req, send)
+	return sendRemainingSearchResults(ctx, req, results, err, send)
+}
+
+func sendRemainingSearchResults(ctx context.Context, req *querypb.SearchRequest, results []*internalpb.SearchResults, err error, send func(*internalpb.SearchResults) error) error {
 	if err != nil || results == nil {
 		return err
 	}
@@ -49,6 +54,38 @@ func (sd *shardDelegator) SearchReduceStream(ctx context.Context, req *querypb.S
 		return err
 	}
 	return searchreducestream.SplitSearchResult(result, req.GetReq().GetNq(), req.GetReq().GetTopk(), int(req.GetStreamChunkBytes()), send)
+}
+
+// streamHybridSubSearch runs under the caller's vchannel pin. Each invocation
+// owns its worker streams, not the shared leader RPC. End only this ReqIndex,
+// even for an empty result; other sub-searches can still be reading workers.
+func (sd *shardDelegator) streamHybridSubSearch(ctx context.Context, index int, req *querypb.SearchRequest, sealed []SnapshotItem, growing []SegmentEntry, rowCounts map[int64]int64, send func(*internalpb.SearchResults) error) (*internalpb.SearchResults, error) {
+	var summary *internalpb.SearchResults
+	write := func(chunk *internalpb.SearchResults) error {
+		if err := merr.Error(chunk.GetStatus()); err != nil {
+			return err
+		}
+		if summary == nil {
+			// The first Chunk carries worker metadata. Do not retain its hits
+			// until the slower sub-searches finish.
+			summary = &internalpb.SearchResults{
+				NumQueries: req.GetReq().GetNq(), CostAggregation: chunk.GetCostAggregation(),
+				ChannelsMvcc: chunk.GetChannelsMvcc(), IsTopkReduce: chunk.GetIsTopkReduce(),
+				ScannedRemoteBytes: chunk.GetScannedRemoteBytes(), ScannedTotalBytes: chunk.GetScannedTotalBytes(),
+			}
+		}
+		return send(&internalpb.SearchResults{Status: merr.Success(), IsAdvanced: true, SubResults: []*internalpb.SubSearchResults{{
+			ReqIndex: int64(index), StreamEnd: proto.Bool(false), NumQueries: req.GetReq().GetNq(), TopK: req.GetReq().GetTopk(),
+			MetricType: chunk.GetMetricType(), ResultData: chunk.GetResultData(), SlicedBlob: chunk.GetSlicedBlob(),
+		}}})
+	}
+	results, err := sd.search(ctx, req, sealed, growing, rowCounts, write)
+	if err = sendRemainingSearchResults(ctx, req, results, err, write); err != nil {
+		return nil, err
+	}
+	return summary, send(&internalpb.SearchResults{Status: merr.Success(), IsAdvanced: true, SubResults: []*internalpb.SubSearchResults{{
+		ReqIndex: int64(index), StreamEnd: proto.Bool(true),
+	}}})
 }
 
 func (sd *shardDelegator) reduceSearchStreams(ctx context.Context, req *querypb.SearchRequest, tasks []subTask[*querypb.SearchRequest], send func(*internalpb.SearchResults) error) (_ []*internalpb.SearchResults, err error) {
