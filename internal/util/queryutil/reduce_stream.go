@@ -58,6 +58,9 @@ func CanMergeQueryStream(req *internalpb.RetrieveRequest) bool {
 // SplitRetrieveResult sends a worker or delegator result in row-aligned chunks.
 // Request metadata belongs to the first chunk; HasMoreResult is not a transport EOF.
 func SplitRetrieveResult(result *internalpb.RetrieveResults, chunkBytes int, send func(*internalpb.RetrieveResults) error) error {
+	if chunkBytes <= 0 {
+		return merr.WrapErrServiceInternalMsg("Query Chunk bytes must be positive")
+	}
 	if !merr.Ok(result.GetStatus()) {
 		return send(result)
 	}
@@ -77,8 +80,16 @@ func SplitRetrieveResult(result *internalpb.RetrieveResults, chunkBytes int, sen
 	sizes := newRowSizeCalculator(result)
 	for start := 0; start < rows; {
 		end, bytes := start, int64(0)
-		for end < rows && (end == start || bytes < int64(chunkBytes)) {
-			bytes += sizes.rowSize(int64(end))
+		for end < rows && bytes < int64(chunkBytes) {
+			n, err := sizes.unitSize(int64(end))
+			if err != nil {
+				return err
+			}
+			// An ordinary row can cross the threshold. An oversized row starts its own Chunk.
+			if end > start && n > int64(chunkBytes) {
+				break
+			}
+			bytes += n
 			end++
 		}
 		chunk, err := rangeSliceRetrieveResults(result, start, end)
@@ -104,6 +115,38 @@ func SplitRetrieveResult(result *internalpb.RetrieveResults, chunkBytes int, sen
 		start = end
 	}
 	return nil
+}
+
+// unitSize counts transport payload. Keep rowSize separate: Batch and the shard
+// output quota count field bytes, not the PK and element indices sent on the wire.
+func (c *rowSizeCalculator) unitSize(row int64) (int64, error) {
+	src := c.result
+	pkBytes, err := reduce.IDsRowSize(src.GetIds(), row)
+	if err != nil {
+		return 0, err
+	}
+	size := int64(pkBytes)
+	for i, field := range src.GetFieldsData() {
+		slot := row
+		if indices := c.compactIndices[i]; indices != nil {
+			if row >= int64(len(indices)) {
+				return 0, merr.WrapErrServiceInternalMsg("Query row %d outside compact vector index", row)
+			}
+			slot = int64(indices[row])
+		}
+		n, err := reduce.FieldDataRowSize(field, row, slot)
+		if err != nil {
+			return 0, err
+		}
+		size += int64(n)
+	}
+	if src.GetElementLevel() {
+		if row >= int64(len(src.GetElementIndices())) {
+			return 0, merr.WrapErrServiceInternalMsg("Query row %d has no element indices", row)
+		}
+		size += 4 * int64(len(src.GetElementIndices()[row].GetIndices()))
+	}
+	return size, nil
 }
 
 type queryRPCStream struct {
@@ -357,7 +400,7 @@ func (s *OrderedReduceStream) produceNextUnit() (queryReduceUnit, error) {
 	} else if s.lastPK != nil && !typeutil.ComparePK(s.lastPK, pk) {
 		return queryReduceUnit{}, merr.WrapErrDataIntegrityMsg("duplicate or unordered PK %v in Query stream", pk)
 	}
-	fieldBytes := b.sizes.rowSize(row)
+	sizes := b.sizes
 	b.pop()
 	// A newer version of the trailing PK can be in the next worker Chunk.
 	// Do not send the row, even at a Chunk boundary, until its PK is final.
@@ -377,23 +420,19 @@ func (s *OrderedReduceStream) produceNextUnit() (queryReduceUnit, error) {
 			}
 			if newer := next.getTimestamp(next.pos); newer > ts {
 				src, row, ts = next.result, next.pos, newer
-				fieldBytes = next.sizes.rowSize(row)
+				sizes = next.sizes
 			}
 			next.pop()
 		}
-		s.outputBytes += fieldBytes
+		s.outputBytes += sizes.rowSize(row)
 		if s.maxOutputBytes > 0 && s.outputBytes > s.maxOutputBytes {
 			return queryReduceUnit{}, merr.WrapErrParameterInvalidMsg("query results exceed the maxOutputSize Limit %d", s.maxOutputBytes)
 		}
 	}
 	s.lastPK = pk
-	idBytes, err := reduce.IDsRowSize(src.GetIds(), row)
+	bytes, err := sizes.unitSize(row)
 	if err != nil {
 		return queryReduceUnit{}, err
-	}
-	bytes := fieldBytes + int64(idBytes)
-	if s.elementLevel {
-		bytes += 4 * int64(len(src.GetElementIndices()[row].GetIndices()))
 	}
 	if s.shard && s.remaining > 0 {
 		n := int64(1)

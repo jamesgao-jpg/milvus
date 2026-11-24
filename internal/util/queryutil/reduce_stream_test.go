@@ -267,21 +267,75 @@ func TestOrderedQueryResolvesTrailingVersionBeforeEmitting(t *testing.T) {
 	}
 }
 
-func TestOrderedQueryOversizedRowIsEmittedAlone(t *testing.T) {
+func TestQueryChunkBoundaries(t *testing.T) {
 	paramtable.Init()
-	ids := []string{"a", strings.Repeat("z", 256)}
-	input := queryStreamResult(nil, []int64{3, 4})
-	input.Ids = &schemapb.IDs{IdField: &schemapb.IDs_StrId{StrId: &schemapb.StringArray{Data: ids}}}
-	stream := NewOrderedReduceStream(&internalpb.RetrieveRequest{Limit: 2}, nil,
-		[]ReduceStream{&testQueryChunks{chunks: []*internalpb.RetrieveResults{input}}}, true, 96)
-	defer stream.Close()
-	for _, id := range ids {
-		chunk, err := stream.Recv()
-		require.NoError(t, err)
-		require.Equal(t, []string{id}, chunk.GetIds().GetStrId().GetData())
+	for _, tc := range []struct {
+		name      string
+		stringPKs []string
+		elements  []*internalpb.ElementIndices
+		budget    int
+		want      []int
+	}{
+		{"exact_int64", nil, nil, 16, []int{1, 1, 1}},                       // 8 PK bytes + 8 timestamp bytes per row.
+		{"raw_string_bytes", []string{"a", "bb", "ccc"}, nil, 22, []int{3}}, // 9 + 10 < 22.
+		{"normal_crossing", []string{strings.Repeat("a", 72), strings.Repeat("b", 22), "c"}, nil, 100, []int{2, 1}},
+		{"oversized_middle", []string{"a", strings.Repeat("b", 112), "c"}, nil, 100, []int{1, 1, 1}},
+		{"element_indices", nil, []*internalpb.ElementIndices{{Indices: []int32{0, 1, 2, 3}}, {Indices: []int32{0}}, {Indices: []int32{1}}}, 51, []int{2, 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := queryStreamResult([]int64{1, 2, 3}, []int64{4, 5, 6})
+			if tc.stringPKs != nil {
+				src.Ids = &schemapb.IDs{IdField: &schemapb.IDs_StrId{StrId: &schemapb.StringArray{Data: tc.stringPKs}}}
+			}
+			src.ElementLevel, src.ElementIndices = tc.elements != nil, tc.elements
+			check := func(t *testing.T, chunks []*internalpb.RetrieveResults) {
+				var counts []int
+				row := 0
+				for _, chunk := range chunks {
+					n := typeutil.GetSizeOfIDs(chunk.GetIds())
+					counts = append(counts, n)
+					for i := range n {
+						require.Equal(t, typeutil.GetPK(src.Ids, int64(row)), typeutil.GetPK(chunk.Ids, int64(i)))
+						if src.ElementLevel {
+							require.True(t, proto.Equal(tc.elements[row], chunk.ElementIndices[i]))
+						}
+						row++
+					}
+				}
+				require.Equal(t, tc.want, counts)
+			}
+			t.Run("worker", func(t *testing.T) {
+				var chunks []*internalpb.RetrieveResults
+				require.NoError(t, SplitRetrieveResult(src, tc.budget, func(chunk *internalpb.RetrieveResults) error {
+					chunks = append(chunks, chunk)
+					return nil
+				}))
+				check(t, chunks)
+			})
+			for _, shard := range []bool{true, false} {
+				name := "proxy"
+				if shard {
+					name = "delegator"
+				}
+				t.Run(name, func(t *testing.T) {
+					// One input row per Chunk: output boundaries must not depend on input boundaries.
+					child := splitTestQuery(t, src)
+					s := NewOrderedReduceStream(&internalpb.RetrieveRequest{Limit: -1}, nil, []ReduceStream{child}, shard, int64(tc.budget))
+					defer s.Close()
+					var chunks []*internalpb.RetrieveResults
+					for {
+						chunk, err := s.Recv()
+						if err == io.EOF {
+							break
+						}
+						require.NoError(t, err)
+						chunks = append(chunks, chunk)
+					}
+					check(t, chunks)
+				})
+			}
+		})
 	}
-	_, err := stream.Recv()
-	require.ErrorIs(t, err, io.EOF)
 }
 
 func TestOrderedGroupLimitAndQuota(t *testing.T) {
@@ -302,6 +356,33 @@ func TestOrderedGroupLimitAndQuota(t *testing.T) {
 		}
 		require.NoError(t, s.Close())
 	}
+}
+
+func TestQueryChunkBoundariesWithoutPK(t *testing.T) {
+	paramtable.Init()
+	// The empty key occupies a row but no payload bytes. It must not share a Chunk with the oversized key.
+	keys := []string{"", strings.Repeat("b", 20), "c", "d"}
+	src := &internalpb.RetrieveResults{FieldsData: []*schemapb.FieldData{makeStringField(100, "key", keys)}}
+	child := &testQueryChunks{}
+	require.NoError(t, SplitRetrieveResult(src, 10, func(chunk *internalpb.RetrieveResults) error {
+		child.chunks = append(child.chunks, chunk)
+		return nil
+	}))
+	schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{{FieldID: 100, Name: "key", DataType: schemapb.DataType_VarChar}}}
+	s := NewOrderedReduceStream(&internalpb.RetrieveRequest{GroupByFieldIds: []int64{100}, Limit: -1}, schema, []ReduceStream{child}, true, 10)
+	defer s.Close()
+	want := [][]string{keys[:1], keys[1:2], keys[2:]}
+	require.Len(t, child.chunks, len(want))
+	for i, values := range want {
+		require.Equal(t, values, child.chunks[i].GetFieldsData()[0].GetScalars().GetStringData().GetData())
+	}
+	for _, values := range want {
+		chunk, err := s.Recv()
+		require.NoError(t, err)
+		require.Equal(t, values, chunk.GetFieldsData()[0].GetScalars().GetStringData().GetData())
+	}
+	_, err := s.Recv()
+	require.ErrorIs(t, err, io.EOF)
 }
 
 func TestGlobalAggregateEmptyAndLateError(t *testing.T) {

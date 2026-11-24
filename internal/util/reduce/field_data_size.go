@@ -17,7 +17,6 @@
 package reduce
 
 import (
-	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
@@ -25,8 +24,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
-// IDsRowSize retains Query's encoded one-row IDs size. Search Chunk thresholds
-// use the PK payload length instead, without protobuf tags or length prefixes.
+// IDsRowSize counts PK payload only. Aggregate rows have no PK.
 func IDsRowSize(ids *schemapb.IDs, row int64) (int, error) {
 	if ids.GetIdField() == nil {
 		return 0, nil
@@ -34,18 +32,10 @@ func IDsRowSize(ids *schemapb.IDs, row int64) (int, error) {
 	if row < 0 || row >= int64(typeutil.GetSizeOfIDs(ids)) {
 		return 0, merr.WrapErrServiceInternalMsg("Unit row %d is outside field data length %d", row, typeutil.GetSizeOfIDs(ids))
 	}
-	var field protowire.Number
-	var size int
-	switch data := ids.GetIdField().(type) {
-	case *schemapb.IDs_IntId:
-		field, size = 1, protowire.SizeVarint(uint64(data.IntId.Data[row]))
-	case *schemapb.IDs_StrId:
-		field, size = 2, len(data.StrId.Data[row])
-	default:
-		return 0, merr.WrapErrServiceInternalMsg("unsupported IDs representation %T", data)
+	if strings := ids.GetStrId(); strings != nil {
+		return len(strings.GetData()[row]), nil
 	}
-	arraySize := protowire.SizeTag(1) + protowire.SizeBytes(size)
-	return protowire.SizeTag(field) + protowire.SizeBytes(arraySize), nil
+	return 8, nil
 }
 
 func scalarPayloadSize[T any](values []T, row int64, null bool, size func(T) int) (int, error) {

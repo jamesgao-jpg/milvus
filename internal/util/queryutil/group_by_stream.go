@@ -237,7 +237,10 @@ func (s *OrderedReduceStream) recvGroups() (*internalpb.RetrieveResults, error) 
 			sizes = newRowSizeCalculator(out)
 		}
 		rows := getRowCount(out)
-		n := sizes.rowSize(int64(rows - 1))
+		n, err := sizes.unitSize(int64(rows - 1))
+		if err != nil {
+			return nil, err
+		}
 		if n > s.chunkBytes && rows > 1 {
 			last, err := rangeSliceRetrieveResults(out, rows-1, rows)
 			if err != nil {
