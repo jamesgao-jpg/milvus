@@ -66,11 +66,18 @@ func (t *SearchTask) executeSearchStream(ctx context.Context, workload shardclie
 	}
 
 	maxOutput := paramtable.Get().QuotaConfig.MaxOutputSize.GetAsInt64()
-	if searchreducestream.IsUngroupedHybrid(t.SearchRequest) {
+	if searchreducestream.CanStreamHybrid(t.SearchRequest) {
 		result, err := searchreducestream.ReduceHybridSearchStreams(ctx, t.SearchRequest, streams, func(index int, inputs []searchreducestream.ReduceStream) (*internalpb.SubSearchResults, error) {
 			sub := t.GetSubReqs()[index]
-			req := &internalpb.SearchRequest{Nq: sub.GetNq(), Topk: sub.GetTopk(), Offset: sub.GetOffset()}
-			chunk, err := consumeSearchResultStream(ctx, searchreducestream.NewReduceStream(req, inputs, pk.GetDataType(), maxOutput, int(chunkBytes)))
+			req := &internalpb.SearchRequest{
+				Nq: sub.GetNq(), Topk: sub.GetTopk(), Offset: sub.GetOffset(),
+				GroupByFieldId: sub.GetGroupByFieldId(), GroupByFieldIds: t.GetGroupByFieldIds(), GroupSize: sub.GetGroupSize(),
+			}
+			newReducer := searchreducestream.NewReduceStream
+			if req.GetGroupByFieldId() > 0 || len(req.GetGroupByFieldIds()) > 0 {
+				newReducer = searchreducestream.NewHybridGroupReduceStream
+			}
+			chunk, err := consumeSearchResultStream(ctx, newReducer(req, inputs, pk.GetDataType(), maxOutput, int(chunkBytes)))
 			if err != nil {
 				return nil, err
 			}
@@ -121,7 +128,7 @@ func consumeSearchResultStream(ctx context.Context, reducer *searchreducestream.
 			result.ResultData = searchreducestream.AppendSearchData(result.GetResultData(), chunk.GetResultData())
 		}
 		counts := result.GetResultData().GetTopks()
-		if len(counts) > 0 && counts[len(counts)-1] >= reducer.HitLimit() {
+		if len(counts) > 0 && reducer.WindowFull(counts[len(counts)-1]) {
 			break
 		}
 	}
@@ -142,7 +149,7 @@ func (t *SearchTask) openSearchStream(ctx context.Context, qn types.QueryNodeCli
 	req := t.shardSearchRequest(nodeID, channel)
 	// Opt in to per-index end markers. Older leaders ignore the inner
 	// threshold and return the legacy format; the reader accepts either.
-	if searchreducestream.IsUngroupedHybrid(req.GetReq()) {
+	if searchreducestream.CanStreamHybrid(req.GetReq()) {
 		req.StreamChunkBytes = chunkBytes
 	}
 	ctx = retry.WithMaxAttemptsContext(ctx, 1)

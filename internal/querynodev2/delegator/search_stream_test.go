@@ -246,9 +246,11 @@ func (s *DelegatorSuite) TestOrderedReduceStreamFirstChunk() {
 	paramtable.SetNodeID(1)
 	s.initSegments()
 	sd := s.delegator.(*shardDelegator)
-	for _, op := range []string{"query", "search", "grouped_search", "hybrid"} {
+	for _, op := range []string{"query", "search", "grouped_search", "hybrid", "grouped_hybrid"} {
 		s.Run(op, func() {
 			t := s.T()
+			hybrid := op == "hybrid" || op == "grouped_hybrid"
+			grouped := op == "grouped_search" || op == "grouped_hybrid"
 			s.workerManager.ExpectedCalls = nil
 			snap := sd.distribution.current.Load()
 			refs := snap.inUse.Load()
@@ -262,11 +264,11 @@ func (s *DelegatorSuite) TestOrderedReduceStreamFirstChunk() {
 			}
 			if op != "query" {
 				w.EXPECT().SearchSegmentsStream(mock.Anything, mock.Anything, int32(1)).RunAndReturn(func(ctx context.Context, req *querypb.SearchRequest, _ int32) (searchreducestream.ReduceStream, error) {
-					if op == "hybrid" && req.GetReq().GetDsl() == "empty" {
+					if hybrid && req.GetReq().GetDsl() == "empty" {
 						return &testSearchChunks{}, nil
 					}
 					data := &schemapb.SearchResultData{NumQueries: 1, TopK: 10, Topks: []int64{2}, Scores: []float32{1, 0}, Ids: newIDs()}
-					if op == "grouped_search" {
+					if grouped {
 						data.GroupByFieldValue = &schemapb.FieldData{Type: schemapb.DataType_Int64, Field: &schemapb.FieldData_Scalars{
 							Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{LongData: data.Ids.GetIntId()}},
 						}}
@@ -296,25 +298,42 @@ func (s *DelegatorSuite) TestOrderedReduceStreamFirstChunk() {
 				rpc, err := client.SearchStream(ctx)
 				require.NoError(t, err)
 				req := &internalpb.SearchRequest{Base: commonpbutil.NewMsgBase(), FieldId: 101, Nq: 1, Topk: 10}
-				if op == "hybrid" {
+				if hybrid {
 					req.IsAdvanced = true
 					req.SubReqs = []*internalpb.SubSearchRequest{{FieldId: 101, Nq: 1, Topk: 10}, {FieldId: 101, Nq: 1, Topk: 10, Dsl: "empty"}}
 				}
-				if op == "grouped_search" {
+				if grouped {
 					req.GroupByFieldId, req.GroupSize = 100, 2
+					for _, sub := range req.SubReqs {
+						sub.GroupByFieldId, sub.GroupSize = 100, 2
+					}
 				}
 				require.NoError(t, rpc.Send(&querypb.SearchStreamRequest{Request: &querypb.SearchRequest{Req: req, DmlChannels: channels}, ChunkBytes: 1}))
 				require.NoError(t, rpc.CloseSend())
 				first, err := rpc.Recv()
 				require.NoError(t, err)
-				if op == "hybrid" {
-					// B must send its empty EOF while A is still in a worker Recv.
-					for !first.GetSubResults()[0].GetStreamEnd() {
+				if hybrid {
+					// A must send a hit and B its empty EOF without waiting for A's blocked worker.
+					var hit, emptyEnd bool
+					for {
+						require.Len(t, first.GetSubResults(), 1)
+						sub := first.GetSubResults()[0]
+						if sub.GetReqIndex() == 0 {
+							require.False(t, sub.GetStreamEnd())
+							require.Len(t, sub.GetResultData().GetScores(), 1)
+							if grouped {
+								require.Len(t, sub.GetResultData().GetGroupByFieldValues(), 1)
+							}
+							hit = true
+						} else if sub.GetReqIndex() == 1 && sub.GetStreamEnd() {
+							emptyEnd = true
+						}
+						if hit && emptyEnd {
+							break
+						}
 						first, err = rpc.Recv()
 						require.NoError(t, err)
-						require.Len(t, first.GetSubResults(), 1)
 					}
-					require.EqualValues(t, 1, first.GetSubResults()[0].GetReqIndex())
 				} else {
 					require.Len(t, first.GetResultData().GetScores(), 1)
 				}

@@ -277,20 +277,26 @@ func TestHybridGroupReduceStreamBatchParity(t *testing.T) {
 	op := hybridSearchReduceOperator{
 		traceCtx: ctx, primaryFieldSchema: &schemapb.FieldSchema{DataType: schemapb.DataType_Int64},
 		subReqs: []*internalpb.SubSearchRequest{
-			{Nq: 2, Topk: 2, Offset: 1}, {Nq: 2, Topk: 2, Offset: 1},
+			{Nq: 2, Topk: 2, Offset: 1, GroupByFieldId: groupFieldID, GroupSize: 2}, {Nq: 2, Topk: 2, Offset: 1},
 		},
 		queryInfos: []*planpb.QueryInfo{{GroupByFieldId: groupFieldID, GroupSize: 2}, {}},
 	}
 	batch := make([]*internalpb.SearchResults, 2)
-	streams := make([]searchreducestream.ReduceStream, 2)
+	lb := shardclient.NewMockLBPolicy(t)
+	task := &SearchTask{
+		ctx: ctx, SearchRequest: &internalpb.SearchRequest{Base: &commonpb.MsgBase{}, IsAdvanced: true, Nq: 2, SubReqs: op.subReqs},
+		lb: lb, resultBuf: typeutil.NewConcurrentSet[*internalpb.SearchResults](), queryChannelsNode: typeutil.NewConcurrentMap[string, int64](),
+		schema: mustNewSchemaInfo(constructCollectionSchema(testInt64Field, testFloatVecField, testVecDim, "test")),
+	}
+	nodes := []*mocks.MockQueryNodeClient{mocks.NewMockQueryNodeClient(t), mocks.NewMockQueryNodeClient(t)}
 	for i := range batch {
 		offset := int64(i * 10)
-		grouped := genSearchResultData(2, 2, []int64{1 + offset, 2 + offset, 3 + offset, 4 + offset}, []float32{-1, -1, -3, -2})
-		grouped.Topks = []int64{3, 1}
+		grouped := genSearchResultData(2, 2, []int64{1, 2 + offset, 3 + offset, 4 + offset, 5 + offset, 6 + offset}, []float32{-1, -2, -3, -1, -2, -3})
+		grouped.Topks = []int64{3, 3}
 		grouped.GroupByFieldValue = &schemapb.FieldData{
-			Type: schemapb.DataType_Int64, ValidData: []bool{true, false, true, true},
+			Type: schemapb.DataType_Int64, ValidData: []bool{true, false, true, true, true, false},
 			Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{
-				Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: []int64{7, 7, 8}}},
+				Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: []int64{7, 7, 8, 8}}},
 			}},
 		}
 		plain := genSearchResultData(2, 2, []int64{1 + offset, 2 + offset, 3 + offset, 4 + offset}, []float32{1, 0.5, 1, 0.5})
@@ -303,18 +309,41 @@ func TestHybridGroupReduceStreamBatchParity(t *testing.T) {
 				{ReqIndex: 1, NumQueries: 2, TopK: 2, MetricType: "IP", ResultData: plain},
 			},
 		}
-		cancelCtx, cancel := context.WithCancel(ctx)
-		rpc := &testLeaderSearchStream{ctx: cancelCtx}
+		rpc := &testLeaderSearchStream{send: func(open *querypb.SearchStreamRequest) {
+			require.EqualValues(t, 1, open.GetRequest().GetStreamChunkBytes())
+		}}
 		require.NoError(t, searchreducestream.SplitHybridSearchResult(proto.CloneOf(batch[i]), 1, func(chunk *internalpb.SearchResults) error {
+			if i == 0 {
+				chunk.SubResults[0].StreamEnd = proto.Bool(false)
+			}
 			rpc.chunks = append(rpc.chunks, chunk)
 			return nil
 		}))
-		require.Len(t, rpc.chunks, 8)
-		streams[i] = &grpcSearchStream{rpc: rpc, cancel: cancel}
+		// One leader sends explicit per-index EOF. The old leader uses physical EOF.
+		if i == 0 {
+			for index := range op.subReqs {
+				rpc.chunks = append(rpc.chunks, &internalpb.SearchResults{IsAdvanced: true, SubResults: []*internalpb.SubSearchResults{{ReqIndex: int64(index), StreamEnd: proto.Bool(true)}}})
+			}
+		}
+		nodes[i].EXPECT().SearchStream(mock.Anything).RunAndReturn(func(ctx context.Context, _ ...grpc.CallOption) (querypb.QueryNode_SearchStreamClient, error) {
+			rpc.ctx = ctx
+			return rpc, nil
+		}).Once()
 	}
-	drained, err := searchreducestream.DrainSearchStreams(ctx, streams)
+	lb.EXPECT().UpdateCostMetrics(mock.Anything, mock.Anything).Once()
+	lb.EXPECT().Execute(mock.Anything, mock.Anything).RunAndReturn(func(ctx context.Context, w shardclient.CollectionWorkLoad) error {
+		if err := w.Exec(ctx, 1, nodes[0], "a"); err != nil {
+			return err
+		}
+		return w.Exec(ctx, 2, nodes[1], "b")
+	}).Once()
+	require.NoError(t, task.executeSearchStream(ctx, shardclient.CollectionWorkLoad{}, 1))
+	drained, err := task.collectSearchResults(ctx)
 	require.NoError(t, err)
-	require.Len(t, drained, 2)
+	require.Len(t, drained, 1)
+	candidates := drained[0].GetSubResults()[0].GetResultData()
+	require.Equal(t, []int64{6, 6}, candidates.GetTopks())
+	require.Equal(t, []int64{1, 2, 3, 1, 12, 13, 4, 5, 6, 14, 15, 16}, candidates.GetIds().GetIntId().GetData())
 	require.Equal(t, map[string]uint64{"a": 1}, drained[0].GetChannelsMvcc())
 	want, err := op.run(ctx, nil, batch)
 	require.NoError(t, err)
@@ -325,5 +354,5 @@ func TestHybridGroupReduceStreamBatchParity(t *testing.T) {
 	for i, expected := range wantResults {
 		require.True(t, proto.Equal(expected, gotResults[i]), "sub-search %d: Batch %v; stream %v", i, expected, gotResults[i])
 	}
-	require.Equal(t, []int64{6, 2}, gotResults[0].GetResults().GetTopks(), "grouped candidates must not be clipped before fusion")
+	require.Equal(t, []int64{6, 6}, gotResults[0].GetResults().GetTopks(), "grouped candidates must not be clipped before fusion")
 }

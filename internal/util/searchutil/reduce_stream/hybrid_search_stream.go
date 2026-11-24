@@ -19,6 +19,7 @@ package reducestream
 import (
 	"context"
 	"io"
+	"math"
 	"sync"
 
 	"golang.org/x/sync/errgroup"
@@ -27,13 +28,13 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 )
 
-// IsUngroupedHybrid leaves grouped Hybrid on its candidate-preserving path.
-func IsUngroupedHybrid(req *internalpb.SearchRequest) bool {
-	if !req.GetIsAdvanced() || len(req.GetSubReqs()) == 0 || req.GetGroupByFieldId() > 0 || len(req.GetGroupByFieldIds()) != 0 {
+// CanStreamHybrid requires a logical stream for each sub-search.
+func CanStreamHybrid(req *internalpb.SearchRequest) bool {
+	if !req.GetIsAdvanced() || len(req.GetSubReqs()) == 0 {
 		return false
 	}
 	for _, sub := range req.GetSubReqs() {
-		if sub == nil || sub.GetGroupByFieldId() > 0 {
+		if sub == nil {
 			return false
 		}
 	}
@@ -42,8 +43,8 @@ func IsUngroupedHybrid(req *internalpb.SearchRequest) bool {
 
 // One physical reader writes the Chunks for this (vchannel, sub-search).
 // It must not wait for the reducer to take A before it can read B on the
-// same RPC. Under skew, pending can hold the whole NQ * sub-search topK
-// window. This is a hit limit, not a byte limit. Do not allocate it up front.
+// same RPC. Under skew, pending can hold the whole vchannel window: NQ *
+// topK * hits per group. This is a hit limit, not a byte limit.
 type hybridSubStream struct {
 	ctx     context.Context             // Cancels all reads on request or transport failure.
 	mu      sync.Mutex                  // Protects pending, ended and closed.
@@ -53,7 +54,8 @@ type hybridSubStream struct {
 	closed  bool                        // The final reducer no longer needs hits; other indexes stay open.
 
 	// Only the physical reader updates these counters, including after Close.
-	counts   []int64 // Cumulative hits per query vector; never more than sub-search topK.
+	counts   []int64 // Cumulative hits per query vector from this vchannel.
+	hitLimit int64   // topK for plain hits, topK * group size for grouped hits.
 	sawEmpty bool    // Preserve empty-result metadata without queuing repeated empty Chunks.
 }
 
@@ -85,8 +87,8 @@ func (s *hybridSubStream) accept(sub *internalpb.SubSearchResults, req *internal
 	}
 	chunk.ResultData, chunk.SlicedBlob = data, nil
 	for q, n := range data.GetTopks() {
-		if n > req.GetTopk()-s.counts[q] {
-			return merr.WrapErrServiceInternalMsg("Hybrid Search ReqIndex %d exceeds topK for vector %d", sub.GetReqIndex(), q)
+		if n > s.hitLimit-s.counts[q] {
+			return merr.WrapErrServiceInternalMsg("Hybrid Search ReqIndex %d exceeds topK window for vector %d", sub.GetReqIndex(), q)
 		}
 		s.counts[q] += n
 	}
@@ -168,7 +170,15 @@ func ReduceHybridSearchStreams(ctx context.Context, req *internalpb.SearchReques
 	for ch, stream := range streams {
 		channel := make([]*hybridSubStream, len(subs))
 		for i, sub := range subs {
-			channel[i] = &hybridSubStream{ctx: groupCtx, ready: make(chan struct{}, 1), counts: make([]int64, sub.GetNq())}
+			size := int64(1)
+			if sub.GetGroupByFieldId() > 0 || len(req.GetGroupByFieldIds()) > 0 {
+				size = max(1, sub.GetGroupSize())
+			}
+			limit := int64(math.MaxInt64)
+			if sub.GetTopk() <= math.MaxInt64/size {
+				limit = sub.GetTopk() * size
+			}
+			channel[i] = &hybridSubStream{ctx: groupCtx, ready: make(chan struct{}, 1), counts: make([]int64, sub.GetNq()), hitLimit: limit}
 			inputs[i][ch] = channel[i]
 		}
 		group.Go(func() error {

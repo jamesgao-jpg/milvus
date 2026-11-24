@@ -1042,7 +1042,7 @@ func (node *QueryNode) searchStream(stream querypb.QueryNode_SearchStreamServer,
 		}
 		// An older Proxy sets only the outer transport threshold. Keep its
 		// buffered Hybrid response (including metadata on the first Chunk).
-		streamHybrid := req.GetStreamChunkBytes() > 0 && searchreducestream.IsUngroupedHybrid(req.GetReq())
+		streamHybrid := req.GetStreamChunkBytes() > 0 && searchreducestream.CanStreamHybrid(req.GetReq())
 		req.StreamChunkBytes = request.GetChunkBytes()
 		if !req.GetReq().GetIsAdvanced() || streamHybrid {
 			result, err = node.searchRequest(stream.Context(), req, stream.Send)

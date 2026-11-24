@@ -277,6 +277,7 @@ type OrderedReduceStream struct {
 	pkType                schemapb.DataType                               // Preserves typed IDs for empty Batch results.
 	maxOutputBytes        int64                                           // Limit on cumulative output field bytes, independent of Chunk size.
 	dedupByPK             bool                                            // Vchannel merge only: deduplicate PKs or (PK, element index).
+	preserveCandidates    bool                                            // Grouped Hybrid at Proxy: forward vchannel candidates in Batch order until EOF.
 	chunkBytes            int                                             // Output Chunk payload threshold.
 	query                 int                                             // Vector currently being merged.
 	emitted               int64                                           // Selected hits for this vector, including offset.
@@ -319,8 +320,11 @@ func (s *OrderedReduceStream) groupForHit(b *orderedChildBuffer, values []any) (
 	return &searchGroup{values: slices.Clone(values)}, hash
 }
 
-// HitLimit includes the groups before the offset. The Proxy pipeline applies the offset once.
-func (s *OrderedReduceStream) HitLimit() int64 { return s.topK * s.groupSize }
+// WindowFull includes the groups before the offset. Grouped Hybrid at Proxy
+// has no cross-vchannel hit limit before fusion.
+func (s *OrderedReduceStream) WindowFull(hits int64) bool {
+	return !s.preserveCandidates && hits >= s.topK*s.groupSize
+}
 
 func NewReduceStream(request *internalpb.SearchRequest, streams []ReduceStream, pkType schemapb.DataType, maxOutputBytes int64, chunkBytes int) *OrderedReduceStream {
 	s := &OrderedReduceStream{
@@ -339,6 +343,13 @@ func NewShardReduceStream(request *internalpb.SearchRequest, streams []ReduceStr
 	s := NewReduceStream(request, streams, pkType, maxOutputBytes, chunkBytes)
 	s.dedupByPK = true
 	s.offset = 0
+	return s
+}
+
+func NewHybridGroupReduceStream(request *internalpb.SearchRequest, streams []ReduceStream, pkType schemapb.DataType, maxOutputBytes int64, chunkBytes int) *OrderedReduceStream {
+	s := NewReduceStream(request, streams, pkType, maxOutputBytes, chunkBytes)
+	s.preserveCandidates = true
+	s.groups = nil // The vchannels have already applied their group limits.
 	return s
 }
 
@@ -397,7 +408,7 @@ func (s *OrderedReduceStream) Recv() (*internalpb.SearchResults, error) {
 			}
 		}
 		b.accept(decoded)
-		if b.data != nil && s.groups != nil {
+		if b.data != nil && len(s.groupByFieldIDs) > 0 {
 			b.groupValues = make([]func(int) any, len(s.groupByFieldIDs))
 			for i, id := range s.groupByFieldIDs {
 				field := reduce.FindGroupByFieldData(decoded, id, len(s.groupByFieldIDs) == 1)
@@ -425,7 +436,7 @@ merge:
 		// Skip surplus hits to reach the next vector. For the final vector,
 		// Proxy owns the stop decision; shard streams still bound their candidates.
 		finalVector := !s.dedupByPK && q == int(s.nq)-1
-		for s.emitted < s.HitLimit() || (finalVector && s.groups == nil) {
+		for !s.WindowFull(s.emitted) || (finalVector && s.groups == nil) {
 			if err := s.childStreams.ReceiveUntilReady(hasUnit, accept); err != nil {
 				return nil, err
 			}
@@ -434,6 +445,11 @@ merge:
 				b := &s.childBuffers[i]
 				if b.data != nil && b.query == q && (best == -1 || b.precedes(&s.childBuffers[best])) {
 					best = i
+					if s.preserveCandidates {
+						// Batch concatenates vchannels for this vector. Fusion
+						// consumes that order, not a global score order.
+						break
+					}
 				}
 			}
 			if best == -1 {
@@ -477,6 +493,8 @@ merge:
 						s.groupCount++
 					}
 					group.count++
+				}
+				if len(s.groupByFieldIDs) > 0 {
 					if groupBuilders == nil {
 						for _, id := range s.groupByFieldIDs {
 							field := reduce.FindGroupByFieldData(b.data, id, len(s.groupByFieldIDs) == 1)
@@ -512,7 +530,7 @@ merge:
 				(s.dedupByPK && s.numResults > 1)) {
 				return nil, merr.WrapErrParameterInvalidMsg("search results exceed the maxOutputSize Limit %d", s.maxOutputBytes)
 			}
-			if chunkSize >= s.chunkBytes || (finalVector && s.emitted == s.HitLimit()) {
+			if chunkSize >= s.chunkBytes || (finalVector && !s.preserveCandidates && s.emitted == s.topK*s.groupSize) {
 				break merge
 			}
 		}

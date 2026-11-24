@@ -181,6 +181,78 @@ func TestUngroupedHybridSearchStream(t *testing.T) {
 	}
 }
 
+func TestGroupedHybridWaitsForPhysicalEOF(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	req := &internalpb.SearchRequest{IsAdvanced: true, GroupByFieldIds: []int64{101, 102},
+		SubReqs: []*internalpb.SubSearchRequest{{Nq: 1, Topk: 2, GroupSize: 2}}}
+	data := newSearchData(1, 2)
+	for _, id := range []int64{11, 12, 13} {
+		typeutil.AppendPKs(data.Ids, id)
+	}
+	data.Scores, data.Topks = []float32{1, 0.5, 0}, []int64{3}
+	for _, id := range req.GroupByFieldIds {
+		b, err := typeutil.NewFieldDataBuilder(schemapb.DataType_Int64, false, 3)
+		require.NoError(t, err)
+		b.Add(nil).Add(int64(7)).Add(nil)
+		f := b.Build()
+		f.FieldId = id
+		data.GroupByFieldValues = append(data.GroupByFieldValues, f)
+	}
+	frame := &internalpb.SearchResults{IsAdvanced: true, SubResults: []*internalpb.SubSearchResults{{StreamEnd: proto.Bool(false), ResultData: data}}}
+	end := &internalpb.SearchResults{IsAdvanced: true, SubResults: []*internalpb.SubSearchResults{{StreamEnd: proto.Bool(true)}}}
+	release := make(chan struct{})
+	rpcCtx, closeRPC := context.WithCancel(ctx)
+	rpc := &gatedHybridStream{testSearchStream: testSearchStream{chunks: []*internalpb.SearchResults{frame, end}},
+		ctx: rpcCtx, cancel: closeRPC, release: release, last: &internalpb.SearchResults{Status: merr.Status(merr.ErrCollectionNotLoaded)}}
+	subDone := make(chan *schemapb.SearchResultData, 1)
+	consume := func(_ int, inputs []ReduceStream) (*internalpb.SubSearchResults, error) {
+		r := NewHybridGroupReduceStream(&internalpb.SearchRequest{Nq: 1, Topk: 2, GroupSize: 2, GroupByFieldIds: req.GroupByFieldIds}, inputs, schemapb.DataType_Int64, 1024, 1)
+		defer r.Close()
+		sub := &internalpb.SubSearchResults{}
+		for {
+			chunk, err := r.Recv()
+			if err == io.EOF {
+				subDone <- sub.ResultData
+				return sub, nil
+			}
+			if err != nil {
+				return nil, err
+			}
+			sub.ResultData = AppendSearchData(sub.ResultData, chunk.ResultData)
+		}
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := ReduceHybridSearchStreams(ctx, req, []ReduceStream{rpc}, consume)
+		done <- err
+	}()
+	select {
+	case got := <-subDone:
+		require.Equal(t, []int64{3}, got.GetTopks())
+		require.Len(t, got.GetGroupByFieldValues(), 2)
+		for i, f := range got.GetGroupByFieldValues() {
+			require.Equal(t, req.GroupByFieldIds[i], f.GetFieldId())
+			read := typeutil.GetDataIterator(f)
+			require.Nil(t, read(0))
+			require.Equal(t, int64(7), read(1))
+			require.Nil(t, read(2))
+		}
+	case <-ctx.Done():
+		t.Fatal("sub-search did not finish on its end marker")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("fusion received results before physical EOF: %v", err)
+	default:
+	}
+	close(release)
+	require.ErrorIs(t, <-done, merr.ErrCollectionNotLoaded)
+	// Repeating the data frame exceeds the four-hit window for this vchannel.
+	_, err := ReduceHybridSearchStreams(ctx, req, []ReduceStream{&testSearchStream{chunks: []*internalpb.SearchResults{frame, frame, end}}}, consume)
+	require.ErrorContains(t, err, "exceeds topK window")
+}
+
 func (s *testSearchStream) Recv() (*internalpb.SearchResults, error) {
 	if len(s.chunks) == 0 {
 		if s.err != nil {

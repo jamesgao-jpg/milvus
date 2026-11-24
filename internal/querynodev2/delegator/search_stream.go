@@ -128,7 +128,7 @@ func (sd *shardDelegator) reduceSearchStreams(ctx context.Context, req *querypb.
 	}
 
 	if send == nil && (req.GetReq().GetGroupByFieldId() > 0 || len(req.GetReq().GetGroupByFieldIds()) > 0) {
-		// Hybrid still needs the buffered sub-search result for fusion.
+		// A legacy Proxy did not opt in to per-sub-search Chunks.
 		return searchreducestream.DrainSearchStreams(ctx, streams)
 	}
 	// Buffered callers (including Hybrid sub-searches) still consume a single result.
