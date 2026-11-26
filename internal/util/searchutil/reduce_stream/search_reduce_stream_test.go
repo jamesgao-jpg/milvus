@@ -18,6 +18,7 @@ package reducestream
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -487,5 +488,133 @@ func TestSearchChunkPayloadBoundaries(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+func TestSplitSearchResultPassThrough(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		rows, threshold int
+		group           bool
+	}{
+		{"below", 3, 37, false}, {"exact", 3, 36, false}, {"crossed_by_last", 3, 35, false},
+		{"oversized_single_hit", 1, 1, false}, {"compact_nullable_key", 3, 128, true},
+	} {
+		for _, encoded := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/encoded=%t", tc.name, encoded), func(t *testing.T) {
+				data := newSearchData(2, int64(tc.rows))
+				data.Topks[1], data.AllSearchCount = int64(tc.rows), 21
+				for i := range tc.rows {
+					typeutil.AppendPKs(data.Ids, int64(i+1))
+					data.Scores = append(data.Scores, float32(tc.rows-i))
+				}
+				if tc.group {
+					b, err := typeutil.NewFieldDataBuilder(schemapb.DataType_VarChar, false, tc.rows)
+					require.NoError(t, err)
+					data.GroupByFieldValue = b.Add(nil).Add("group").Add(nil).Build()
+					data.GroupByFieldValue.FieldId = 101
+				}
+				result := &internalpb.SearchResults{ResultData: data, NumQueries: 2, TopK: int64(tc.rows), ChannelsMvcc: map[string]uint64{"a": 7}}
+				if encoded {
+					var err error
+					result.SlicedBlob, err = proto.Marshal(data)
+					require.NoError(t, err)
+					result.ResultData = nil
+					result.SlicedNumCount = 1
+				}
+				want := proto.CloneOf(result)
+				calls := 0
+				err := SplitSearchResult(result, 2, int64(tc.rows), tc.threshold, func(chunk *internalpb.SearchResults) error {
+					calls++
+					require.Same(t, result, chunk)
+					require.True(t, proto.Equal(want, chunk), "the wire representation and metadata must not change")
+					if !encoded {
+						require.Same(t, data, chunk.ResultData)
+					}
+					if tc.group {
+						req := &internalpb.SearchRequest{Nq: 2, Topk: int64(tc.rows), GroupByFieldId: 101, GroupSize: 3}
+						input := &testSearchStream{chunks: []*internalpb.SearchResults{chunk}}
+						reducer := NewShardReduceStream(req, []ReduceStream{input}, schemapb.DataType_Int64, 4096, 128)
+						defer reducer.Close()
+						got, err := reducer.Recv()
+						require.NoError(t, err)
+						require.Equal(t, data.Topks, got.GetResultData().GetTopks())
+						read := typeutil.GetDataIterator(got.GetResultData().GetGroupByFieldValues()[0])
+						require.Equal(t, []any{nil, "group", nil}, []any{read(0), read(1), read(2)})
+					}
+					return nil
+				})
+				require.NoError(t, err)
+				require.Equal(t, 1, calls)
+			})
+		}
+	}
+}
+
+func TestSplitSearchResultPassThroughStillValidates(t *testing.T) {
+	data := newSearchData(1, 1)
+	typeutil.AppendPKs(data.Ids, int64(1))
+	data.Topks[0] = 1
+	send := func(*internalpb.SearchResults) error { t.Fatal("sent an invalid Search result"); return nil }
+	result := &internalpb.SearchResults{ResultData: data}
+	require.ErrorContains(t, SplitSearchResult(result, 1, 1, 256, send), "do not align")
+	data.Scores = []float32{1}
+	data.GroupByFieldValue = &schemapb.FieldData{Type: schemapb.DataType_Float,
+		Field: &schemapb.FieldData_Scalars{Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_FloatData{FloatData: &schemapb.FloatArray{Data: []float32{1}}}}}}
+	require.ErrorIs(t, SplitSearchResult(result, 1, 1, 256, send), merr.ErrParameterInvalid)
+}
+
+func BenchmarkSplitSearchResultAndMarshal(b *testing.B) {
+	for _, tc := range []struct {
+		name          string
+		nq, topK, dim int
+	}{
+		{"single_scalar", 10, 100, 0}, {"single_vector", 1, 8, 1536},
+		{"multi_scalar", 10, 2000, 0}, {"multi_vector", 10, 100, 1536},
+	} {
+		for _, encoded := range []bool{false, true} {
+			b.Run(fmt.Sprintf("%s/encoded=%t", tc.name, encoded), func(b *testing.B) {
+				nq, topK := int64(tc.nq), int64(tc.topK)
+				data := newSearchData(nq, topK)
+				n := tc.nq * tc.topK
+				values, err := typeutil.NewFieldDataBuilder(schemapb.DataType_Int64, false, n)
+				require.NoError(b, err)
+				for q := range tc.nq {
+					data.Topks[q] = topK
+					for i := range tc.topK {
+						typeutil.AppendPKs(data.Ids, int64(i+1))
+						data.Scores = append(data.Scores, 1/float32(i+1))
+						values.Add(int64(i + 1))
+					}
+				}
+				data.FieldsData = []*schemapb.FieldData{values.Build()}
+				if tc.dim > 0 {
+					data.FieldsData = append(data.FieldsData, &schemapb.FieldData{Type: schemapb.DataType_FloatVector, FieldId: 101,
+						Field: &schemapb.FieldData_Vectors{Vectors: &schemapb.VectorField{Dim: int64(tc.dim),
+							Data: &schemapb.VectorField_FloatVector{FloatVector: &schemapb.FloatArray{Data: make([]float32, n*tc.dim)}}}}})
+				}
+				var blob []byte
+				if encoded {
+					blob, err = proto.Marshal(data)
+					require.NoError(b, err)
+					data = nil
+				}
+				calls := 0
+				send := func(chunk *internalpb.SearchResults) error {
+					calls++
+					_, err := proto.Marshal(chunk)
+					return err
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					r := &internalpb.SearchResults{NumQueries: nq, TopK: topK, ResultData: data, SlicedBlob: blob}
+					if err := SplitSearchResult(r, nq, topK, 256*1024, send); err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.ReportMetric(float64(calls)/float64(b.N), "chunks/op")
+			})
+		}
 	}
 }

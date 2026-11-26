@@ -182,20 +182,42 @@ func SplitSearchResult(result *internalpb.SearchResults, nq, topK int64, chunkBy
 		return send(result)
 	}
 
-	first := true
-	chunk := newSearchData(nq, topK)
-	size := 0
+	var buffer orderedChildBuffer
+	buffer.accept(data)
+	// Sizing can read ahead of copying. Only allocate a copy cursor's field
+	// indexes when a split is necessary; both cursors then move forward.
+	copyCursor := buffer
 	groupFields := append([]*schemapb.FieldData{}, data.GetGroupByFieldValues()...)
 	singular := data.GetGroupByFieldValue() != nil
 	if singular {
 		groupFields = append(groupFields, data.GetGroupByFieldValue())
 	}
-	groupValues := make([]func(int) any, len(groupFields))
-	for i, field := range groupFields {
-		groupValues[i] = typeutil.GetDataIterator(field)
-	}
-	start, end := 0, 0
-	emit := func() error {
+	var groupValues []func(int) any
+	start := 0
+	emit := func(end int) error {
+		if start == 0 && end == len(data.Scores) {
+			for _, field := range groupFields {
+				// Keep the same group-type validation as the copying path.
+				if _, err := typeutil.NewFieldDataBuilder(field.GetType(), true, 0); err != nil {
+					return err
+				}
+			}
+			result.NumQueries, result.TopK = nq, topK
+			return send(result) // Preserve the original ResultData or SlicedBlob.
+		}
+		if start == 0 {
+			copyCursor.fields = typeutil.NewFieldDataIdxComputer(data.GetFieldsData())
+			groupValues = make([]func(int) any, len(groupFields))
+			for i, field := range groupFields {
+				groupValues[i] = typeutil.GetDataIterator(field)
+			}
+		}
+		chunk := newSearchData(nq, topK)
+		for copyCursor.row < int64(end) {
+			appendSearchHit(chunk, data, copyCursor.query, copyCursor.row, copyCursor.fields.Compute(copyCursor.row))
+			copyCursor.row++
+			copyCursor.advanceQuery()
+		}
 		for i, field := range groupFields {
 			builder, err := typeutil.NewFieldDataBuilder(field.GetType(), true, end-start)
 			if err != nil {
@@ -217,47 +239,39 @@ func SplitSearchResult(result *internalpb.SearchResults, nq, topK int64, chunkBy
 				chunk.GroupByFieldValues = append(chunk.GroupByFieldValues, group)
 			}
 		}
-		start = end
 		out := &internalpb.SearchResults{Status: result.Status, MetricType: result.MetricType, NumQueries: nq, TopK: topK}
-		if first {
-			first = false
+		if start == 0 {
 			out = result
 			out.SlicedBlob, out.SlicedNumCount, out.SlicedOffset = nil, 0, 0
 			chunk.AllSearchCount = data.AllSearchCount
 		}
 		out.ResultData = chunk
 		out.NumQueries, out.TopK = nq, topK
+		start = end
 		return send(out)
 	}
 
-	buffer := orderedChildBuffer{}
-	buffer.accept(data)
-	for buffer.data != nil {
+	size := 0
+	for row := range data.Scores {
+		buffer.row = int64(row)
 		indexes := buffer.fields.Compute(buffer.row)
 		bytes, err := buffer.reducibleByteSize(indexes)
 		if err != nil {
 			return err
 		}
 		if bytes > chunkBytes && size > 0 {
-			if err := emit(); err != nil {
+			if err := emit(row); err != nil {
 				return err
 			}
-			chunk, size = newSearchData(nq, topK), 0
+			size = 0
 		}
-		appendSearchHit(chunk, data, buffer.query, buffer.row, indexes)
-		end++
-		buffer.row++
-		buffer.advanceQuery()
 		size += bytes
-		if size >= chunkBytes {
-			if err := emit(); err != nil {
+		if size >= chunkBytes || row == len(data.Scores)-1 {
+			if err := emit(row + 1); err != nil {
 				return err
 			}
-			chunk, size = newSearchData(nq, topK), 0
+			size = 0
 		}
-	}
-	if size > 0 {
-		return emit()
 	}
 	return nil
 }
