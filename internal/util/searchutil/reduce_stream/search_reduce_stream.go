@@ -20,6 +20,7 @@ import (
 	"io"
 	"slices"
 	"sync"
+	"unsafe"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/util/reduce"
@@ -349,6 +350,7 @@ func NewShardReduceStream(request *internalpb.SearchRequest, streams []ReduceStr
 func NewHybridGroupReduceStream(request *internalpb.SearchRequest, streams []ReduceStream, pkType schemapb.DataType, maxOutputBytes int64, chunkBytes int) *OrderedReduceStream {
 	s := NewReduceStream(request, streams, pkType, maxOutputBytes, chunkBytes)
 	s.preserveCandidates = true
+	s.offset = 0   // Fusion receives every candidate, including the prefix before the offset.
 	s.groups = nil // The vchannels have already applied their group limits.
 	return s
 }
@@ -524,8 +526,8 @@ merge:
 			}
 			b.row++
 			b.advanceQuery()
-			// Proxy checks ungrouped output even for one vchannel. Grouped output is charged
-			// after group OFFSET in the pipeline. Shards keep Batch's multi-worker check.
+			// Ordinary grouped Search checks quota after group OFFSET. Grouped Hybrid
+			// checks below with the emitted group columns. Shards keep Batch's multi-worker check.
 			if s.outputBytes > s.maxOutputBytes && ((!s.dedupByPK && len(s.groupByFieldIDs) == 0) ||
 				(s.dedupByPK && s.numResults > 1)) {
 				return nil, merr.WrapErrParameterInvalidMsg("search results exceed the maxOutputSize Limit %d", s.maxOutputBytes)
@@ -545,12 +547,26 @@ merge:
 	s.metadataSent = true
 	for i, builder := range groupBuilders {
 		field := builder.Build()
+		if s.preserveCandidates {
+			// Match AppendFieldData: count dense output slots, even for NULL keys.
+			switch field.GetType() {
+			case schemapb.DataType_Int8, schemapb.DataType_Int16:
+				s.outputBytes += 4 * int64(len(field.GetScalars().GetIntData().GetData()))
+			case schemapb.DataType_VarChar:
+				s.outputBytes += int64(unsafe.Sizeof("")) * int64(len(field.GetScalars().GetStringData().GetData()))
+			default:
+				s.outputBytes += int64(typeutil.CalcScalarSize(field))
+			}
+		}
 		field.FieldId, field.FieldName = s.groupByFieldIDs[i], groupNames[i]
 		// A later Chunk can contain NULL even if this Chunk has only valid keys.
 		if len(typeutil.GetFieldDataValidData(field)) == 0 {
 			typeutil.SetFieldDataValidData(field, slices.Repeat([]bool{true}, len(data.Scores)))
 		}
 		data.GroupByFieldValues = append(data.GroupByFieldValues, field)
+	}
+	if s.preserveCandidates && s.outputBytes > s.maxOutputBytes {
+		return nil, merr.WrapErrParameterInvalidMsg("search results exceed the maxOutputSize Limit %d", s.maxOutputBytes)
 	}
 	if s.numResults != 0 {
 		out.ResultData = data

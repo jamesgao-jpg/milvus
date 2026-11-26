@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"testing"
+	"unsafe"
 
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -105,6 +106,66 @@ func TestConsumeSearchStreamSingleVChannelQuota(t *testing.T) {
 				require.NoError(t, err)
 			}
 		})
+	}
+}
+
+func TestGroupedSearchRetainedKeyQuota(t *testing.T) {
+	quota := &paramtable.Get().QuotaConfig.MaxOutputSize
+	ids := []int64{1, 2}
+	single := genSearchResultData(1, 2, ids, []float32{-1, -2})
+	single.Topks[0] = 2
+	single.FieldsData = []*schemapb.FieldData{getFieldData("value", 100, schemapb.DataType_Int64, ids, 1)}
+	single.GroupByFieldValue = getFieldData("group", 101, schemapb.DataType_Int64, []int64{10, 20}, 1)
+	composite := genSearchResultData(1, 1, ids, []float32{-1, -2})
+	composite.Topks[0] = 2
+	number, err := typeutil.NewFieldDataBuilder(schemapb.DataType_Int8, false, 2)
+	require.NoError(t, err)
+	key := number.Add(nil).Add(nil).Build()
+	key.FieldId = 101
+	composite.GroupByFieldValues = []*schemapb.FieldData{key, getFieldData("name", 102, schemapb.DataType_VarChar, []string{"x", "x"}, 1)}
+	compositeBytes := int64(2 * (4 + unsafe.Sizeof("")))
+
+	for _, tc := range []struct {
+		name          string
+		data          *schemapb.SearchResultData
+		info          *planpb.QueryInfo
+		offset, bytes int64
+		aggregation   bool
+		wantIDs       []int64
+	}{
+		{"single", single, &planpb.QueryInfo{GroupByFieldId: 101, GroupSize: 1}, 0, 32, false, ids},
+		{"skip first group", single, &planpb.QueryInfo{GroupByFieldId: 101, GroupSize: 1}, 1, 16, false, ids[1:]},
+		{"composite", composite, &planpb.QueryInfo{GroupByFieldIds: []int64{101, 102}, GroupSize: 2}, 0, compositeBytes, false, ids},
+		{"aggregation", composite, &planpb.QueryInfo{GroupByFieldIds: []int64{101, 102}, GroupSize: 2}, 0, compositeBytes, true, ids},
+	} {
+		for _, path := range []string{"Batch", "ReduceStream"} {
+			for _, cap := range []int64{tc.bytes, tc.bytes - 1} {
+				t.Run(fmt.Sprintf("%s/%s/quota%d", tc.name, path, cap), func(t *testing.T) {
+					defer quota.SwapTempValue(quota.SwapTempValue(fmt.Sprint(cap)))
+					result := &internalpb.SearchResults{Status: merr.Success(), MetricType: "L2", ResultData: proto.CloneOf(tc.data)}
+					if path == "ReduceStream" {
+						req := &internalpb.SearchRequest{Nq: 1, Topk: tc.data.TopK, Offset: tc.offset, GroupSize: tc.info.GroupSize, GroupByFieldId: tc.info.GroupByFieldId, GroupByFieldIds: tc.info.GroupByFieldIds}
+						leader := &grpcSearchStream{rpc: &testLeaderSearchStream{ctx: t.Context()}, first: result, cancel: func() {}}
+						stream := searchreducestream.NewReduceStream(req, []searchreducestream.ReduceStream{leader}, schemapb.DataType_Int64, cap, 1)
+						var err error
+						result, err = consumeSearchResultStream(t.Context(), stream)
+						require.NoError(t, err)
+					}
+					final, err := reduceResults(t.Context(), []*internalpb.SearchResults{result}, 1, tc.data.TopK, tc.offset, "L2", schemapb.DataType_Int64, tc.info, false, tc.aggregation, 0, nil, false)
+					if cap < tc.bytes {
+						require.ErrorIs(t, err, merr.ErrParameterInvalid)
+						require.ErrorContains(t, err, "maxOutputSize")
+						return
+					}
+					require.NoError(t, err)
+					require.Equal(t, tc.wantIDs, final.GetResults().GetIds().GetIntId().GetData())
+					if tc.data == composite {
+						require.Equal(t, []bool{false, false}, final.GetResults().GetGroupByFieldValues()[0].GetValidData())
+						require.Equal(t, []string{"x", "x"}, final.GetResults().GetGroupByFieldValues()[1].GetScalars().GetStringData().GetData())
+					}
+				})
+			}
+		}
 	}
 }
 
@@ -268,6 +329,34 @@ func TestSearchStreamFallsBackToUnaryBeforeFirstChunk(t *testing.T) {
 	require.Same(t, batch, result)
 	_, err = stream.Recv()
 	require.ErrorIs(t, err, io.EOF)
+}
+
+func TestHybridGroupReduceStreamPreFusionQuota(t *testing.T) {
+	for _, tc := range []struct{ limit, offset int64 }{{32, 0}, {31, 0}, {32, 1}, {31, 1}} {
+		t.Run(fmt.Sprintf("quota%d/offset%d", tc.limit, tc.offset), func(t *testing.T) {
+			req := &internalpb.SearchRequest{Nq: 1, Topk: 1 + tc.offset, Offset: tc.offset, GroupByFieldId: 101, GroupSize: 1}
+			var inputs []searchreducestream.ReduceStream
+			for _, id := range []int64{1, 2} {
+				data := genSearchResultData(1, req.Topk, []int64{id}, []float32{-float32(id)})
+				data.Topks[0] = 1
+				data.FieldsData = []*schemapb.FieldData{getFieldData("value", 100, schemapb.DataType_Int64, []int64{id}, 1)}
+				data.GroupByFieldValue = getFieldData("group", 101, schemapb.DataType_Int64, []int64{7}, 1)
+				chunk := &internalpb.SearchResults{Status: merr.Success(), MetricType: "L2", ResultData: data}
+				leader := &testLeaderSearchStream{ctx: t.Context(), chunks: []*internalpb.SearchResults{chunk}}
+				inputs = append(inputs, &grpcSearchStream{rpc: leader, cancel: func() {}})
+			}
+			stream := searchreducestream.NewHybridGroupReduceStream(req, inputs, schemapb.DataType_Int64, tc.limit, 1)
+			got, err := consumeSearchResultStream(t.Context(), stream)
+			if tc.limit < 32 {
+				require.ErrorIs(t, err, merr.ErrParameterInvalid)
+				require.ErrorContains(t, err, "maxOutputSize")
+				require.Nil(t, got)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, []int64{1, 2}, got.GetResultData().GetIds().GetIntId().GetData())
+		})
+	}
 }
 
 func TestHybridGroupReduceStreamBatchParity(t *testing.T) {
