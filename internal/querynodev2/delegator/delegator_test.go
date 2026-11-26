@@ -2843,7 +2843,7 @@ func TestDelegatorSearchBM25InvalidMetricType(t *testing.T) {
 		latestRequiredMVCCTimeTick: atomic.NewUint64(0),
 	}
 
-	_, err := sd.search(context.Background(), searchReq, []SnapshotItem{}, []SegmentEntry{}, map[int64]int64{})
+	_, err := sd.search(context.Background(), searchReq, []SnapshotItem{}, []SegmentEntry{}, map[int64]int64{}, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "must use BM25 metric type when searching against BM25 Function output field")
 }

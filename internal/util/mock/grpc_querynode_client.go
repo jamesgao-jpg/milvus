@@ -20,6 +20,8 @@ import (
 	"context"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
@@ -86,6 +88,17 @@ func (m *GrpcQueryNodeClient) Search(ctx context.Context, in *querypb.SearchRequ
 	return &internalpb.SearchResults{}, m.Err
 }
 
+func (m *GrpcQueryNodeClient) SearchStream(context.Context, ...grpc.CallOption) (querypb.QueryNode_SearchStreamClient, error) {
+	if m.Err != nil {
+		return nil, m.Err
+	}
+	return nil, status.Error(codes.Unimplemented, "SearchStream not configured")
+}
+
+func (m *GrpcQueryNodeClient) SearchSegmentsStream(ctx context.Context, opts ...grpc.CallOption) (querypb.QueryNode_SearchSegmentsStreamClient, error) {
+	return m.SearchStream(ctx, opts...)
+}
+
 func (m *GrpcQueryNodeClient) SearchSegments(ctx context.Context, in *querypb.SearchRequest, opts ...grpc.CallOption) (*internalpb.SearchResults, error) {
 	return &internalpb.SearchResults{}, m.Err
 }
@@ -96,6 +109,13 @@ func (m *GrpcQueryNodeClient) Query(ctx context.Context, in *querypb.QueryReques
 
 func (m *GrpcQueryNodeClient) QueryStream(ctx context.Context, in *querypb.QueryRequest, opts ...grpc.CallOption) (querypb.QueryNode_QueryStreamClient, error) {
 	return &streamrpc.LocalQueryClient{}, m.Err
+}
+
+func (m *GrpcQueryNodeClient) QueryReduceStream(context.Context, ...grpc.CallOption) (querypb.QueryNode_QueryReduceStreamClient, error) {
+	if m.Err != nil {
+		return nil, m.Err
+	}
+	return nil, status.Error(codes.Unimplemented, "QueryReduceStream not configured")
 }
 
 func (m *GrpcQueryNodeClient) QuerySegments(ctx context.Context, in *querypb.QueryRequest, opts ...grpc.CallOption) (*internalpb.RetrieveResults, error) {

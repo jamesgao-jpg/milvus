@@ -79,6 +79,10 @@ type CollectionWorkLoad struct {
 	// than vanishing from the answer. See ChannelWorkload.ResourceGroup.
 	ResourceGroup  string
 	PreferredNodes map[string]int64
+
+	// CancelOnFailure stops sibling stream opens after a channel exhausts
+	// its retries. Successful opens must outlive Execute.
+	CancelOnFailure context.CancelCauseFunc
 }
 
 // ForChannel derives the ChannelWorkload for one shard of w, carrying every
@@ -536,7 +540,11 @@ func (lb *LBPolicyImpl) Execute(ctx context.Context, workload CollectionWorkLoad
 	wg, _ := errgroup.WithContext(ctx)
 	for _, channel := range channelList {
 		wg.Go(func() error {
-			return lb.ExecuteWithRetry(ctx, workload.ForChannel(channel, preferredNodeID(workload, channel)))
+			err := lb.ExecuteWithRetry(ctx, workload.ForChannel(channel, preferredNodeID(workload, channel)))
+			if err != nil && workload.CancelOnFailure != nil {
+				workload.CancelOnFailure(err)
+			}
+			return err
 		})
 	}
 	return wg.Wait()

@@ -207,7 +207,7 @@ func (op *OrderByLimitOperator) compareRowsAt(result *internalpb.RetrieveResults
 	fieldsData := result.GetFieldsData()
 	for i, field := range op.orderByFields {
 		fd := fieldsData[op.fieldPositions[i]]
-		cmp := op.compareFieldValuesAt(fd, idx1, idx2, field)
+		cmp := compareOrderByValues(fd, idx1, fd, idx2, field.DataType, field.Ascending, field.NullsFirst)
 		if cmp != 0 {
 			return cmp
 		}
@@ -226,33 +226,33 @@ func (op *OrderByLimitOperator) compareRowsAt(result *internalpb.RetrieveResults
 	return 0
 }
 
-// compareFieldValuesAt compares two values in the same field at different indices.
-func (op *OrderByLimitOperator) compareFieldValuesAt(fd *schemapb.FieldData, idx1, idx2 int, field *orderby.OrderByField) int {
-	val1, null1 := getFieldValue(fd, idx1)
-	val2, null2 := getFieldValue(fd, idx2)
+// Batch rows may share a column; stream heads can belong to different Chunks.
+func compareOrderByValues(left *schemapb.FieldData, idx1 int, right *schemapb.FieldData, idx2 int, dataType schemapb.DataType, ascending, nullsFirst bool) int {
+	val1, null1 := getFieldValue(left, idx1)
+	val2, null2 := getFieldValue(right, idx2)
 
 	// Handle nulls
 	if null1 && null2 {
 		return 0
 	}
 	if null1 {
-		if field.NullsFirst {
+		if nullsFirst {
 			return -1
 		}
 		return 1
 	}
 	if null2 {
-		if field.NullsFirst {
+		if nullsFirst {
 			return 1
 		}
 		return -1
 	}
 
 	// Compare actual values
-	cmp := compareValues(val1, val2, field.DataType)
+	cmp := compareValues(val1, val2, dataType)
 
 	// Apply ascending/descending
-	if !field.Ascending {
+	if !ascending {
 		cmp = -cmp
 	}
 

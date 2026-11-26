@@ -1562,6 +1562,9 @@ func getFieldValue(fd *schemapb.FieldData, rowIdx int) (any, bool) {
 	return nil, true
 }
 
+// GetRowCount counts groups by their field rows, even when the result has no IDs.
+func GetRowCount(result *internalpb.RetrieveResults) int { return getRowCount(result) }
+
 // getRowCount returns the number of rows in the result.
 func getRowCount(result *internalpb.RetrieveResults) int {
 	// Try to get count from IDs first (most reliable)

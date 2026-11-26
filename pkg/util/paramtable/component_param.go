@@ -2499,6 +2499,9 @@ type AccessLogConfig struct {
 }
 
 type proxyConfig struct {
+	EnableReduceStream     ParamItem `refreshable:"true"`
+	ReduceStreamChunkBytes ParamItem `refreshable:"true"`
+
 	// Alias  string
 	SoPath ParamItem `refreshable:"false"`
 
@@ -2587,6 +2590,24 @@ func positiveProxyLimitFormatter(defaultValue string) func(string) string {
 }
 
 func (p *proxyConfig) init(base *BaseTable) {
+	p.EnableReduceStream = ParamItem{
+		Key:          "proxy.enableReduceStream",
+		Version:      "3.0.6",
+		DefaultValue: "false",
+		Doc:          "Enable streaming reduction for eligible plain ANN Search requests.",
+		Export:       true,
+	}
+	p.EnableReduceStream.Init(base.mgr)
+	p.ReduceStreamChunkBytes = ParamItem{
+		Key:          "proxy.reduceStreamChunkBytes",
+		Version:      "3.0.6",
+		DefaultValue: "262144",
+		Formatter:    positiveProxyLimitFormatter("262144"),
+		Doc:          "Target reducible-payload bytes per Chunk for streaming reduction.",
+		Export:       true,
+	}
+	p.ReduceStreamChunkBytes.Init(base.mgr)
+
 	p.ExprParseCacheEnabled = ParamItem{
 		Key:          "proxy.exprParseCache.enabled",
 		Version:      "3.0.6",

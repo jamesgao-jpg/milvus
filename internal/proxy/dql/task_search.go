@@ -1375,7 +1375,6 @@ func (t *SearchTask) tryParsePartitionIDsFromPlan(plan *planpb.PlanNode) ([]int6
 func (t *SearchTask) Execute(ctx context.Context) error {
 	ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-Search-Execute")
 	defer sp.End()
-	log := mlog.WithLazy(mlog.Int64("nq", t.GetNq()))
 
 	tr := timerecord.NewTimeRecorder(fmt.Sprintf("proxy execute search %d", t.ID()))
 	defer tr.CtxElapse(ctx, "done")
@@ -1392,6 +1391,15 @@ func (t *SearchTask) Execute(ctx context.Context) error {
 		Nq:             t.Nq,
 		Exec:           t.searchShard,
 	}
+	cfg := &paramtable.Get().ProxyCfg
+	if cfg.EnableReduceStream.GetAsBool() && t.supportsStreamingReduce() {
+		return t.executeSearchStream(ctx, workload, cfg.ReduceStreamChunkBytes.GetAsInt64())
+	}
+	return t.executeSearch(ctx, workload)
+}
+
+func (t *SearchTask) executeSearch(ctx context.Context, workload shardclient.CollectionWorkLoad) error {
+	log := mlog.WithLazy(mlog.Int64("nq", t.GetNq()))
 	if NamespacePartitionKeyModeEnabled(t.schema.CollectionSchema) && t.request.Namespace != nil {
 		channelNames, err := t.chMgr.GetVChannels(t.CollectionID)
 		if err != nil {
@@ -1646,13 +1654,7 @@ func (t *SearchTask) PostExecute(ctx context.Context) error {
 
 func (t *SearchTask) searchShard(ctx context.Context, nodeID int64, qn types.QueryNodeClient, channel string) error {
 	ctx = retry.WithMaxAttemptsContext(ctx, 1)
-	searchReq := shallowcopy.ShallowCopySearchRequest(t.SearchRequest, nodeID)
-	req := &querypb.SearchRequest{
-		Req:             searchReq,
-		DmlChannels:     []string{channel},
-		Scope:           querypb.DataScope_All,
-		TotalChannelNum: int32(1),
-	}
+	req := t.shardSearchRequest(nodeID, channel)
 
 	log := mlog.With(mlog.Int64("collection", t.GetCollectionID()),
 		mlog.Int64s("partitionIDs", t.GetPartitionIDs()),
@@ -1691,6 +1693,15 @@ func (t *SearchTask) searchShard(ctx context.Context, nodeID int64, qn types.Que
 	t.lb.UpdateCostMetrics(nodeID, result.CostAggregation)
 
 	return nil
+}
+
+func (t *SearchTask) shardSearchRequest(nodeID int64, channel string) *querypb.SearchRequest {
+	return &querypb.SearchRequest{
+		Req:             shallowcopy.ShallowCopySearchRequest(t.SearchRequest, nodeID),
+		DmlChannels:     []string{channel},
+		Scope:           querypb.DataScope_All,
+		TotalChannelNum: 1,
+	}
 }
 
 func (t *SearchTask) estimateResultSize(nq int64, topK int64) (int64, error) {

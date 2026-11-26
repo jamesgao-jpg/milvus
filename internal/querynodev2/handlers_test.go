@@ -224,7 +224,7 @@ func TestQueryChannelReportsExecutedSnapshot(t *testing.T) {
 			}).Build()
 			defer reduce.UnPatch()
 			req := &querypb.QueryRequest{Req: &internalpb.RetrieveRequest{Base: &commonpb.MsgBase{}, CollectionID: 1}, DmlChannels: []string{"ch0"}}
-			result, err := node.queryChannel(context.Background(), req, "ch0")
+			result, err := node.queryChannel(context.Background(), req, "ch0", nil)
 			if name == "query_error" || name == "reduce_error" || name == "channel_missing" || name == "collection_missing" {
 				require.Error(t, err)
 				require.Nil(t, result)

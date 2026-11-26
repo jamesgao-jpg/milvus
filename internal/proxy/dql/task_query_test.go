@@ -18,6 +18,7 @@ package dql
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"sync"
 	"testing"
@@ -36,10 +37,12 @@ import (
 	"github.com/milvus-io/milvus/internal/proxy/metacache"
 	"github.com/milvus-io/milvus/internal/proxy/shardclient"
 	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/internal/util/queryutil"
 	"github.com/milvus-io/milvus/internal/util/reduce"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/planpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
 	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
@@ -2111,4 +2114,122 @@ func TestQueryTask_CanSkipAllocTimestamp(t *testing.T) {
 		skip = qt2.CanSkipAllocTimestamp()
 		assert.True(t, skip)
 	})
+}
+
+type orderByTestStream struct {
+	queryutil.ReduceStream
+	first           *internalpb.RetrieveResults
+	end             error
+	drained, closed bool
+}
+
+func (s *orderByTestStream) Recv() (*internalpb.RetrieveResults, error) {
+	if s.first != nil {
+		first := s.first
+		s.first = nil
+		return first, nil
+	}
+	s.drained = true
+	return nil, s.end
+}
+
+func (s *orderByTestStream) Close() error { s.closed = true; return nil }
+
+func TestConsumeQueryStreamQuota(t *testing.T) {
+	quota := &paramtable.Get().QuotaConfig.MaxOutputSize
+	req := &internalpb.RetrieveRequest{Limit: typeutil.Unlimited}
+	for _, chunkBytes := range []int64{1, 1024} {
+		for _, cap := range []int{15, 16} {
+			t.Run(fmt.Sprintf("chunk%d/quota%d", chunkBytes, cap), func(t *testing.T) {
+				defer quota.SwapTempValue(quota.SwapTempValue(fmt.Sprint(cap)))
+				var channels []queryutil.ReduceStream
+				for _, id := range []int64{1, 2} {
+					ids := &schemapb.IDs{}
+					typeutil.AppendPKs(ids, id)
+					channels = append(channels, &orderByTestStream{end: io.EOF, first: &internalpb.RetrieveResults{
+						Status: merr.Success(), Ids: ids, FieldsData: []*schemapb.FieldData{
+							getFieldData("value", 100, schemapb.DataType_Int64, []int64{id}, 1),
+						},
+					}})
+				}
+				stream := queryutil.NewOrderedReduceStream(req, nil, channels, false, chunkBytes)
+				got, err := consumeQueryResultStream(t.Context(), stream, req)
+				if cap < 16 {
+					require.ErrorIs(t, err, merr.ErrParameterInvalid)
+					require.Equal(t, merr.Code(merr.ErrParameterInvalid), merr.Code(err))
+					require.Nil(t, got)
+				} else {
+					require.NoError(t, err)
+					require.Equal(t, []int64{1, 2}, got.GetIds().GetIntId().GetData())
+					require.Equal(t, []int64{1, 2}, got.FieldsData[0].GetScalars().GetLongData().GetData())
+				}
+				for _, child := range channels {
+					require.True(t, child.(*orderByTestStream).closed)
+				}
+			})
+		}
+	}
+	t.Run("element indices count toward quota", func(t *testing.T) {
+		defer quota.SwapTempValue(quota.SwapTempValue("8"))
+		ids := &schemapb.IDs{}
+		typeutil.AppendPKs(ids, int64(1))
+		s := &orderByTestStream{end: io.EOF, first: &internalpb.RetrieveResults{
+			Ids: ids, ElementLevel: true, ElementIndices: []*internalpb.ElementIndices{{Indices: []int32{1}}},
+			FieldsData: []*schemapb.FieldData{getFieldData("value", 100, schemapb.DataType_Int64, []int64{1}, 1)},
+		}}
+		got, err := consumeQueryResultStream(t.Context(), s, req)
+		require.ErrorIs(t, err, merr.ErrParameterInvalid)
+		require.Nil(t, got)
+	})
+	t.Run("aggregate columns with the same field ID", func(t *testing.T) {
+		req := &internalpb.RetrieveRequest{Aggregates: []*planpb.Aggregate{
+			{Op: planpb.AggregateOp_min, FieldId: 100}, {Op: planpb.AggregateOp_max, FieldId: 100},
+		}}
+		for _, cap := range []int{15, 16} {
+			t.Run(fmt.Sprint(cap), func(t *testing.T) {
+				defer quota.SwapTempValue(quota.SwapTempValue(fmt.Sprint(cap)))
+				s := &orderByTestStream{end: io.EOF, first: &internalpb.RetrieveResults{
+					FieldsData: []*schemapb.FieldData{
+						getFieldData("min", 100, schemapb.DataType_Int64, []int64{3}, 1),
+						getFieldData("max", 100, schemapb.DataType_Int64, []int64{7}, 1),
+					},
+				}}
+				got, err := consumeQueryResultStream(t.Context(), s, req)
+				if cap < 16 {
+					require.ErrorIs(t, err, merr.ErrParameterInvalid)
+					require.Nil(t, got)
+				} else {
+					require.NoError(t, err)
+					require.Equal(t, []int64{3}, got.FieldsData[0].GetScalars().GetLongData().GetData())
+					require.Equal(t, []int64{7}, got.FieldsData[1].GetScalars().GetLongData().GetData())
+				}
+			})
+		}
+	})
+}
+
+func TestConsumeOrderByStreamPastWindow(t *testing.T) {
+	quota := &paramtable.Get().QuotaConfig.MaxOutputSize
+	defer quota.SwapTempValue(quota.SwapTempValue("8")) // Only the retained int64 counts.
+	req := &internalpb.RetrieveRequest{Limit: 1, OrderByFields: []*planpb.OrderByField{{FieldId: 100}}}
+	for _, end := range []error{io.EOF, merr.ErrDataIntegrity} {
+		s := &orderByTestStream{end: end, first: &internalpb.RetrieveResults{
+			AllRetrieveCount: 3,
+			Ids:              &schemapb.IDs{IdField: &schemapb.IDs_IntId{IntId: &schemapb.LongArray{Data: []int64{8, 2}}}},
+			FieldsData: []*schemapb.FieldData{{Type: schemapb.DataType_Int64, FieldId: 100, Field: &schemapb.FieldData_Scalars{
+				Scalars: &schemapb.ScalarField{Data: &schemapb.ScalarField_LongData{LongData: &schemapb.LongArray{Data: []int64{10, 15}}}},
+			}}},
+		}}
+		result, err := consumeQueryResultStream(t.Context(), s, req)
+		require.True(t, s.drained)
+		require.True(t, s.closed)
+		if end != io.EOF {
+			require.ErrorIs(t, err, end)
+			require.Nil(t, result)
+		} else {
+			require.NoError(t, err)
+			require.Equal(t, []int64{8}, result.GetIds().GetIntId().GetData())
+			require.EqualValues(t, 3, result.GetAllRetrieveCount())
+		}
+	}
 }

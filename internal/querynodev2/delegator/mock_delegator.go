@@ -901,6 +901,54 @@ func (_c *MockShardDelegator_Query_Call) RunAndReturn(run func(context.Context, 
 	return _c
 }
 
+// QueryReduceStream provides a mock function with given fields: ctx, req, send
+func (_m *MockShardDelegator) QueryReduceStream(ctx context.Context, req *querypb.QueryRequest, send func(*internalpb.RetrieveResults) error) error {
+	ret := _m.Called(ctx, req, send)
+
+	if len(ret) == 0 {
+		panic("no return value specified for QueryReduceStream")
+	}
+
+	var r0 error
+	if rf, ok := ret.Get(0).(func(context.Context, *querypb.QueryRequest, func(*internalpb.RetrieveResults) error) error); ok {
+		r0 = rf(ctx, req, send)
+	} else {
+		r0 = ret.Error(0)
+	}
+
+	return r0
+}
+
+// MockShardDelegator_QueryReduceStream_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'QueryReduceStream'
+type MockShardDelegator_QueryReduceStream_Call struct {
+	*mock.Call
+}
+
+// QueryReduceStream is a helper method to define mock.On call
+//   - ctx context.Context
+//   - req *querypb.QueryRequest
+//   - send func(*internalpb.RetrieveResults) error
+func (_e *MockShardDelegator_Expecter) QueryReduceStream(ctx interface{}, req interface{}, send interface{}) *MockShardDelegator_QueryReduceStream_Call {
+	return &MockShardDelegator_QueryReduceStream_Call{Call: _e.mock.On("QueryReduceStream", ctx, req, send)}
+}
+
+func (_c *MockShardDelegator_QueryReduceStream_Call) Run(run func(ctx context.Context, req *querypb.QueryRequest, send func(*internalpb.RetrieveResults) error)) *MockShardDelegator_QueryReduceStream_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(*querypb.QueryRequest), args[2].(func(*internalpb.RetrieveResults) error))
+	})
+	return _c
+}
+
+func (_c *MockShardDelegator_QueryReduceStream_Call) Return(_a0 error) *MockShardDelegator_QueryReduceStream_Call {
+	_c.Call.Return(_a0)
+	return _c
+}
+
+func (_c *MockShardDelegator_QueryReduceStream_Call) RunAndReturn(run func(context.Context, *querypb.QueryRequest, func(*internalpb.RetrieveResults) error) error) *MockShardDelegator_QueryReduceStream_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // QueryStream provides a mock function with given fields: ctx, req, srv
 func (_m *MockShardDelegator) QueryStream(ctx context.Context, req *querypb.QueryRequest, srv streamrpc.QueryStreamServer) error {
 	ret := _m.Called(ctx, req, srv)
@@ -1111,6 +1159,54 @@ func (_c *MockShardDelegator_Search_Call) Return(_a0 []*internalpb.SearchResults
 }
 
 func (_c *MockShardDelegator_Search_Call) RunAndReturn(run func(context.Context, *querypb.SearchRequest) ([]*internalpb.SearchResults, error)) *MockShardDelegator_Search_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// SearchReduceStream provides a mock function with given fields: ctx, req, send
+func (_m *MockShardDelegator) SearchReduceStream(ctx context.Context, req *querypb.SearchRequest, send func(*internalpb.SearchResults) error) error {
+	ret := _m.Called(ctx, req, send)
+
+	if len(ret) == 0 {
+		panic("no return value specified for SearchReduceStream")
+	}
+
+	var r0 error
+	if rf, ok := ret.Get(0).(func(context.Context, *querypb.SearchRequest, func(*internalpb.SearchResults) error) error); ok {
+		r0 = rf(ctx, req, send)
+	} else {
+		r0 = ret.Error(0)
+	}
+
+	return r0
+}
+
+// MockShardDelegator_SearchReduceStream_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'SearchReduceStream'
+type MockShardDelegator_SearchReduceStream_Call struct {
+	*mock.Call
+}
+
+// SearchReduceStream is a helper method to define mock.On call
+//   - ctx context.Context
+//   - req *querypb.SearchRequest
+//   - send func(*internalpb.SearchResults) error
+func (_e *MockShardDelegator_Expecter) SearchReduceStream(ctx interface{}, req interface{}, send interface{}) *MockShardDelegator_SearchReduceStream_Call {
+	return &MockShardDelegator_SearchReduceStream_Call{Call: _e.mock.On("SearchReduceStream", ctx, req, send)}
+}
+
+func (_c *MockShardDelegator_SearchReduceStream_Call) Run(run func(ctx context.Context, req *querypb.SearchRequest, send func(*internalpb.SearchResults) error)) *MockShardDelegator_SearchReduceStream_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(*querypb.SearchRequest), args[2].(func(*internalpb.SearchResults) error))
+	})
+	return _c
+}
+
+func (_c *MockShardDelegator_SearchReduceStream_Call) Return(_a0 error) *MockShardDelegator_SearchReduceStream_Call {
+	_c.Call.Return(_a0)
+	return _c
+}
+
+func (_c *MockShardDelegator_SearchReduceStream_Call) RunAndReturn(run func(context.Context, *querypb.SearchRequest, func(*internalpb.SearchResults) error) error) *MockShardDelegator_SearchReduceStream_Call {
 	_c.Call.Return(run)
 	return _c
 }

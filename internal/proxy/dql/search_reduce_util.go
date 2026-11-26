@@ -2,6 +2,7 @@ package dql
 
 import (
 	"context"
+	"unsafe"
 
 	"go.opentelemetry.io/otel"
 
@@ -162,14 +163,38 @@ func reduceSearchResultDataWithGroupBy(
 	}
 
 	maxOutputSize := paramtable.Get().QuotaConfig.MaxOutputSize.GetAsInt64()
+	// WriteGroupByFieldValues writes one dense scalar slot per key column per
+	// retained hit, including NULL. Match AppendFieldData's quota, not wire size.
+	var groupKeyBytes int64
+	for _, result := range subSearchResultData {
+		if typeutil.GetSizeOfIDs(result.GetIds()) == 0 {
+			continue
+		}
+		for _, id := range groupByFieldIDs {
+			dt := reduce.FindGroupByFieldData(result, id, singleFieldGroupBy).GetType()
+			switch dt {
+			case schemapb.DataType_Bool:
+				groupKeyBytes++
+			case schemapb.DataType_Int8, schemapb.DataType_Int16, schemapb.DataType_Int32:
+				groupKeyBytes += 4 // All three use IntArray.
+			case schemapb.DataType_Int64, schemapb.DataType_Timestamptz:
+				groupKeyBytes += 8
+			case schemapb.DataType_VarChar:
+				groupKeyBytes += int64(unsafe.Sizeof(""))
+			default:
+				return ret, merr.WrapErrParameterInvalidMsg("not supported field type: %s", dt)
+			}
+		}
+		break // All inputs use the same group columns.
+	}
 
 	var acceptedRows []reduce.RowRef
 	if len(groupByFieldIDs) == 1 {
 		acceptedRows, err = runSingleFieldGroupByHotLoop(ctx, ret, subSearchResultData, subSearchNqOffset, idxComputers,
-			nq, offset, groupSize, limit, groupBound, groupByFieldIDs[0], maxOutputSize)
+			nq, offset, groupSize, limit, groupBound, groupByFieldIDs[0], groupKeyBytes, maxOutputSize)
 	} else {
 		acceptedRows, err = runMultiFieldGroupByHotLoop(ctx, ret, subSearchResultData, subSearchNqOffset, idxComputers,
-			nq, offset, groupSize, limit, groupBound, groupByFieldIDs, maxOutputSize, isSearchAggregation)
+			nq, offset, groupSize, limit, groupBound, groupByFieldIDs, groupKeyBytes, maxOutputSize, isSearchAggregation)
 	}
 	if err != nil {
 		return nil, err
@@ -199,7 +224,7 @@ func runSingleFieldGroupByHotLoop(
 	idxComputers []*typeutil.FieldDataIdxComputer,
 	nq, offset, groupSize, limit, groupBound int64,
 	groupByFieldID int64,
-	maxOutputSize int64,
+	groupKeyBytes, maxOutputSize int64,
 ) ([]reduce.RowRef, error) {
 	subSearchNum := len(subSearchResultData)
 	subSearchGroupByValIterator := make([]func(int) any, subSearchNum)
@@ -236,6 +261,10 @@ func runSingleFieldGroupByHotLoop(
 			} else if exists && int64(len(bucket)) >= groupSize {
 				// group full
 			} else {
+				retSize += groupKeyBytes
+				if retSize > maxOutputSize {
+					return nil, merr.WrapErrParameterInvalidMsg("search results exceed the maxOutputSize Limit %d", maxOutputSize)
+				}
 				if !exists {
 					groupByValList = append(groupByValList, groupByVal)
 				}
@@ -253,6 +282,9 @@ func runSingleFieldGroupByHotLoop(
 				if len(ret.Results.FieldsData) > 0 {
 					fieldIdxs := idxComputers[ref.ResultIdx].Compute(ref.RowIdx)
 					retSize += typeutil.AppendFieldData(ret.Results.FieldsData, subResData.FieldsData, ref.RowIdx, fieldIdxs...)
+					if retSize > maxOutputSize {
+						return nil, merr.WrapErrParameterInvalidMsg("search results exceed the maxOutputSize Limit %d", maxOutputSize)
+					}
 				}
 				typeutil.AppendPKs(ret.Results.Ids, typeutil.GetPK(subResData.GetIds(), ref.RowIdx))
 				ret.Results.Scores = append(ret.Results.Scores, subResData.GetScores()[ref.RowIdx])
@@ -271,10 +303,6 @@ func runSingleFieldGroupByHotLoop(
 		}
 		realTopK = j
 		ret.Results.Topks = append(ret.Results.Topks, realTopK)
-
-		if retSize > maxOutputSize {
-			return nil, merr.WrapErrParameterInvalidMsg("search results exceed the maxOutputSize Limit %d", maxOutputSize)
-		}
 	}
 
 	ret.Results.TopK = realTopK
@@ -291,7 +319,7 @@ func runMultiFieldGroupByHotLoop(
 	idxComputers []*typeutil.FieldDataIdxComputer,
 	nq, offset, groupSize, limit, groupBound int64,
 	groupByFieldIDs []int64,
-	maxOutputSize int64,
+	groupKeyBytes, maxOutputSize int64,
 	isSearchAggregation bool,
 ) ([]reduce.RowRef, error) {
 	subSearchNum := len(subSearchResultData)
@@ -346,6 +374,10 @@ func runMultiFieldGroupByHotLoop(
 			case !isNewGroup && entry.count >= groupSize:
 				// group full
 			default:
+				retSize += groupKeyBytes
+				if retSize > maxOutputSize {
+					return nil, merr.WrapErrParameterInvalidMsg("search results exceed the maxOutputSize Limit %d", maxOutputSize)
+				}
 				if isNewGroup {
 					entry = &multiGroupEntry{values: values}
 					groupBuckets[hash] = append(groupBuckets[hash], entry)
@@ -377,6 +409,9 @@ func runMultiFieldGroupByHotLoop(
 			if len(ret.Results.FieldsData) > 0 {
 				fieldIdxs := idxComputers[ref.ResultIdx].Compute(ref.RowIdx)
 				retSize += typeutil.AppendFieldData(ret.Results.FieldsData, subResData.FieldsData, ref.RowIdx, fieldIdxs...)
+				if retSize > maxOutputSize {
+					return nil, merr.WrapErrParameterInvalidMsg("search results exceed the maxOutputSize Limit %d", maxOutputSize)
+				}
 			}
 			typeutil.AppendPKs(ret.Results.Ids, typeutil.GetPK(subResData.GetIds(), ref.RowIdx))
 			ret.Results.Scores = append(ret.Results.Scores, subResData.GetScores()[ref.RowIdx])
@@ -394,10 +429,6 @@ func runMultiFieldGroupByHotLoop(
 		}
 		realTopK = j
 		ret.Results.Topks = append(ret.Results.Topks, realTopK)
-
-		if retSize > maxOutputSize {
-			return nil, merr.WrapErrParameterInvalidMsg("search results exceed the maxOutputSize Limit %d", maxOutputSize)
-		}
 	}
 
 	ret.Results.TopK = realTopK
